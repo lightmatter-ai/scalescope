@@ -1,0 +1,9 @@
+d_model: 12288
+n_layers: 120
+num_heads: 128
+mlp_ratio: 0.5
+max_sequence_length: 131072
+vocab_size: 50432
+num_regular_experts: 256
+num_selected_experts: 8
+num_shared_experts: 0

@@ -1,0 +1,46 @@
+name: "Passage_256_experts"
+
+# 256 experts, 16 TP, 2 TP_MoE, 8 PP, 256 DP_attn
+
+dimensions:
+  # PP is on scale out
+  - logical_tag: "PP"
+    maps_to_physical_dimension_name: "InterPodFabric"
+    size: 8
+
+  # Attention part
+  - logical_tag: "TP_Attn"
+    maps_to_physical_dimension_name: "IntraPodFabric"
+    size: 16
+
+  # DP_Attn_SU: IntraPodFabric_size / TP_Attn_size = 512 / 16 = 32
+  - logical_tag: "DP_Attn_SU"
+    maps_to_physical_dimension_name: "IntraPodFabric"
+    size: 32
+
+  # DP_Attn_SO: InterPodFabric_size / PP_stages = 64 / 8 = 8
+  - logical_tag: "DP_Attn_SO"
+    maps_to_physical_dimension_name: "InterPodFabric"
+    size: 8
+
+  # Experts
+
+  - logical_tag: "TP_MoE"
+    maps_to_physical_dimension_name: "IntraPodFabric"
+    size: 2
+
+  # 512 gpus contains an entire full expert group
+  # Scale up domain size is also 512 gpus
+  # 512 / 2 (gpus per expert) = 256
+  - logical_tag: "EP_SU"
+    maps_to_physical_dimension_name: "IntraPodFabric"
+    size: 256
+
+  # 512 (full expert group size)/512 (scale-up domain size) =1
+  - logical_tag: "EP_SO"
+    maps_to_physical_dimension_name: "InterPodFabric"
+    size: 1
+
+  - logical_tag: "DP_MoE"
+    maps_to_physical_dimension_name: "InterPodFabric"
+    size: 8

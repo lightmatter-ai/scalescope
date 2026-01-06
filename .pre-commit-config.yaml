@@ -1,0 +1,70 @@
+# Setup:
+#   pip install pre-commit
+#   pre-commit install-hooks
+#   pre-commit install --hook-type pre-commit
+#   pre-commit install --hook-type pre-push
+
+#   manually run pydocstyle: pre-commit run pydocstyle --all-files
+#   pre-commit --help
+#
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+
+default_stages: [pre-commit, pre-push]
+
+repos:
+  #
+  # Fixers - run these as pre-push hooks
+  #
+  - repo: https://github.com/timothycrosley/isort
+    rev: "6.1.0"
+    hooks:
+      - id: isort
+        name: Fix Python - isort
+        args: ["--profile", "black"]
+        # exclude: ^examples/|.*/filename.py
+
+  - repo: https://github.com/psf/black
+    rev: 25.9.0
+    hooks:
+      - id: black
+        language_version: python3
+        args: ["--line-length", "100"]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        name: Fix trailing whitespace
+      - id: end-of-file-fixer
+        name: Fix end of files
+
+  #
+  # Checkers - run these as pre-commit and pre-push hooks
+  #
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: no-commit-to-branch
+        args: [--branch, main]
+        name: "Don't commit to main branch"
+      - id: check-merge-conflict
+      - id: check-ast
+        name: Check Python AST
+      - id: check-builtin-literals
+        name: Check Python literal syntax for builtin types
+      - id: check-yaml
+
+  - repo: https://github.com/pycqa/flake8
+    rev: 7.3.0
+    hooks:
+      - id: flake8
+        name: Check Python style - flake8
+        args: [--max-line-length=100, --extend-ignore=E501] # ignore line length here, handled by black
+
+  - repo: https://github.com/PyCQA/pydocstyle
+    rev: "6.3.0"
+    hooks:
+      - id: pydocstyle
+        name: Check Python docstrings - pydocstyle
+        stages: [manual]

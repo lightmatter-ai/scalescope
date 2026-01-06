@@ -1,0 +1,17 @@
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+sweep_results_*
+.vscode/
+.DS_Store
+*.egg-info/
+tmp/
+dist/
+build/
+node_modules/

@@ -1,0 +1,21 @@
+# Sweep definition
+sweep:
+
+  # List examples
+  train_spec.tp_spec.variant: ["NONE", "SHARD_WEIGHTS_1D"]
+  train_spec.dp_spec.variant: ["ZERO_STAGE_1", "ZERO_STAGE_2"]
+  train_spec.recompute_spec.strategy: ["NONE", "SELECTIVE"]
+
+  # Generator example
+  train_spec.seq_length:
+    generator: perfect_squares
+    min_val: 1024
+    max_val: 8192
+
+  model_spec.mlp_ratio: [3.25, 4.0]
+
+  # Range examples
+  train_spec.global_batch_size:   {min: 1024, max: 4096, step: 1024} # Should generate ints: [1024, 2048, 3096, 4096]
+
+  # Example targeting a topology
+  dp_topology.shape: [[128], [256]] # Sweep shape directly with list

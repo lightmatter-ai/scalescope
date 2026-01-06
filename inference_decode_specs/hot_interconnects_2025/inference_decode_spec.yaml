@@ -1,0 +1,43 @@
+
+## Inference decode spec for Hot Interconnects'25 scenarios.
+## Describes model placement (TP/DP/PP), decode batch sizing, precision,
+## and memory tier mappings used by the analytical decode model.
+## Values are per global decode step across the whole cluster.
+global_batch_size: 4096         # Total sequences decoded concurrently across all DP ranks
+micro_batch_size: 2             # Micro-batch size per PP stage; per-DP batch = micro_batch_size * Num_PP_Stages
+prefill_seq_len: 8192           # Context length used to build initial KV cache (from prefill)
+num_generated_tokens: 1024      # Tokens to generate per sequence during decode
+
+float_size_bytes: 2             # Inference precision in bytes (e.g., 2 = bf16/fp16)
+
+memory_device_map_traffic:
+  weights: xpu_memory           # Weight reads during each generated token
+  activations: xpu_memory       # Activation reads/writes for decode steps
+  gradients: xpu_memory         # Unused in inference; present for structural parity
+  kv_cache: xpu_memory          # KV cache reads dominate; small appends per step
+
+memory_device_map_footprint:
+  weights: xpu_memory           # Parameter storage
+  optimizer_states: xpu_memory  # Unused in inference
+  saved_activations: xpu_memory # Unused in inference
+  gradient_buffers: xpu_memory  # Unused in inference
+  kv_cache: xpu_memory          # KV cache footprint from prefill plus decode appends
+  transient_forward_peak: xpu_memory   # Peak transient forward working set during decode
+  transient_backward_peak: xpu_memory  # Zero for inference
+
+comp_comm_efficiency: 0.7       # Overlap between compute and communication
+comp_mem_efficiency: 0.7        # Overlap between compute and memory traffic
+comm_mem_efficiency: 0.7        # Overlap between communication and memory traffic
+
+tp_spec:
+  variant: SHARD_WEIGHTS_1D     # Tensor-parallel strategy for attention/MLP
+
+dp_spec:
+  variant: DDP                   # Data-parallel strategy
+
+moe_spec_v2:
+  num_colocated_experts: 1      # Number of experts hosted per XPU (expert colocation)
+  expert_imbalance: 1.5         # Routed token skew multiplier (>= 1.0) affecting MoE a2a and compute
+
+pp_spec:
+  variant: GPIPE                 # Pipeline-parallel strategy

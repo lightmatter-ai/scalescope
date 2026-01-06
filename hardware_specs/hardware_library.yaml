@@ -1,0 +1,122 @@
+# hardware_library.yaml
+# Defines reusable hardware components and node configurations.
+
+components:
+  compute:
+    H100_COMPUTE:
+      fp8_nominal: 3958e12
+      bf16_nominal: 1000e12
+      fp32_nominal: 66.9e12
+      efficiency: 0.7
+    GB200_COMPUTE:
+      fp8_nominal: null
+      bf16_nominal: 2250e12 # 2250 TFLOPS
+      fp32_nominal: null
+      efficiency: 0.7
+    ALTERNATIVE_COMPUTE:
+      fp8_nominal: 17000e12
+      bf16_nominal: 8500e12
+      fp32_nominal: 4250e12
+      efficiency: 0.7
+
+  memory:
+    H100_MEMORY:
+      bandwidth_per_stack_nominal: 820e9 # 820 GB/s
+      size_per_stack: 16e9            # 16 GB
+      num_stack: 5
+      efficiency: 0.7
+    GB200_MEMORY:
+      bandwidth_per_stack_nominal: 1000e9 # 1 TB/s
+      size_per_stack: 24e9             # 24 GB
+      num_stack: 8
+      efficiency: 0.7
+    ALTERNATIVE_MEMORY:
+      bandwidth_per_stack_nominal: 1500e9 # 1500e9 # 1.5 TB/s
+      size_per_stack: 24e9             # 24 GB
+      num_stack: 12
+      efficiency: 0.7
+    ALTERNATIVE_MEMORY_REMOTE:
+      bandwidth_per_stack_nominal: 3000e9 # 3.0 TB/s
+      size_per_stack: 24e9             # 24 GB
+      num_stack: 12
+      efficiency: 0.7
+
+  interconnect:
+    # Passage Interconnects
+    PASSAGE_INTERCONNECT_8TB:
+      name: "Passage_8TB/s_Interconnect"
+      type: "Passage"
+      num_links: 1
+      bandwidth_nominal: 4032e9 # 2 * 36 * 112 * 1e9 / 2 = 4032e9 (approx 4 TB/s outgoing)
+      latency_sec: 150e-9
+      efficiency: 0.8
+
+    # Chip-Specific Interconnects
+    H100_INTERCONNECT:
+      name: "H100_Interconnect"
+      type: "NVLink"
+      num_links: 18
+      bandwidth_nominal: 450e9 # 900 GB/s total / 2 = 450 GB/s outgoing
+      latency_sec: 150e-9
+      efficiency: 0.8
+    GB200_INTERCONNECT:
+      name: "GB200_Interconnect"
+      type: "NVLink"
+      num_links: 18
+      bandwidth_nominal: 900e9 # 1800 GB/s total / 2 = 900 GB/s outgoing
+      latency_sec: 150e-9
+      efficiency: 0.8
+    ALTERNATIVE_INTERCONNECT:
+      name: "Alternative_Interconnect"
+      type: "NVLink"
+      num_links: 18
+      bandwidth_nominal: 1800e9 # 2 * 1800 GB/s total / 2 = 1.8 TB/s outgoing
+      latency_sec: 150e-9
+      efficiency: 0.8
+
+    # DP-Specific Interconnects
+    DP_INTERCONNECT_INFINIBAND:
+      name: "Infiniband_DP_Interconnect"
+      type: "Infiniband"
+      num_links: 1 # Aggregate view for DP
+      bandwidth_nominal: 200e9 # 1600 Gbps / 8 bits/byte  = 200 GB/s uindirectional
+      latency_sec: 2e-6
+      efficiency: 0.8
+
+nodes:
+  # Standard nodes
+  H100_NODE:
+    node_name: "H100"
+    device_compute: "H100_COMPUTE"
+    device_memory_tiers:
+      xpu_memory: "H100_MEMORY"
+    device_interconnects:
+      "fast_fabric": "H100_INTERCONNECT"
+      "cluster_fabric": "DP_INTERCONNECT_INFINIBAND"
+  GB200_NODE:
+    node_name: "GB200_1.8TB/s_Interconnect"
+    device_compute: "GB200_COMPUTE"
+    device_memory_tiers:
+      xpu_memory: "GB200_MEMORY"
+    device_interconnects:
+      "fast_fabric": "GB200_INTERCONNECT"
+      "cluster_fabric": "DP_INTERCONNECT_INFINIBAND"
+  ALTERNATIVE_NODE:
+    node_name: "Alternative_3.6TB/s_Interconnect"
+    device_compute: "ALTERNATIVE_COMPUTE"
+    device_memory_tiers:
+      xpu_memory: "ALTERNATIVE_MEMORY"
+    device_interconnects:
+      "fast_fabric": "ALTERNATIVE_INTERCONNECT"
+      "cluster_fabric": "DP_INTERCONNECT_INFINIBAND"
+
+  # Passage nodes
+  PASSAGE_NODE_8TB_ALTERNATIVE:
+    node_name: "Passage_8TB/s_Interconnect_Alternative"
+    device_compute: "ALTERNATIVE_COMPUTE"
+    device_memory_tiers:
+      xpu_memory: "ALTERNATIVE_MEMORY"
+      remote_memory: "ALTERNATIVE_MEMORY_REMOTE"
+    device_interconnects:
+      "fast_fabric": "PASSAGE_INTERCONNECT_8TB"
+      "cluster_fabric": "DP_INTERCONNECT_INFINIBAND"

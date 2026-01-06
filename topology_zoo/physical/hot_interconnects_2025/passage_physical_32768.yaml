@@ -1,0 +1,16 @@
+
+name: "Hierarchical_Cluster_32768_Nodes"
+
+# This refers to a node definition with two interconnects that must exist in the HardwareRegistry.
+node_definition_ref: "PASSAGE_NODE_8TB_ALTERNATIVE"
+
+dimensions:
+  - name: "InterPodFabric"
+    interconnect_name: "cluster_fabric"
+    topology_type: "switched"
+    size: 64
+
+  - name: "IntraPodFabric"
+    interconnect_name: "fast_fabric"
+    topology_type: "switched" # or "fully_connected"
+    size: 512

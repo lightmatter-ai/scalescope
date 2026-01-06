@@ -1,0 +1,51 @@
+# train_spec.yaml
+# Training workload specification for Hot Interconnects'25 scenarios.
+# Describes model placement (TP/DP/PP), training batch sizing, numeric
+# precision, memory tier mappings, and overlap efficiencies used by the
+# analytical models. Values are per global step across the whole cluster.
+
+global_batch_size: 4096         # Total sequences processed per step across all DP ranks
+seq_length: 8192                # Tokens per sequence (context length) for training
+micro_batch_size: 2             # Micro-batch size per PP stage; per-DP batch = micro_batch_size * Num_PP_Stages
+total_train_tokens: 13_000_000_000_000  # Total tokens to train over (drives number of steps)
+
+float_size_bytes: 2             # Compute precision in bytes (e.g., 2 = bf16/fp16); used for mixed-precision training
+full_precision_param_float_size: 4  # Master parameter precision in bytes (e.g., 4 = fp32) for mixed-precision training
+optimizer: adam                 # Optimizer used to size optimizer state footprint (e.g., 2 states for Adam)
+
+# Memory tier mappings for traffic (bytes moved) during the step.
+memory_device_map_traffic:
+  weights: xpu_memory           # Where weight reads/writes are served from
+  activations: xpu_memory       # Where activation reads/writes are served from
+  gradients: xpu_memory         # Where gradient traffic is served from
+  kv_cache: xpu_memory          # Where KV cache traffic (if any) is served from
+
+# Memory tier mappings for persistent footprint on each XPU.
+memory_device_map_footprint:
+  weights: xpu_memory           # Parameter storage
+  optimizer_states: xpu_memory  # Optimizer states (e.g., Adam m/v)
+  saved_activations: xpu_memory # Saved activations needed for backward (if no recomputation)
+  gradient_buffers: xpu_memory  # Gradient buffers during backward/update
+  kv_cache: xpu_memory          # KV cache footprint (mostly relevant in inference)
+  transient_forward_peak: xpu_memory   # Peak transient forward working set
+  transient_backward_peak: xpu_memory  # Peak transient backward working set
+
+# Overlap/efficiency knobs in the overlapped-time model (0..1).
+comp_comm_efficiency: 0.7       # Overlap between compute and communication
+comp_mem_efficiency: 0.7        # Overlap between compute and memory traffic
+comm_mem_efficiency: 0.7        # Overlap between communication and memory traffic
+
+tp_spec:
+  variant: SHARD_WEIGHTS_1D     # Tensor-parallel strategy for weight sharding (Megatron-style 1D)
+
+dp_spec:
+  variant: DDP                   # Data-parallel strategy (DDP baseline)
+
+moe_spec_v2:
+  num_colocated_experts: 1      # Number of experts hosted per XPU (colocation)
+  expert_imbalance: 1.5         # Traffic multiplier modeling routed token skew (>= 1.0)
+
+pp_spec:
+  variant: GPIPE                 # Pipeline-parallel strategy (GPIPE)
+
+activation_storage_strategy: none  # Saved activation policy: none | recomputation | gather
