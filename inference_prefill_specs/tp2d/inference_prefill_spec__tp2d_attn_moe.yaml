@@ -1,0 +1,57 @@
+## Inference prefill spec (TP2D attention + TP2D MoE).
+## Values are per global prefill step across the whole cluster.
+
+global_batch_size: 4096
+micro_batch_size: 2
+seq_length: 8192
+
+float_size_bytes: 1
+
+memory_device_map_traffic:
+  weights: xpu_memory
+  activations: xpu_memory
+  gradients: xpu_memory
+  kv_cache: xpu_memory
+
+memory_device_map_footprint:
+  weights: xpu_memory
+  optimizer_states: xpu_memory
+  saved_activations: xpu_memory
+  gradient_buffers: xpu_memory
+  kv_cache: xpu_memory
+  transient_forward_peak: xpu_memory
+  transient_backward_peak: xpu_memory
+
+comp_comm_efficiency: 0.7
+comp_mem_efficiency: 0.7
+comm_mem_efficiency: 0.7
+tp_moe_a2a_replication_optimization: true  # on: send to expert shard then all-gather across expert TP shards; off: regular routed MoE A2A
+
+# New: allow Attn and MoE to use different TP strategies.
+tp_attn_spec:
+  variant: SHARD_WEIGHTS_2D
+  split_2d:
+    x_tags: ["TP_Attn_X"]
+    yz_tags: ["TP_Attn_Y"]
+
+tp_proj_spec:
+  variant: SHARD_WEIGHTS_2D
+  split_2d:
+    x_tags: ["TP_Proj_X"]
+    yz_tags: ["TP_Proj_Y"]
+
+tp_moe_spec:
+  variant: SHARD_WEIGHTS_2D
+  split_2d:
+    x_tags: ["TP_MoE_X"]
+    yz_tags: ["TP_MoE_Y"]
+
+dp_spec:
+  variant: DDP
+
+moe_spec_v2:
+  num_colocated_experts: 1
+  expert_imbalance: 1.5
+
+pp_spec:
+  variant: GPIPE

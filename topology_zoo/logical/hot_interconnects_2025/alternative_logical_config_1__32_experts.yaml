@@ -27,14 +27,15 @@ dimensions:
     maps_to_physical_dimension_name: "IntraPodFabric"
     size: 16
 
-  # 512 gpus contains an entire full expert group
-  # Scale up domain size is 128 gpus
-  # 128 / 16 (gpus per expert) = 8
+  # EP_SU is the number of XPUs allocated to the expert scale-up domain.
+  # It is not expert count: one expert may be TP-sharded across several XPUs,
+  # and multiple experts may be colocated on one XPU.
   - logical_tag: "EP_SU"
     maps_to_physical_dimension_name: "IntraPodFabric"
-    size: 8
+    size: 128
 
-  # 512 / 128 = 4
+  # Each EP_SU domain has 128 XPUs and hosts 8 experts, each sharded across 16 XPUs.
+  # EP_SO=4 means the full 32-expert set spans four EP_SU domains.
   - logical_tag: "EP_SO"
     maps_to_physical_dimension_name: "InterPodFabric"
     size: 4

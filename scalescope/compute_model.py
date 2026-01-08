@@ -8,12 +8,14 @@ used by the orchestrator to build results.
 """
 
 import math
+import warnings
 
 from scalescope.model_spec import (
     attn_params_per_xpu,
     expert_params_per_xpu,
     TransformerConfig,
 )
+from scalescope.workload_spec import InferenceDecodeSpec, MoERouterSyncMode
 
 
 def matmul_flops(a_fst, a_snd, b_fst, b_snd):
@@ -23,9 +25,31 @@ def matmul_flops(a_fst, a_snd, b_fst, b_snd):
 
 
 def _calculate_prefill_attention_compute(
-    tp_attn_topology, transformer_config: TransformerConfig, workload_spec
+    proj_tp_topology,
+    tp_attn_topology,
+    transformer_config: TransformerConfig,
+    workload_spec,
 ) -> tuple[float, float]:
     """Per-layer attention: return (time_per_chip, flops_per_chip) for prefill."""
+    proj_time, proj_flops = _calculate_prefill_attention_projection_compute(
+        proj_tp_topology, transformer_config, workload_spec
+    )
+    attn_time, attn_flops = _calculate_prefill_attention_attn_compute(
+        tp_attn_topology, transformer_config, workload_spec
+    )
+    return proj_time + attn_time, proj_flops + attn_flops
+
+
+def _calculate_prefill_attention_projection_compute(
+    proj_tp_topology, transformer_config: TransformerConfig, workload_spec
+) -> tuple[float, float]:
+    """
+    Prefill attention projection compute:
+    - Q/K/V projections
+    - output projection
+
+    Split out to allow projections to run on a different TP domain than attention compute.
+    """
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     n_seq = workload_spec.seq_length
     float_size = workload_spec.float_size_bytes
@@ -40,14 +64,35 @@ def _calculate_prefill_attention_compute(
     v_proj_flops = matmul_flops(n_batch * n_seq, d_model, d_model, num_kv_heads * head_dim)
     kvq_proj_flops = q_proj_flops + k_proj_flops + v_proj_flops
 
+    # Output projection
+    out_proj_flops = matmul_flops(n_batch * n_seq, d_model, d_model, d_model)
+
+    total_flops = kvq_proj_flops + out_proj_flops
+    n_chips = proj_tp_topology.num_chips
+    flops_per_chip = total_flops / n_chips
+    node = proj_tp_topology.physical_topology.node_definition
+    time_per_chip = node.get_time_per_flop(dtype_size=float_size) * flops_per_chip
+    return time_per_chip, flops_per_chip
+
+
+def _calculate_prefill_attention_attn_compute(
+    tp_attn_topology, transformer_config: TransformerConfig, workload_spec
+) -> tuple[float, float]:
+    """
+    Prefill attention *core* compute:
+    - attention score (Q @ K^T)
+    - attention–V multiplication (Attn @ V)
+    """
+    n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
+    n_seq = workload_spec.seq_length
+    float_size = workload_spec.float_size_bytes
+    d_model = transformer_config.d_model
+
     # Attention score (Q @ K.T) and attention–V multiplication.
     kqv_flops = n_batch * matmul_flops(n_seq, d_model, d_model, n_seq)  # Q @ K.T
     kqv_flops += n_batch * matmul_flops(n_seq, n_seq, n_seq, d_model)  # Attn @ V
 
-    # Output projection
-    out_proj_flops = matmul_flops(n_batch * n_seq, d_model, d_model, d_model)
-
-    total_flops = kvq_proj_flops + kqv_flops + out_proj_flops
+    total_flops = kqv_flops
     n_chips = tp_attn_topology.num_chips
     flops_per_chip = total_flops / n_chips
     node = tp_attn_topology.physical_topology.node_definition
@@ -64,15 +109,19 @@ def _calculate_prefill_moe_compute(
 ) -> tuple[float, float]:
     """Per-layer MoE: return (time_per_chip, flops_per_chip) for prefill.
 
+    This function is intentionally the shared MoE forward-compute path for all pass modes:
+    training/prefill call it directly, and decode reuses it via _calculate_decode_moe_compute().
+
     Uses batch size per full expert set, computes per-expert FLOPs, then divides by TP_MoE chips.
     Shared experts not yet supported in this normalization path.
 
-    Args:
-        tp_attn_topology:
+    Router sharding uses ``moe_config.router_shard_factor`` which the orchestrator
+    sets to Y_eff for 2D TP (after AG(X) the router is sharded only across Y_eff)
+    or attn_tp_size for 1D TP.
     """
     float_size = workload_spec.float_size_bytes
     d_model = transformer_config.d_model
-    d_ff = transformer_config.mlp_ratio * d_model
+    d_ff = transformer_config.mlp_hidden_size
     num_routed_experts = transformer_config.num_regular_experts
     k = transformer_config.num_selected_experts
 
@@ -108,6 +157,25 @@ def _calculate_prefill_moe_compute(
         topk_flops = n_batch * n_seq * num_routed_experts
     router_flops = gating_flops + topk_flops
 
+    # Decode router mode policy for compute:
+    # - replicated_router: each rank computes full router scores locally.
+    # - sharded_router: router compute is sharded by router_shard_factor.
+    # router_shard_factor is set by the orchestrator: Y_eff for 2D TP (after
+    # AG(X) the router is sharded only across Y_eff), attn_tp_size for 1D TP.
+    router_compute_multiplier = 1.0
+    if isinstance(workload_spec, InferenceDecodeSpec):
+        router_mode = workload_spec.decode_moe_router_sync_mode
+        router_shard_factor = int(moe_config.router_shard_factor)
+        if router_shard_factor < 1:
+            raise ValueError(f"Invalid router_shard_factor: {router_shard_factor}")
+        if router_mode == MoERouterSyncMode.REPLICATED_ROUTER:
+            router_compute_multiplier = float(router_shard_factor)
+        elif router_mode == MoERouterSyncMode.SHARDED_ROUTER:
+            router_compute_multiplier = 1.0
+        else:
+            raise ValueError(f"Unsupported decode_moe_router_sync_mode: {router_mode}")
+    router_flops *= router_compute_multiplier
+
     # Expert computation per routed expert based on tokens_per_set/num_routed_experts and traffic multiplier.
     # Scale per-chip compute by the number of colocated experts on each XPU.
     if num_routed_experts <= 0:
@@ -123,17 +191,26 @@ def _calculate_prefill_moe_compute(
         per_expert_ffn_flops *= moe_config.num_colocated_experts
 
     # We assume that we need to add each expert output to the final sum
-    total_experts_in_group = moe_config.num_all_experts_per_dp_rank
-    expert_output_combine_flops = n_batch * n_seq * d_model * (total_experts_in_group - 1)
+    total_experts_in_group = max(0, int(moe_config.num_all_experts_per_dp_rank))
+    if total_experts_in_group == 0:
+        warnings.warn(
+            "MoE compute modeling: total_experts_in_group resolved to 0 "
+            f"(num_all_experts_per_dp_rank={getattr(moe_config, 'num_all_experts_per_dp_rank', None)}). "
+            "This will zero out expert-output combine FLOPs; double-check that MoE is intentionally disabled "
+            "(e.g. num_regular_experts=0) for this run.",
+            stacklevel=2,
+        )
+    expert_output_combine_flops = n_batch * n_seq * d_model * max(0, total_experts_in_group - 1)
 
     # Combine expert outputs cost (sum across experts within the set)
     # total_experts_in_group = max(0, num_routed_experts)
     # expert_output_combine_flops = tokens_per_set * d_model * max(0, total_experts_in_group - 1)
 
     moe_tp_size = moe_tp_topology.num_chips if moe_tp_topology is not None else 1
+    router_shard_denom = moe_config.router_shard_factor
     attn_tp_size = tp_attn_topology.num_chips if tp_attn_topology is not None else 1
     total_flops = (
-        router_flops / attn_tp_size
+        router_flops / router_shard_denom
         + per_expert_ffn_flops / moe_tp_size
         + expert_output_combine_flops / attn_tp_size
     )
@@ -151,6 +228,7 @@ def _calculate_prefill_moe_compute(
 
 
 def forward_prefill_flops_per_chip(
+    proj_tp_topology,
     attn_tp_topology,
     moe_tp_topology,
     transformer_config: TransformerConfig,
@@ -161,7 +239,7 @@ def forward_prefill_flops_per_chip(
     num_layers_per_pp_stage = workload_spec.get_layers_per_pp_stage()
 
     att_time_per_layer_chip, att_flops_per_layer_chip = _calculate_prefill_attention_compute(
-        attn_tp_topology, transformer_config, workload_spec
+        proj_tp_topology, attn_tp_topology, transformer_config, workload_spec
     )
     moe_time_per_layer_chip, moe_flops_per_layer_chip = _calculate_prefill_moe_compute(
         moe_tp_topology, attn_tp_topology, transformer_config, moe_config, workload_spec
@@ -189,9 +267,79 @@ def forward_prefill_flops_per_chip(
 
 
 def _calculate_decode_attention_compute(
-    attn_tp_topology, transformer_config: TransformerConfig, workload_spec, n_seq_so_far: int
+    proj_tp_topology,
+    attn_tp_topology,
+    transformer_config: TransformerConfig,
+    workload_spec,
+    n_seq_so_far: int,
 ) -> tuple[float, float]:
     """Per-layer attention: return (time_per_chip, flops_per_chip) for decode step."""
+    # Projections (QKV + output projection) may eventually live on a separate TP domain.
+    proj_time, proj_flops = _calculate_decode_attention_projection_compute(
+        proj_tp_topology, transformer_config, workload_spec
+    )
+    # Core attention compute (KV-cache GEMMs) may live on a different TP domain.
+    attn_time, attn_flops = _calculate_decode_attention_attn_compute(
+        attn_tp_topology, transformer_config, workload_spec, n_seq_so_far
+    )
+    return proj_time + attn_time, proj_flops + attn_flops
+
+
+def decode_attention_compute_breakdown_per_layer(
+    *,
+    proj_tp_topology,
+    attn_tp_topology,
+    transformer_config: TransformerConfig,
+    workload_spec,
+    n_seq_so_far: int,
+) -> tuple[float, float, float, float]:
+    """Decode attention compute breakdown for a single token (per-layer, per-chip).
+
+    Returns:
+        (proj_time_s, proj_flops, core_time_s, core_flops)
+    """
+    proj_time, proj_flops = _calculate_decode_attention_projection_compute(
+        proj_tp_topology, transformer_config, workload_spec
+    )
+    core_time, core_flops = _calculate_decode_attention_attn_compute(
+        attn_tp_topology, transformer_config, workload_spec, n_seq_so_far
+    )
+    return proj_time, proj_flops, core_time, core_flops
+
+
+def prefill_attention_compute_breakdown_per_layer(
+    *,
+    proj_tp_topology,
+    attn_tp_topology,
+    transformer_config: TransformerConfig,
+    workload_spec,
+) -> tuple[float, float, float, float]:
+    """Prefill attention compute breakdown (per-layer, per-chip).
+
+    Returns:
+        (proj_time_s, proj_flops, core_time_s, core_flops)
+    """
+    proj_time, proj_flops = _calculate_prefill_attention_projection_compute(
+        proj_tp_topology, transformer_config, workload_spec
+    )
+    core_time, core_flops = _calculate_prefill_attention_attn_compute(
+        attn_tp_topology, transformer_config, workload_spec
+    )
+    return proj_time, proj_flops, core_time, core_flops
+
+
+def _calculate_decode_attention_projection_compute(
+    proj_tp_topology, transformer_config: TransformerConfig, workload_spec
+) -> tuple[float, float]:
+    """
+    Decode attention projection compute for a single new token:
+    - Q/K/V projections
+    - output projection
+
+    This is intentionally separated from the KV-cache attention compute so that a future
+    design can use a different TP domain for projections (`proj_tp_topology`) while keeping
+    attention compute on `attn_tp_topology`.
+    """
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     float_size = workload_spec.float_size_bytes
     d_model = transformer_config.d_model
@@ -205,6 +353,30 @@ def _calculate_decode_attention_compute(
     v_proj_flops = matmul_flops(n_batch * 1, d_model, d_model, num_kv_heads * head_dim)
     kvq_proj_flops = q_proj_flops + k_proj_flops + v_proj_flops
 
+    # Output projection is for the single new token
+    out_proj_flops = matmul_flops(n_batch * 1, d_model, d_model, d_model)
+
+    total_flops = kvq_proj_flops + out_proj_flops
+    n_chips = proj_tp_topology.num_chips
+    flops_per_chip = total_flops / n_chips
+    node = proj_tp_topology.physical_topology.node_definition
+    time_per_chip = node.get_time_per_flop(dtype_size=float_size) * flops_per_chip
+    return time_per_chip, flops_per_chip
+
+
+def _calculate_decode_attention_attn_compute(
+    attn_tp_topology, transformer_config: TransformerConfig, workload_spec, n_seq_so_far: int
+) -> tuple[float, float]:
+    """
+    Decode attention *core* compute for a single new token attending to the KV cache:
+    - Q @ K_cache^T
+    - softmax (not explicitly modeled; typically lower order vs GEMMs)
+    - Attn @ V_cache
+    """
+    n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
+    float_size = workload_spec.float_size_bytes
+    d_model = transformer_config.d_model
+
     #  KV cache : Q (new) attends to *K_cache* (history)
     # Q @ K.T -> (B, 1, D) @ (B, D, S_cache) = (B, 1, S_cache)
     qkt_flops = matmul_flops(n_batch * 1, d_model, d_model, n_seq_so_far)
@@ -213,10 +385,7 @@ def _calculate_decode_attention_compute(
     # Attention-V multiplication: (Attn @ V) -> (B, 1, S_cache) @ (B, S_cache, D)
     att_v_flops = matmul_flops(n_batch * 1, n_seq_so_far, n_seq_so_far, d_model)
 
-    # Output projection is for the single new token
-    out_proj_flops = matmul_flops(n_batch * 1, d_model, d_model, d_model)
-
-    total_flops = kvq_proj_flops + qkt_flops + att_v_flops + out_proj_flops
+    total_flops = qkt_flops + att_v_flops
     n_chips = attn_tp_topology.num_chips
     flops_per_chip = total_flops / n_chips
     node = attn_tp_topology.physical_topology.node_definition
@@ -232,13 +401,13 @@ def _calculate_decode_moe_compute(
     workload_spec,
 ) -> tuple[float, float]:
     """Per-layer MoE: return (time_per_chip, flops_per_chip) for decode step."""
-    # MoE logic same as prefill with n_seq=1.
     return _calculate_prefill_moe_compute(
         moe_tp_topology, attn_tp_topology, transformer_config, moe_config, workload_spec
     )
 
 
 def forward_decode_flops_per_chip(
+    proj_tp_topology,
     attn_tp_topology,
     moe_tp_topology,
     transformer_config: TransformerConfig,
@@ -263,7 +432,7 @@ def forward_decode_flops_per_chip(
     #
 
     att_time_per_layer_chip, att_flops_per_layer_chip = _calculate_decode_attention_compute(
-        attn_tp_topology, transformer_config, workload_spec, n_seq_so_far
+        proj_tp_topology, attn_tp_topology, transformer_config, workload_spec, n_seq_so_far
     )
     moe_time_per_layer_chip, moe_flops_per_layer_chip = _calculate_decode_moe_compute(
         moe_tp_topology, attn_tp_topology, transformer_config, moe_config, workload_spec
@@ -303,9 +472,31 @@ def _calculate_backward_linear_layer_flops(
 
 
 def _calculate_backward_attention_compute(
-    tp_attn_topology, transformer_config: TransformerConfig, workload_spec
+    proj_tp_topology,
+    tp_attn_topology,
+    transformer_config: TransformerConfig,
+    workload_spec,
 ) -> tuple[float, float]:
     """Per-layer attention backward: return (time_per_chip, flops_per_chip)."""
+    proj_time, proj_flops = _calculate_backward_attention_projection_compute(
+        proj_tp_topology, transformer_config, workload_spec
+    )
+    attn_time, attn_flops = _calculate_backward_attention_attn_compute(
+        tp_attn_topology, transformer_config, workload_spec
+    )
+    return proj_time + attn_time, proj_flops + attn_flops
+
+
+def _calculate_backward_attention_projection_compute(
+    proj_tp_topology, transformer_config: TransformerConfig, workload_spec
+) -> tuple[float, float]:
+    """
+    Backward compute attributable to attention projections:
+    - gradients for W_o (output projection)
+    - gradients for W_q, W_k, W_v (QKV projections)
+
+    Split out to allow projections to run on a different TP domain than attention compute.
+    """
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     n_seq = workload_spec.seq_length
     float_size = workload_spec.float_size_bytes
@@ -316,6 +507,32 @@ def _calculate_backward_attention_compute(
 
     # Gradients for W_o
     w_o_grad_flops = _calculate_backward_linear_layer_flops(n_batch * n_seq, d_model, d_model)
+
+    # Gradients for W_q, W_k, W_v
+    w_q_grad_flops = _calculate_backward_linear_layer_flops(n_batch * n_seq, d_model, d_model)
+    w_kv_grad_flops = 2 * _calculate_backward_linear_layer_flops(
+        n_batch * n_seq, d_model, num_kv_heads * head_dim
+    )
+    w_kvq_proj_grad_flops = w_q_grad_flops + w_kv_grad_flops
+
+    total_flops = w_o_grad_flops + w_kvq_proj_grad_flops
+    n_chips = proj_tp_topology.num_chips
+    flops_per_chip = total_flops / n_chips
+    node = proj_tp_topology.physical_topology.node_definition
+    time_per_chip = node.get_time_per_flop(dtype_size=float_size) * flops_per_chip
+    return time_per_chip, flops_per_chip
+
+
+def _calculate_backward_attention_attn_compute(
+    tp_attn_topology, transformer_config: TransformerConfig, workload_spec
+) -> tuple[float, float]:
+    """
+    Backward compute attributable to the core attention mechanism (excluding projections).
+    """
+    n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
+    n_seq = workload_spec.seq_length
+    float_size = workload_spec.float_size_bytes
+    d_model = transformer_config.d_model
 
     # Gradients for the core attention mechanism
     # dL/dK = (Q * V^T) * dL/dAttn etc.
@@ -328,14 +545,7 @@ def _calculate_backward_attention_compute(
     V_grad_flops = n_batch * matmul_flops(n_seq, n_seq, n_seq, d_model)
     core_attn_grads = K_grad_flops + Q_grad_flops + V_grad_flops
 
-    # Gradients for W_q, W_k, W_v
-    w_q_grad_flops = _calculate_backward_linear_layer_flops(n_batch * n_seq, d_model, d_model)
-    w_kv_grad_flops = 2 * _calculate_backward_linear_layer_flops(
-        n_batch * n_seq, d_model, num_kv_heads * head_dim
-    )
-    w_kvq_proj_grad_flops = w_q_grad_flops + w_kv_grad_flops
-
-    total_flops = w_o_grad_flops + core_attn_grads + w_kvq_proj_grad_flops
+    total_flops = core_attn_grads
     n_chips = tp_attn_topology.num_chips
     flops_per_chip = total_flops / n_chips
     node = tp_attn_topology.physical_topology.node_definition
@@ -352,13 +562,14 @@ def _calculate_backward_moe_compute(
 ) -> tuple[float, float]:
     """Per-layer MoE backward: return (time_per_chip, flops_per_chip).
 
-    Mirrors forward path normalization: router-related grads normalized by TP_Attn chips,
-    expert FFN grads normalized by TP_MoE chips. Uses tokens per full expert set.
+    Mirrors forward path normalization: router-related grads are normalized by
+    ``router_shard_factor`` (resolved in orchestration), expert FFN grads are
+    normalized by TP_MoE chips. Uses tokens per full expert set.
     Shared experts not supported in this normalization path.
     """
     float_size = workload_spec.float_size_bytes
     d_model = transformer_config.d_model
-    d_ff = transformer_config.mlp_ratio * d_model
+    d_ff = transformer_config.mlp_hidden_size
 
     # Tokens per full expert set
     tokens_per_set = (
@@ -375,7 +586,8 @@ def _calculate_backward_moe_compute(
             "Shared experts are not supported in _calculate_backward_moe_compute normalization"
         )
 
-    # Router gradients (normalized by TP_Attn chips) use per-DP tokens (old path parity)
+    # Router gradients use per-DP tokens and are normalized by router_shard_factor
+    # (same convention as forward router FLOPs).
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     n_seq = workload_spec.seq_length
     router_grad_flops = _calculate_backward_linear_layer_flops(
@@ -384,8 +596,10 @@ def _calculate_backward_moe_compute(
     router_grad_flops += (
         n_batch * n_seq * max(0, num_routed_experts)
     )  # Mask/softmax-related cost approximation
-    n_chips_tp_attn = tp_attn_topology.num_chips if tp_attn_topology is not None else 1
-    router_grad_flops_per_chip = router_grad_flops / n_chips_tp_attn
+    router_shard_denom = moe_config.router_shard_factor
+    if router_shard_denom < 1:
+        raise ValueError(f"Invalid router_shard_factor: {router_shard_denom}")
+    router_grad_flops_per_chip = router_grad_flops / router_shard_denom
 
     # Expert gradients (normalized by TP_MoE chips)
     traffic_mult = moe_config.regular_expert_traffic_multiplier
@@ -413,6 +627,7 @@ def _calculate_backward_moe_compute(
 
 
 def backward_pass_flops_per_chip(
+    proj_tp_topology,
     attn_tp_topology,
     moe_tp_topology,
     transformer_config: TransformerConfig,
@@ -426,7 +641,7 @@ def backward_pass_flops_per_chip(
     attn_tp_size = attn_tp_topology.num_chips
 
     att_time_per_layer_chip, att_flops_per_layer_chip = _calculate_backward_attention_compute(
-        attn_tp_topology, transformer_config, workload_spec
+        proj_tp_topology, attn_tp_topology, transformer_config, workload_spec
     )
     moe_time_per_layer_chip, moe_flops_per_layer_chip = _calculate_backward_moe_compute(
         moe_tp_topology, attn_tp_topology, transformer_config, moe_config, workload_spec

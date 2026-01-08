@@ -1,0 +1,15 @@
+name: "CONF26_4096_FC128_with_32_Groups"
+node_definition_ref: "PASSAGE_NODE_8TB_ALTERNATIVE"
+
+dimensions:
+  # 32 system groups; modeled on fast_fabric as requested.
+  - name: "Domain32"
+    interconnect_name: "fast_fabric"
+    topology_type: "switched"
+    size: 32
+
+  # 128-XPU fully-connected local domain per group.
+  - name: "Domain128"
+    interconnect_name: "fast_fabric"
+    topology_type: "fully_connected"
+    size: 128

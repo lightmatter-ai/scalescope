@@ -1,0 +1,8 @@
+name: "CONF26_4096_Ring"
+node_definition_ref: "PASSAGE_NODE_8TB_ALTERNATIVE"
+
+dimensions:
+  - name: "ScaleUpFabric"
+    interconnect_name: "fast_fabric"
+    topology_type: "ring"
+    size: 4096

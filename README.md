@@ -42,6 +42,7 @@ scalescope-cli \
     --sweep-config <path/to/sweep_config.yaml> \
     --pass-mode <training|inference_prefill|inference_decode> \
     [--output-file <path/to/output_results.yaml>] \
+    [--output-dir <path/to/output_dir> --run-name <name> [--no-timestamp] [--overwrite]] \
     [--raw-output] # Optional
 ```
 
@@ -59,6 +60,12 @@ scalescope-cli \
   - `inference_decode` (token generation)
   Note: ensure `--workload-spec` points to the matching spec directory for the selected mode (e.g., `train_specs/...`, `inference_prefill_specs/...`, or `inference_decode_specs/...`).
 * --output-file (Optional): Path to save the detailed sweep results as a YAML file. If not provided, a summary is printed to the console.
+* --output-dir (Optional): Directory to write sweep artifacts. ScaleScope will create a subdirectory (named by `--run-name`, optionally with a timestamp suffix) containing:
+  - `manifest.yaml`: provenance (including git SHA when available) and an index of run IDs to per-run files
+  - `runs/<run_id>.yaml`: one detailed structured YAML output per sweep point
+* --run-name (Optional): Name for the run subdirectory under `--output-dir`.
+* --no-timestamp (Optional): When set, do not append a timestamp to the run subdirectory name (useful for tests/CI).
+* --overwrite (Optional): When set, allow overwriting an existing run subdirectory.
 * --raw-output (Optional): If specified, disables human-readable formatting for numbers (e.g., bytes, FLOPs, time) in the YAML output, printing raw numeric values instead.
 
 ### Config Files
@@ -81,7 +88,7 @@ ScaleScope consumes several YAML configuration files. This section summarizes th
    - Defines the logical dimensions used by distributed training/inference (e.g., TP_Attn, TP_MoE, DP_Attn, DP_MoE, EP_*, PP) and maps each to a physical dimension to form collective groups. The `size` on each mapping sets that dimension’s degree on the chosen fabric. When multiple logical mappings share the same interconnect, effective bandwidth is adjusted to account for sharing. See “Configuration reference” for the detailed field list.
 
 6. **Sweep configuration (`--sweep-config`)**
-   - Provides parameter sweeps across one or more base specs. A top-level `sweep:` section enumerates keys (e.g., `workload_spec.tp_spec.variant`) with values expressed as lists, ranges, or allowed generators (see `spec_utils.py`).
+   - Provides parameter sweeps using the **Sweep DSL** described below. It defines `leaves` (aligned multi-parameter case lists or generators) and a `sweep` expression composed with `cartesian` / `zip` / `union`, optionally filtered by `where` verifiers.
 
 ## Configuration reference
 
@@ -97,7 +104,7 @@ ScaleScope consumes several YAML configuration files. This section summarizes th
 - **memory_device_map_traffic**: Map each component to a memory tier for traffic accounting. Tiers must match the node's `device_memory_tiers` declared in the hardware library (for example, `xpu_memory`, `host_memory`, `remote_memory`, `nvme`). The chosen tier determines which bandwidth is used when converting bytes to time for that component. Currently, configurations use `xpu_memory` for all components; this mapping exists to support future modeling of remote tiers and offloading (e.g., `kv_cache` offload to `remote_memory` during decode).
 - **memory_device_map_footprint**: Map each component to a memory tier for footprint/capacity accounting. Uses the same tier namespace as above. Keys: `weights`, `optimizer_states`, `saved_activations`, `gradient_buffers`, `transient_forward_peak`, `transient_backward_peak`. The assigned tier’s capacity is checked when verifying feasibility; changing tiers lets you model sharding or offload (e.g., placing `saved_activations` on `host_memory` to simulate activation offload).
 - **comp_comm_efficiency / comp_mem_efficiency / comm_mem_efficiency**: Overlap efficiencies between compute/comm/memory (0.0–1.0).
-- **tp_spec.variant**: Tensor parallel variant (only `SHARD_WEIGHTS_1D` is currently supported).
+- **tp_attn_spec.variant / tp_moe_spec.variant**: Tensor parallel variants.
 - **dp_spec.variant**: Data parallel variant (only `DDP` is currently supported).
 - **pp_spec.variant**: Pipeline parallel variant (only `GPIPE` is currently supported). PP stage count is derived from the logical topology (`PP` mapping size).
 - **moe_spec_v2**:
@@ -110,7 +117,7 @@ ScaleScope consumes several YAML configuration files. This section summarizes th
   - **global_batch_size**, **micro_batch_size**, **seq_length**, **float_size_bytes**
   - **memory_device_map_traffic**, **memory_device_map_footprint**
   - **comp_comm_efficiency**, **comp_mem_efficiency**, **comm_mem_efficiency**
-  - **tp_spec.variant**, **dp_spec.variant**,  **pp_spec.variant**
+  - **tp_attn_spec.variant**, **tp_moe_spec.variant**, **dp_spec.variant**,  **pp_spec.variant**
   - **moe_spec_v2**: `num_colocated_experts`, `shared_expert_copies`, `expert_imbalance`
 
 ### Inference decode spec (inference_decode_specs/*.yaml)
@@ -121,8 +128,21 @@ ScaleScope consumes several YAML configuration files. This section summarizes th
   - **global_batch_size**, **micro_batch_size**, **float_size_bytes**
   - **memory_device_map_traffic** (often `kv_cache: remote_memory`), **memory_device_map_footprint**
   - **comp_comm_efficiency**, **comp_mem_efficiency**, **comm_mem_efficiency**
-  - **tp_spec.variant**, **dp_spec.variant**, **pp_spec.variant**
+  - **tp_attn_spec.variant**, **tp_moe_spec.variant**, **dp_spec.variant**, **pp_spec.variant**
   - **moe_spec_v2**: `num_colocated_experts`, `shared_expert_copies`, `expert_imbalance`
+
+## Inference unit sweeps (TP-only, DP=PP=1)
+
+For inference decode analysis without scale-out complications, see the `inference_decode_2026` project files:
+
+- **Physical topology**: `topology_zoo/physical/inference_decode_2026/inference_unit_physical.yaml`
+- **Logical topology**: `topology_zoo/logical/inference_decode_2026/inference_unit_logical.yaml`
+- **Workload spec**: `inference_decode_specs/inference_decode_2026/inference_decode_spec__inference_unit.yaml`
+- **Sweep**: `sweep_configs/inference_decode_2026/attn_proj_decode_inference_unit_tp_sweep.yaml`
+
+This setup models a single *inference unit* whose size is the TP group size, and it sweeps
+TP1D vs TP2D while holding DP and PP at 1. This helps isolate how TP strategy and TP size affect
+compute, memory traffic, and communication in a single decode step.
 
 ### Model spec (model_zoo/*.yaml)
 - **d_model**: Hidden dimension.
@@ -145,7 +165,7 @@ ScaleScope consumes several YAML configuration files. This section summarizes th
   - **topology_type**: e.g., `switched`, `mesh`, `ring`, etc.
   - **size**: Number of nodes along this dimension.
 - Optional:
-  - **expert_high_bandwidth_group_size_xpus**: Cluster-wide EP high-bandwidth group size (XPUs).
+  - (removed) Expert high-bandwidth group size is inferred from the physical dimension mapped by logical tag `EP_SU`.
 
 ### Logical topology spec (topology_zoo/logical/*.yaml)
 - **name**: Logical topology name.
@@ -153,6 +173,150 @@ ScaleScope consumes several YAML configuration files. This section summarizes th
   - **logical_tag**: Tag name (e.g., `PP`, `TP_Attn`, `TP_MoE`, `DP_Attn`, `DP_MoE`, `EP_SU`, `EP_SO`).
   - **maps_to_physical_dimension_name**: Physical dimension name from the physical topology.
   - **size**: Degree for that logical dimension.
+
+## Sweep DSL (`--sweep-config`)
+
+ScaleScope uses a small YAML DSL to define sweeps. The sweep file has two main sections:
+
+- **`leaves:`**: named leaf sweeps. Each leaf sets one or more *paths* and enumerates aligned *cases*.
+  - A leaf must specify **exactly one** of:
+    - `cases`: list of aligned tuples (each tuple length must equal `len(paths)`), or
+    - `generator`: `{name: ..., args: {...}}` producing a `list[list[Any]]` aligned to `paths`.
+  - Optional: `labels`: a parallel list of label dictionaries aligned 1:1 with `cases`. Labels are metadata only.
+- **`sweep:`**: an expression tree over leaves:
+  - `ref`: reference a leaf by name
+  - `cartesian`: cross product of children
+  - `zip`: index-aligned merge of children (**strict by default**; lengths must match)
+  - `union`: concatenate child streams
+  - Any operator node can include:
+    - `where: [verifier_name, ...]` (AND semantics)
+    - `on_fail: skip|error` (default: `skip`)
+
+### Path syntax
+
+Paths are written as `spec_key.attr.path`, where `spec_key` is one of the loaded base specs (e.g. `workload_spec`, `model_spec`, `logical_topology`, `physical_topology`).
+
+Special case for logical topology degrees:
+
+- `logical_topology.tag_size.<TAG>` updates the `size` of the logical dimension whose `logical_tag` matches `<TAG>`.
+
+### Empty sweep file
+
+An **empty** sweep YAML (or a YAML file containing only comments) means “no sweep”: ScaleScope runs a **single** evaluation using the base input specs.
+
+### Labels
+
+If a leaf defines `labels`, each run output will include a merged `labels` dictionary (and flattened `label.<key>` columns).
+
+You can also use a label-only leaf (identity leaf) to annotate sweep points without changing any spec values:
+
+```yaml
+leaves:
+  fabric_label:
+    paths: []
+    cases: [[]]
+    labels:
+      - {fabric: electrical}
+```
+
+### Report (summary columns + BEST markers)
+
+If `report:` is present in the sweep YAML and you run with `--output-dir`, ScaleScope will write `summary.csv`
+into the run directory and record it in `manifest.yaml`.
+
+`report.columns` are extracted by **arbitrary dotted paths** into the per-run YAML record (e.g. `time.total_time_seconds`,
+`configuration.tp_xpu_count`, `labels.fabric`, `sweep_case.model_spec.num_regular_experts`).
+
+Example:
+
+```yaml
+report:
+  columns:
+    - {name: fabric, path: labels.fabric}
+    - {name: experts, path: sweep_case.model_spec.num_regular_experts}
+    - {name: batch, path: configuration.batch_size_per_dp}
+    - {name: overall_s, path: time.total_time_seconds}
+
+  best:
+    - name: BEST
+      group_by: [fabric, experts, batch]
+      metric: overall_s
+      mode: min
+
+    # Implicit subset example: BEST1D is the subset where N2 == 1
+    - name: BEST1D
+      group_by: [fabric, batch]
+      metric: overall_s
+      mode: min
+      where:
+        - {col: N2, op: "==", value: 1}
+```
+
+Notes:
+- `best[].where` predicates refer to extracted **column names** (not paths).
+- Supported `op`: `==`, `!=`, `<`, `<=`, `>`, `>=`.
+
+### Built-in generators
+
+The sweep DSL supports these generator names:
+
+- `power_of_two` (args: `min_val`, `max_val`) – emits `[[N]]` for powers of two in range
+- `perfect_square_factors` (args: `min_val`, `max_val`) – emits `[[n, n]]` for square grids
+- `decompose_with_balanced_multiplicands` (args: `min_val`, `max_val`, `step`) – emits `[[x, y]]` balanced factor pairs for each integer in the range
+
+### Built-in verifiers
+
+- `pydantic_valid`: keeps only cases that can be applied to the base specs without Pydantic validation errors.
+- `decode_tp2d_qkv_groups_divides_proj_yz`: for decode TP2D sweeps, keeps only cases where `workload_spec.decode_tp2d_qkv_groups`
+  divides the resolved projection TP2D YZ size (from `workload_spec.tp_proj_spec.split_2d.yz_tags` and `logical_topology` tag sizes).
+
+### Example sweeps (report + BEST markers)
+
+Sweep configs can include `report:` to produce a compact `summary.csv` with BEST markers.
+
+Example (inference decode, TP-only inference unit sweep):
+
+```bash
+scalescope-cli \
+  --hardware-lib hardware_specs/hardware_library.yaml \
+  --physical-topology topology_zoo/physical/inference_decode_2026/inference_unit_physical.yaml \
+  --logical-topology topology_zoo/logical/inference_decode_2026/inference_unit_logical.yaml \
+  --workload-spec inference_decode_specs/inference_decode_2026/inference_decode_spec__inference_unit.yaml \
+  --model-spec model_zoo/tp2d/gpt_moe_config__1024_experts__gqa.yaml \
+  --sweep-config sweep_configs/inference_decode_2026/attn_proj_decode_inference_unit_tp_sweep.yaml \
+  --pass-mode inference_decode \
+  --output-dir /tmp/scalescope_out --run-name inference_unit_tp_sweep --no-timestamp --overwrite
+```
+
+### Example
+
+This sweeps batch size and sequence length as a cartesian product (use a training or prefill workload spec that has `seq_length`):
+
+```yaml
+leaves:
+  batch:
+    paths: [workload_spec.global_batch_size]
+    cases:
+      - [1]
+      - [64]
+      - [512]
+
+  seq_len:
+    paths: [workload_spec.seq_length]
+    cases:
+      - [1024]
+      - [4096]
+      - [8192]
+
+sweep:
+  cartesian:
+    - ref: batch
+    - ref: seq_len
+  where: [pydantic_valid]
+  on_fail: skip
+```
+
+See also `examples/sweep_dsl_example.yaml`.
 
 ### Hardware library (hardware_specs/hardware_library.yaml)
 - Components:

@@ -1,0 +1,18 @@
+name: "CONF26_4096_Torus_16x16x16"
+node_definition_ref: "PASSAGE_NODE_8TB_ALTERNATIVE"
+
+dimensions:
+  - name: "DomainX"
+    interconnect_name: "fast_fabric_x"
+    topology_type: "ring"
+    size: 16
+
+  - name: "DomainY0"
+    interconnect_name: "fast_fabric_y0"
+    topology_type: "ring"
+    size: 16
+
+  - name: "DomainY1"
+    interconnect_name: "fast_fabric_y1"
+    topology_type: "ring"
+    size: 16

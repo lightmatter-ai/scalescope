@@ -1,0 +1,356 @@
+leaves:
+  batch:
+    paths:
+    - workload_spec.global_batch_size
+    cases:
+    - - 1
+    - - 16
+    - - 32
+    - - 128
+    - - 1024
+    - - 4096
+    labels:
+    - batch: 1
+    - batch: 16
+    - batch: 32
+    - batch: 128
+    - batch: 1024
+    - batch: 4096
+
+  context:
+    paths:
+    - workload_spec.prefill_seq_len
+    cases:
+    - - 1024
+    - - 32768
+    - - 131072
+    - - 2097152
+    labels:
+    - context: 1024
+    - context: 32768
+    - context: 131072
+    - context: 2097152
+
+  decode_step:
+    paths:
+    - workload_spec.seq_length
+    - workload_spec.num_generated_tokens
+    - workload_spec.micro_batch_size
+    cases:
+    - - 1
+      - 1
+      - 1
+
+  expert_family_fixed:
+    paths:
+    - model_spec.num_regular_experts
+    - model_spec.num_selected_experts
+    cases:
+    - - 1024
+      - 16
+
+  imbalance:
+    paths:
+    - workload_spec.moe_spec_v2.expert_imbalance
+    cases:
+    - - 1.0
+    - - 4.0
+    - - 8.0
+    - - 16.0
+    - - 32.0
+    labels:
+    - imbalance: 1.0
+    - imbalance: 4.0
+    - imbalance: 8.0
+    - imbalance: 16.0
+    - imbalance: 32.0
+
+  fixed_tp_shape_torus3d:
+    paths:
+    - logical_topology.tag_size.TP_Attn_X
+    - logical_topology.tag_size.TP_Attn_Y
+    - logical_topology.tag_size.TP_Attn_Y1
+    - logical_topology.tag_size.TP_Proj_X
+    - logical_topology.tag_size.TP_Proj_Y
+    - logical_topology.tag_size.TP_Proj_Y1
+    cases:
+    - - 16
+      - 16
+      - 16
+      - 16
+      - 16
+      - 16
+
+  fixed_tp_moe_2d_torus3d:
+    paths:
+    - workload_spec.tp_moe_spec.variant
+    - workload_spec.tp_moe_spec.split_2d
+    cases:
+    - - SHARD_WEIGHTS_2D
+      - x_tags:
+        - TP_MoE_X
+        yz_tags:
+        - TP_MoE_Y
+        - TP_MoE_Y1
+
+  colocated_with_tp_moe_pairs_main:
+    paths:
+    - workload_spec.moe_spec_v2.num_colocated_experts
+    - logical_topology.tag_size.TP_MoE_X
+    - logical_topology.tag_size.TP_MoE_Y
+    - logical_topology.tag_size.TP_MoE_Y1
+    cases:
+    - - 1
+      - 1
+      - 1
+      - 4
+    - - 1
+      - 2
+      - 1
+      - 2
+    - - 1
+      - 4
+      - 1
+      - 1
+    - - 8
+      - 1
+      - 2
+      - 16
+    - - 8
+      - 2
+      - 1
+      - 16
+    - - 8
+      - 4
+      - 1
+      - 8
+    - - 8
+      - 8
+      - 1
+      - 4
+    - - 8
+      - 16
+      - 1
+      - 2
+    - - 32
+      - 1
+      - 8
+      - 16
+    - - 32
+      - 2
+      - 4
+      - 16
+    - - 32
+      - 4
+      - 2
+      - 16
+    - - 32
+      - 8
+      - 1
+      - 16
+    - - 32
+      - 16
+      - 1
+      - 8
+    - - 1024
+      - 16
+      - 16
+      - 16
+    labels:
+    - colocated_experts: 1
+      expert_tp: 4
+      tp_moe_shape: 1x4
+    - colocated_experts: 1
+      expert_tp: 4
+      tp_moe_shape: 2x2
+    - colocated_experts: 1
+      expert_tp: 4
+      tp_moe_shape: 4x1
+    - colocated_experts: 8
+      expert_tp: 32
+      tp_moe_shape: 1x32
+    - colocated_experts: 8
+      expert_tp: 32
+      tp_moe_shape: 2x16
+    - colocated_experts: 8
+      expert_tp: 32
+      tp_moe_shape: 4x8
+    - colocated_experts: 8
+      expert_tp: 32
+      tp_moe_shape: 8x4
+    - colocated_experts: 8
+      expert_tp: 32
+      tp_moe_shape: 16x2
+    - colocated_experts: 32
+      expert_tp: 128
+      tp_moe_shape: 1x128
+    - colocated_experts: 32
+      expert_tp: 128
+      tp_moe_shape: 2x64
+    - colocated_experts: 32
+      expert_tp: 128
+      tp_moe_shape: 4x32
+    - colocated_experts: 32
+      expert_tp: 128
+      tp_moe_shape: 8x16
+    - colocated_experts: 32
+      expert_tp: 128
+      tp_moe_shape: 16x8
+    - colocated_experts: 1024
+      expert_tp: 4096
+      tp_moe_shape: 16x256
+
+  router_g_mode:
+    paths:
+    - workload_spec.decode_moe_router_sync_mode
+    - workload_spec.decode_tp2d_qkv_groups
+    cases:
+    - - replicated_router
+      - 1
+    - - replicated_router
+      - 2
+    - - replicated_router
+      - 4
+    - - replicated_router
+      - 8
+    - - replicated_router
+      - 16
+    - - replicated_router
+      - 32
+    - - replicated_router
+      - 64
+    - - replicated_router
+      - 128
+    - - sharded_router
+      - 1
+    - - sharded_router
+      - 2
+    - - sharded_router
+      - 4
+    - - sharded_router
+      - 8
+    - - sharded_router
+      - 16
+    - - sharded_router
+      - 32
+    - - sharded_router
+      - 64
+    - - sharded_router
+      - 128
+    labels:
+    - router_mode: replicated
+      g: 1
+    - router_mode: replicated
+      g: 2
+    - router_mode: replicated
+      g: 4
+    - router_mode: replicated
+      g: 8
+    - router_mode: replicated
+      g: 16
+    - router_mode: replicated
+      g: 32
+    - router_mode: replicated
+      g: 64
+    - router_mode: replicated
+      g: 128
+    - router_mode: sharded
+      g: 1
+    - router_mode: sharded
+      g: 2
+    - router_mode: sharded
+      g: 4
+    - router_mode: sharded
+      g: 8
+    - router_mode: sharded
+      g: 16
+    - router_mode: sharded
+      g: 32
+    - router_mode: sharded
+      g: 64
+    - router_mode: sharded
+      g: 128
+
+sweep:
+  cartesian:
+  - ref: batch
+  - ref: context
+  - ref: decode_step
+  - ref: expert_family_fixed
+  - ref: imbalance
+  - ref: router_g_mode
+  - ref: fixed_tp_shape_torus3d
+  - ref: fixed_tp_moe_2d_torus3d
+  - ref: colocated_with_tp_moe_pairs_main
+  where:
+  - pydantic_valid
+  - decode_tp2d_qkv_groups_divides_proj_yz
+  - decode_sharded_router_proj_y_eff_matches_moe_y_all_shapes
+  on_fail: skip
+
+report:
+  columns:
+  - name: batch
+    path: labels.batch
+  - name: context
+    path: labels.context
+  - name: imbalance
+    path: labels.imbalance
+  - name: overall_s
+    path: time.total_time_seconds
+  - name: projection_s
+    path: time_breakdown.forward.attn_projection.total_time_seconds
+  - name: projection_compute_s
+    path: time_breakdown.forward.attn_projection.compute_s
+  - name: projection_mem_s
+    path: time_breakdown.forward.attn_projection.memory_s
+  - name: projection_comm_s
+    path: time_breakdown.forward.attn_projection.communication_s
+  - name: core_attn_s
+    path: time_breakdown.forward.attn_core.total_time_seconds
+  - name: core_attn_compute_s
+    path: time_breakdown.forward.attn_core.compute_s
+  - name: core_attn_mem_s
+    path: time_breakdown.forward.attn_core.memory_s
+  - name: core_attn_comm_s
+    path: time_breakdown.forward.attn_core.communication_s
+  - name: moe_s
+    path: time_breakdown.forward.ffn.total_time_seconds
+  - name: moe_compute_s
+    path: time_breakdown.forward.ffn.compute_s
+  - name: moe_mem_s
+    path: time_breakdown.forward.ffn.memory_s
+  - name: moe_comm_s
+    path: time_breakdown.forward.ffn.communication_s
+  - name: colocated_experts
+    path: labels.colocated_experts
+  - name: expert_tp
+    path: labels.expert_tp
+  - name: tp_moe_shape
+    path: labels.tp_moe_shape
+  - name: router_mode
+    path: labels.router_mode
+  - name: g
+    path: labels.g
+  - name: TP_Attn_X
+    path: sweep_case.logical_topology.tag_size.TP_Attn_X
+  - name: TP_Attn_Y
+    path: sweep_case.logical_topology.tag_size.TP_Attn_Y
+  - name: TP_Attn_Y1
+    path: sweep_case.logical_topology.tag_size.TP_Attn_Y1
+  - name: TP_MoE_X
+    path: sweep_case.logical_topology.tag_size.TP_MoE_X
+  - name: TP_MoE_Y
+    path: sweep_case.logical_topology.tag_size.TP_MoE_Y
+  - name: TP_MoE_Y1
+    path: sweep_case.logical_topology.tag_size.TP_MoE_Y1
+  - name: num_complete_sets
+    path: expert_placement.num_complete_expert_sets
+  best:
+  - name: BEST_PLACEMENT_BY_BATCH_CONTEXT_IMBALANCE
+    group_by:
+    - batch
+    - context
+    - imbalance
+    metric: overall_s
+    mode: min

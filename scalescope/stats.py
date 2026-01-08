@@ -12,11 +12,14 @@ class CommStats:
         transmission_time: float = 0,
         comm_vol: float = 0,
         compute_time: float = 0,
+        startup_phase_count: int = 0,
     ):
         self.startup_latency = startup_latency  # Initial latency before communication starts
         self.transmission_time = transmission_time  # Time spent for data transmission
         self.comm_vol = comm_vol  # Communication volume in bytes
         self.compute_time = compute_time  # Time spent in computation
+        # Topology/algorithm phase count independent of alpha.
+        self.startup_phase_count = startup_phase_count
 
     def __add__(self, other):
         return CommStats(
@@ -24,6 +27,7 @@ class CommStats:
             self.transmission_time + other.transmission_time,
             self.comm_vol + other.comm_vol,
             self.compute_time + other.compute_time,
+            self.startup_phase_count + other.startup_phase_count,
         )
 
     def __iadd__(self, other):
@@ -31,6 +35,7 @@ class CommStats:
         self.transmission_time += other.transmission_time
         self.comm_vol += other.comm_vol
         self.compute_time += other.compute_time
+        self.startup_phase_count += other.startup_phase_count
         return self
 
     def __mul__(self, scalar):
@@ -50,6 +55,7 @@ class CommStats:
             self.transmission_time * scalar,
             self.comm_vol * scalar,
             self.compute_time * scalar,
+            int(round(self.startup_phase_count * scalar)),
         )
 
     def __rmul__(self, scalar):
@@ -65,6 +71,7 @@ class CommStats:
         self.transmission_time *= scalar
         self.comm_vol *= scalar
         self.compute_time *= scalar
+        self.startup_phase_count = int(round(self.startup_phase_count * scalar))
         return self
 
     def combine_color(self, other):
@@ -72,6 +79,7 @@ class CommStats:
         self.transmission_time = max(self.transmission_time, other.transmission_time)
         self.comm_vol += other.comm_vol
         self.compute_time += other.compute_time
+        self.startup_phase_count = max(self.startup_phase_count, other.startup_phase_count)
         return self
 
     def __str__(self):
@@ -80,7 +88,8 @@ class CommStats:
             # f"transmission_time={self.transmission_time*1e6:.3f} us, "
             f"transmission_time={self.transmission_time:.3f} s, "
             f"comm_vol={self.comm_vol / (1024*1024):.3f} MB, "
-            f"compute_time={self.compute_time*1e6:.3f} us)"
+            f"compute_time={self.compute_time*1e6:.3f} us, "
+            f"startup_phase_count={self.startup_phase_count})"
         )
 
     @property

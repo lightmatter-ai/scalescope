@@ -8,7 +8,7 @@ sequence length, numeric precision/efficiency knobs).
 
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Type, TypeVar
+from typing import Any, Dict, Literal, Optional, Type, TypeVar
 
 import yaml
 
@@ -54,6 +54,16 @@ class ActivationStorageOptimizationStrategy(StrEnum):
     GATHER_RECOMPUTATION = "gather_recomputation"
 
 
+class MoERouterSyncMode(StrEnum):
+    REPLICATED_ROUTER = "replicated_router"
+    SHARDED_ROUTER = "sharded_router"
+
+
+class MoEA2ACommMode(StrEnum):
+    HIERARCHICAL_SPLIT = "hierarchical_split"
+    FUSED_ND = "fused_nd"
+
+
 # Pydantic Spec Classes
 
 
@@ -65,6 +75,61 @@ class TensorParallelSpec(BaseModel):
     _parse_variant = field_validator("variant", mode="before")(
         parse_enum_by_name_or_value(TensorParallelVariant)
     )
+
+
+class TP2DSplitSpec(BaseModel):
+    """
+    Explicit 2D-TP split specification.
+
+    We keep the nomenclature X vs YZ:
+    - X shards heads (Q/K/V heads)
+    - YZ shards sequence/KV-cache length (context/sequence parallelism)
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    x_tags: list[str] = Field(
+        ..., min_length=1, description="Logical TP dimension tags that form the X axis"
+    )
+    yz_tags: list[str] = Field(
+        ..., min_length=1, description="Logical TP dimension tags that form the YZ axis"
+    )
+
+    @model_validator(mode="after")
+    def _validate_disjoint(self) -> "TP2DSplitSpec":
+        x = set(self.x_tags)
+        yz = set(self.yz_tags)
+        inter = x.intersection(yz)
+        if inter:
+            raise ValueError(
+                f"TP2DSplitSpec x_tags and yz_tags must be disjoint; overlap={sorted(inter)}"
+            )
+        return self
+
+
+class TensorParallelSpecV2(BaseModel):
+    """
+    Tensor-parallel specification with optional explicit 2D split.
+
+    This exists to allow Attn and MoE to have different TP variants and (for 2D) different X/YZ splits.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    variant: TensorParallelVariant = TensorParallelVariant.NONE
+    split_2d: TP2DSplitSpec | None = Field(
+        default=None, description="Required when variant is SHARD_WEIGHTS_2D"
+    )
+
+    _parse_variant = field_validator("variant", mode="before")(
+        parse_enum_by_name_or_value(TensorParallelVariant)
+    )
+
+    @model_validator(mode="after")
+    def _validate_2d_requires_split(self) -> "TensorParallelSpecV2":
+        if self.variant == TensorParallelVariant.SHARD_WEIGHTS_2D and self.split_2d is None:
+            raise ValueError(
+                "TensorParallelSpecV2.split_2d must be set when variant is SHARD_WEIGHTS_2D"
+            )
+        return self
 
 
 class DataParallelSpec(BaseModel):
@@ -87,11 +152,6 @@ class MoESpecV2(BaseModel):
         default=None,
         ge=1,
         description="Replication factor per shared expert; if None, may be inferred later",
-    )
-    expert_high_bandwidth_group_size_xpus: Optional[int] = Field(
-        default=None,
-        ge=1,
-        description="High-bandwidth expert group size in XPUs; if None, can be inferred from EP topology later",
     )
 
 
@@ -123,7 +183,14 @@ class WorkloadSpec(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    tp_spec: TensorParallelSpec = Field(default_factory=TensorParallelSpec)
+    # Tensor-parallel specifications are explicitly separated by block type.
+    # We intentionally do NOT provide a global `tp_spec` default, because there is no single
+    # "good default" across workloads (and implicit fallbacks can be confusing).
+    tp_attn_spec: TensorParallelSpecV2
+    # Optional V2 override for projection TP (QKV + output projection). If omitted, code falls back
+    # to `tp_attn_spec`.
+    tp_proj_spec: TensorParallelSpecV2 | None = None
+    tp_moe_spec: TensorParallelSpecV2
     dp_spec: DataParallelSpec = Field(default_factory=DataParallelSpec)
     # New primary spec
     moe_spec_v2: "MoESpecV2"
@@ -148,10 +215,34 @@ class WorkloadSpec(BaseModel):
     comp_comm_efficiency: float = Field(..., ge=0.0, le=1.0)
     comp_mem_efficiency: float = Field(..., ge=0.0, le=1.0)
     comm_mem_efficiency: float = Field(..., ge=0.0, le=1.0)
+    # TP-MoE expert-input redistribution optimization toggle (mode-agnostic).
+    tp_moe_a2a_replication_optimization: bool = Field(
+        ...,
+        description=(
+            "Controls TP-MoE token redistribution strategy. "
+            "When enabled, routed traffic is first placed on expert shards and then "
+            "redistributed across expert TP shards via all-gather (lower routed A2A bytes, "
+            "extra collective startup). "
+            "When disabled, routed MoE all-to-all carries the direct non-optimized payload."
+        ),
+    )
+    moe_a2a_comm_mode: MoEA2ACommMode = Field(
+        default=MoEA2ACommMode.HIERARCHICAL_SPLIT,
+        description=(
+            "MoE all-to-all communication model: "
+            "'hierarchical_split' uses the original intra/inter split logic; "
+            "'fused_nd' uses a fused N-D total-exchange model."
+        ),
+    )
+
     # Optional: resolved batch sizes attached at runtime (immutable via copy)
     resolved_batches: Optional["ResolvedBatchSizes"] = None
     # Optional: layers per pipeline stage, attached at runtime (do not define in YAML)
     layers_per_pipeline_stage: Optional[int] = Field(default=None)
+
+    _parse_moe_a2a_comm_mode = field_validator("moe_a2a_comm_mode", mode="before")(
+        parse_enum_by_name_or_value(MoEA2ACommMode)
+    )
 
     @classmethod
     def load_from_yaml(cls: Type[T_WorkloadSpec], filepath: str) -> T_WorkloadSpec:
@@ -252,6 +343,29 @@ class WorkloadSpec(BaseModel):
                 "layers_per_pipeline_stage is not attached. Call with_layers_per_pp_stage(...) first."
             )
         return int(layers)
+
+    # ---- TP helpers (backward-compatible) ----
+    def get_attn_tp_spec(self) -> TensorParallelSpecV2:
+        """Return the attention TP spec (V2)."""
+        return self.tp_attn_spec
+
+    def get_moe_tp_spec(self) -> TensorParallelSpecV2:
+        """Return the MoE/FFN TP spec (V2)."""
+        return self.tp_moe_spec
+
+    def get_proj_tp_spec(self) -> TensorParallelSpecV2:
+        """
+        Return the projection TP spec (V2), falling back to the attention TP spec.
+
+        Rationale:
+        - If `tp_proj_spec` is omitted, we assume projections run on the same TP domain/variant
+          as attention (current behavior).
+        - If legacy `tp_spec.variant` is used, `get_attn_tp_spec()` already enforces that 2D TP
+          requires an explicit split.
+        """
+        if self.tp_proj_spec is not None:
+            return self.tp_proj_spec
+        return self.get_attn_tp_spec()
 
 
 @dataclass(frozen=True)
@@ -356,6 +470,50 @@ class InferenceDecodeSpec(WorkloadSpec):
     seq_length: int = Field(
         default=1, gt=0, description="Sequence length per decode step (typically 1)"
     )
+    decode_tp2d_qkv_groups: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Decode-only TP2D knob (projection-domain grouping): split the TP2D YZ domain into `g` independent "
+            "groups for *projection-domain* work (Q/K/V projections and output projection). This reduces the "
+            "projection-domain YZ collective group size (lower comm latency) and increases projection compute "
+            "and projection memory traffic per chip due to replication/duplication across groups. "
+            "Attention-core sharding (and KV-cache footprint) remains determined by the attention TP2D domain. "
+            "1 means no grouping. Must divide the projection TP2D YZ size when used."
+        ),
+    )
+
+    # Decode-only: how to place / communicate K/V under TP2D.
+    #
+    # Semantics:
+    # - reduce_to_owner: K/V are reduced along the YZ axis to a single owner rank (sharded KV-cache).
+    # - allreduce_and_drop: K/V participate in the YZ all-reduce (replicated), and non-owner ranks
+    #   "drop" them afterward. This can reduce the number of distinct collectives (latency),
+    #   but increases bandwidth relative to reduce-to-owner.
+    decode_tp2d_kv_comm_mode: Literal["reduce_to_owner", "allreduce_and_drop"] = Field(
+        default="reduce_to_owner",
+        description=(
+            "Decode-only TP2D knob for K/V placement/communication. "
+            "'reduce_to_owner' models sharded KV-cache via reduce-to-owner along YZ. "
+            "'allreduce_and_drop' models a latency-optimized alternative where K/V are replicated "
+            "via the YZ all-reduce and then discarded on non-owner ranks."
+        ),
+    )
+
+    decode_moe_router_sync_mode: MoERouterSyncMode = Field(
+        ...,
+        description=(
+            "Decode-only MoE router synchronization mode over the attention TP domain. "
+            "'replicated_router' computes full router logits locally on each attention-TP rank "
+            "(no router all-reduce). "
+            "'sharded_router' shards router logits across attention-TP ranks and requires an all-reduce."
+        ),
+    )
+    _parse_decode_moe_router_sync_mode = field_validator(
+        "decode_moe_router_sync_mode", mode="before"
+    )(parse_enum_by_name_or_value(MoERouterSyncMode))
+    # Note: K/V reduce-to-owner is always modeled as a single fused reduce on (K,V) concatenated
+    # payload when decode_tp2d_kv_comm_mode='reduce_to_owner'. We do not expose this as a knob.
 
     @property
     def effective_micro_batch_size(self) -> int:

@@ -1,0 +1,54 @@
+name: "CONF26_TP4096_TP2D_16x16x16_MultiDim_EP256"
+
+dimensions:
+  - logical_tag: "PP"
+    maps_to_physical_dimension_name: "DomainY1"
+    size: 1
+
+  - logical_tag: "TP_Attn_X"
+    maps_to_physical_dimension_name: "DomainX"
+    size: 16
+  - logical_tag: "TP_Attn_Y"
+    maps_to_physical_dimension_name: "DomainY0"
+    size: 16
+  - logical_tag: "TP_Attn_Y1"
+    maps_to_physical_dimension_name: "DomainY1"
+    size: 16
+
+  - logical_tag: "TP_Proj_X"
+    maps_to_physical_dimension_name: "DomainX"
+    size: 16
+  - logical_tag: "TP_Proj_Y"
+    maps_to_physical_dimension_name: "DomainY0"
+    size: 16
+  - logical_tag: "TP_Proj_Y1"
+    maps_to_physical_dimension_name: "DomainY1"
+    size: 16
+
+  - logical_tag: "DP_Attn_SU"
+    maps_to_physical_dimension_name: "DomainY0"
+    size: 1
+  - logical_tag: "DP_Attn_SO"
+    maps_to_physical_dimension_name: "DomainX"
+    size: 1
+  - logical_tag: "DP_MoE"
+    maps_to_physical_dimension_name: "DomainY1"
+    size: 1
+
+  - logical_tag: "TP_MoE_X"
+    maps_to_physical_dimension_name: "DomainX"
+    size: 1
+  - logical_tag: "TP_MoE_Y"
+    maps_to_physical_dimension_name: "DomainY0"
+    size: 1
+  - logical_tag: "TP_MoE_Y1"
+    maps_to_physical_dimension_name: "DomainY1"
+    size: 1
+
+  # EP is intentionally limited to 16x16 in this torus-3D decomposition path.
+  - logical_tag: "EP_SU"
+    maps_to_physical_dimension_name: "DomainY0"
+    size: 16
+  - logical_tag: "EP_SO"
+    maps_to_physical_dimension_name: "DomainX"
+    size: 16

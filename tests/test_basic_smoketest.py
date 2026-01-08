@@ -58,6 +58,7 @@ def test_import_train_spec_classes():
         "DataParallelSpec",
         "PipelineParallelSpec",
         "TensorParallelSpec",
+        "TensorParallelSpecV2",
         "TrainSpec",
     ):
         assert hasattr(ws, name), f"Missing '{name}' in workload_spec"

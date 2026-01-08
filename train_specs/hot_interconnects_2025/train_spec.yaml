@@ -34,9 +34,13 @@ memory_device_map_footprint:
 comp_comm_efficiency: 0.7       # Overlap between compute and communication
 comp_mem_efficiency: 0.7        # Overlap between compute and memory traffic
 comm_mem_efficiency: 0.7        # Overlap between communication and memory traffic
+tp_moe_a2a_replication_optimization: true  # on: send to expert shard then all-gather across expert TP shards; off: regular routed MoE A2A
 
-tp_spec:
-  variant: SHARD_WEIGHTS_1D     # Tensor-parallel strategy for weight sharding (Megatron-style 1D)
+tp_attn_spec:
+  variant: SHARD_WEIGHTS_1D     # Tensor-parallel strategy for attention weights
+
+tp_moe_spec:
+  variant: SHARD_WEIGHTS_1D     # Tensor-parallel strategy for MoE/FFN weights
 
 dp_spec:
   variant: DDP                   # Data-parallel strategy (DDP baseline)

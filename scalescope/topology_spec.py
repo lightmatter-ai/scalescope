@@ -8,7 +8,7 @@ computed properties (shape/total_nodes) and YAML loaders.
 import math
 import os
 from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple, Type, TypeVar, Union
+from typing import Dict, List, Set, Tuple, Type, TypeVar, Union
 
 import yaml
 
@@ -71,8 +71,6 @@ class PhysicalTopology(BaseModel):
     dimensions: List[PhysicalDimension] = Field(
         ..., description="Ordered list of physical dimensions", min_length=1
     )
-    # New: EP high-bandwidth expert group size (in XPUs) for the entire cluster
-    expert_high_bandwidth_group_size_xpus: Optional[int] = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def check_interconnect_references(self) -> "PhysicalTopology":

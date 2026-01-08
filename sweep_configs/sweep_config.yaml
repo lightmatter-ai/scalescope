@@ -1,21 +1,32 @@
-# Sweep definition
+## Sweep DSL example (new system)
+##
+## This file is a template for the new sweep DSL used by `scalescope/run_scalescope.py`.
+##
+## Key ideas:
+## - `leaves`: each leaf sets 1+ paths with aligned `cases` OR uses a `generator`.
+## - `sweep`: expression tree over leaves using `cartesian`, `zip` (strict by default), and `union`.
+## - Optional inline filtering via `where: [verifier_names]` with `on_fail: skip|error`.
+##
+leaves:
+  batch:
+    paths: [workload_spec.global_batch_size]
+    cases:
+      - [1]
+      - [64]
+      - [512]
+
+  # Example of a 2D split leaf (paths are aligned tuples).
+  tp2d_split:
+    paths:
+      - logical_topology.tag_size.TP_Proj_X
+      - logical_topology.tag_size.TP_Proj_YZ
+    generator:
+      name: decompose_with_balanced_multiplicands
+      args: {min_val: 64, max_val: 2048, step: 64}
+
 sweep:
-
-  # List examples
-  train_spec.tp_spec.variant: ["NONE", "SHARD_WEIGHTS_1D"]
-  train_spec.dp_spec.variant: ["ZERO_STAGE_1", "ZERO_STAGE_2"]
-  train_spec.recompute_spec.strategy: ["NONE", "SELECTIVE"]
-
-  # Generator example
-  train_spec.seq_length:
-    generator: perfect_squares
-    min_val: 1024
-    max_val: 8192
-
-  model_spec.mlp_ratio: [3.25, 4.0]
-
-  # Range examples
-  train_spec.global_batch_size:   {min: 1024, max: 4096, step: 1024} # Should generate ints: [1024, 2048, 3096, 4096]
-
-  # Example targeting a topology
-  dp_topology.shape: [[128], [256]] # Sweep shape directly with list
+  cartesian:
+    - ref: batch
+    - ref: tp2d_split
+  where: [pydantic_valid]
+  on_fail: skip

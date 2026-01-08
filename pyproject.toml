@@ -22,7 +22,9 @@ dependencies = [
     "pydantic>=2.11.0",
     "pywebview>=4.0",
     "flask>=2.0.0",
-    "flask-cors>=3.0.0"
+    "flask-cors>=3.0.0",
+    "pytest",
+    "pre-commit"
 ]
 
 [project.scripts]
@@ -55,4 +57,7 @@ max-line-length = 100
 [tool.pytest.ini_options]
 pythonpath = [
   "."
+]
+markers = [
+  "conf26_paper_regression: locks conf26 paper numeric artifact regressions"
 ]

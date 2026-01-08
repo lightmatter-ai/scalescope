@@ -1,0 +1,6 @@
+python_version: Python 3.14.3
+pip_version: 26.0.1
+uname: Darwin 25.3.0 arm64
+sw_vers_product_name: macOS
+sw_vers_product_version: 26.3.1
+sw_vers_build_version: 25D2128

@@ -1,0 +1,67 @@
+# CONF26 base decode spec for projection-group (g) sweeps.
+# TP is fixed by logical topology at 4096 (TP_Attn/TP_Proj = 32 x 128).
+#
+# This spec is intentionally decode-only:
+# - prefill_seq_len is swept as "context length so far"
+# - seq_length = 1 and num_generated_tokens = 1 model a single decode step
+
+global_batch_size: 64
+micro_batch_size: 1
+prefill_seq_len: 1
+num_generated_tokens: 1
+seq_length: 1
+
+decode_moe_router_sync_mode: replicated_router
+float_size_bytes: 1
+
+memory_device_map_traffic:
+  weights: xpu_memory
+  activations: xpu_memory
+  gradients: xpu_memory
+  kv_cache: xpu_memory
+
+memory_device_map_footprint:
+  weights: xpu_memory
+  optimizer_states: xpu_memory
+  saved_activations: xpu_memory
+  gradient_buffers: xpu_memory
+  kv_cache: xpu_memory
+  transient_forward_peak: xpu_memory
+  transient_backward_peak: xpu_memory
+
+# Additive timing (no overlap), matching prior lab-style studies.
+comp_comm_efficiency: 0.0
+comp_mem_efficiency: 0.0
+comm_mem_efficiency: 0.0
+
+tp_moe_a2a_replication_optimization: true
+
+tp_attn_spec:
+  variant: SHARD_WEIGHTS_2D
+  split_2d:
+    x_tags: ["TP_Attn_X"]
+    yz_tags: ["TP_Attn_Y"]
+
+tp_proj_spec:
+  variant: SHARD_WEIGHTS_2D
+  split_2d:
+    x_tags: ["TP_Proj_X"]
+    yz_tags: ["TP_Proj_Y"]
+
+# Keep MoE TP in 2D everywhere; represent 1D by setting Y=1.
+tp_moe_spec:
+  variant: SHARD_WEIGHTS_2D
+  split_2d:
+    x_tags: ["TP_MoE_X"]
+    yz_tags: ["TP_MoE_Y"]
+
+dp_spec:
+  variant: DDP
+
+# Overridden in sweep by expert-family leaves.
+moe_spec_v2:
+  num_colocated_experts: 1024
+  expert_imbalance: 1.0
+
+pp_spec:
+  variant: GPIPE

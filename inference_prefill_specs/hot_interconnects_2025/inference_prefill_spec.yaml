@@ -7,7 +7,7 @@ global_batch_size: 4096         # Total sequences processed per prefill step acr
 micro_batch_size: 2             # Micro-batch size per PP stage; per-DP batch = micro_batch_size * Num_PP_Stages
 seq_length: 8192                # Tokens per sequence (context length) for prefill
 
-float_size_bytes: 2             # Inference precision in bytes (e.g., 2 = bf16/fp16)
+float_size_bytes: 1             # Inference precision in bytes (e.g., 1 = int8/fp8)
 
 # Memory tier mappings for traffic (bytes moved) during prefill.
 memory_device_map_traffic:
@@ -30,9 +30,13 @@ memory_device_map_footprint:
 comp_comm_efficiency: 0.7       # Overlap between compute and communication
 comp_mem_efficiency: 0.7        # Overlap between compute and memory traffic
 comm_mem_efficiency: 0.7        # Overlap between communication and memory traffic
+tp_moe_a2a_replication_optimization: true  # on: send to expert shard then all-gather across expert TP shards; off: regular routed MoE A2A
 
-tp_spec:
-  variant: SHARD_WEIGHTS_1D     # Tensor-parallel strategy for attention/MLP
+tp_attn_spec:
+  variant: SHARD_WEIGHTS_1D     # Tensor-parallel strategy for attention weights
+
+tp_moe_spec:
+  variant: SHARD_WEIGHTS_1D     # Tensor-parallel strategy for MoE/FFN weights
 
 dp_spec:
   variant: DDP                   # Data-parallel strategy

@@ -7,12 +7,19 @@ produces structured YAML summaries (optionally human-formatted) and plots.
 """
 
 import argparse
+import json
 import os
+import shutil
+import subprocess
+from datetime import datetime, timezone
 from enum import Enum
+from hashlib import sha256
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import yaml
+from tqdm import tqdm
 
 import scalescope.plotting as plotting
 from scalescope.comm_model import get_transformer_comm_stats
@@ -20,27 +27,46 @@ from scalescope.compute_model import (
     backward_pass_flops_per_chip,
     calculate_embedding_compute,
     calculate_unembedding_compute,
+    decode_attention_compute_breakdown_per_layer,
     forward_decode_flops_per_chip,
     forward_prefill_flops_per_chip,
     parameter_update_flops,
+    prefill_attention_compute_breakdown_per_layer,
+)
+from scalescope.decode_layout_trace import (
+    build_decode_2dtp_mesh,
+    build_decode_2dtp_trace,
+    LayoutTrace,
+    NULL_LAYOUT_TRACE,
 )
 from scalescope.ep_strategy import infer_expert_placement_per_xpu
 from scalescope.hardware_spec import HardwareRegistry
 from scalescope.memory_model import (
     _backward_attn_tp_1d_memory_traffic,
+    _backward_attn_tp_2d_memory_traffic,
     _backward_moe_tp_1d_memory_traffic,
-    _decode_attention_memory_traffic,
-    _forward_pass_prefill_attention_memory_traffic,
+    _backward_moe_tp_2d_memory_traffic,
+    _decode_attention_attn_tp_1d_memory_traffic,
+    _decode_attention_attn_tp_2d_memory_traffic,
+    _decode_attention_projection_tp_1d_memory_traffic,
+    _decode_attention_projection_tp_2d_memory_traffic,
+    _forward_pass_prefill_attention_attn_tp_1d_memory_traffic,
+    _forward_pass_prefill_attention_attn_tp_2d_memory_traffic,
+    _forward_pass_prefill_attention_projection_tp_1d_memory_traffic,
+    _forward_pass_prefill_attention_projection_tp_2d_memory_traffic,
     _forward_pass_prefill_moe_ffn_tp_1d_memory_traffic,
+    _forward_pass_prefill_moe_ffn_tp_2d_memory_traffic,
     calculate_attn_backward_transient_peak_memory_footprint,
-    calculate_attn_forward_transient_peak_memory_footprint,
+    calculate_attn_forward_transient_peak_memory_footprint_tp1d,
+    calculate_attn_forward_transient_peak_memory_footprint_tp2d,
     calculate_attn_optimizer_states_memory_footprint,
     calculate_attn_saved_activations_memory_footprint,
     calculate_attn_weights_memory_footprint,
     calculate_embedding_memory_traffic_1d_tp_bwd,
     calculate_embedding_memory_traffic_1d_tp_fwd,
     calculate_ffn_moe_backward_transient_peak_memory_footprint,
-    calculate_ffn_moe_forward_transient_peak_memory_footprint,
+    calculate_ffn_moe_forward_transient_peak_memory_footprint_tp1d,
+    calculate_ffn_moe_forward_transient_peak_memory_footprint_tp2d,
     calculate_ffn_moe_optimizer_states_memory_footprint,
     calculate_ffn_moe_saved_activations_memory_footprint,
     calculate_ffn_moe_weights_memory_footprint,
@@ -50,15 +76,24 @@ from scalescope.memory_model import (
     LayerMemoryTraffic,
     MemoryFootprint,
 )
-from scalescope.model_spec import TransformerConfig
+from scalescope.model_spec import resolve_kv_heads_per_partition, TransformerConfig
 from scalescope.pp_strategy import get_pp_strategy
-from scalescope.spec_utils import (
-    convert_sweep_values,
-)
 from scalescope.stats import CommStats
-from scalescope.sweep_utils import generate_specs_from_sweep
+from scalescope.sweep_dsl import (
+    apply_case_to_specs,
+    generate_cases,
+    LeafSpec,
+    NodeSpec,
+    SweepConfig,
+)
 from scalescope.topology_spec import LogicalTopology, PhysicalTopology
-from scalescope.tp_strategy import get_2d_tp_dims, validate_2d_tp_invariants
+from scalescope.tp_strategy import (
+    resolve_tp2d_split,
+    validate_1d_tp_invariants_attn,
+    validate_2d_tp_invariants_attn,
+    validate_2d_tp_invariants_moe,
+    validate_2d_tp_invariants_proj,
+)
 from scalescope.utils import (
     calculate_overlapped_time,
     format_bytes,
@@ -69,6 +104,7 @@ from scalescope.utils import (
 from scalescope.workload_spec import (
     InferenceDecodeSpec,
     InferencePrefillSpec,
+    MoERouterSyncMode,
     TensorParallelVariant,
     TrainSpec,
     WorkloadSpec,
@@ -141,7 +177,13 @@ def parse_arguments():
     )
 
     parser.add_argument(
-        "--sweep-config", type=str, required=True, help="Path to the sweep definition YAML."
+        "--sweep-config",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to the sweep definition YAML. "
+            "When omitted, runs a single default point (no sweep overrides)."
+        ),
     )
 
     parser.add_argument(
@@ -151,6 +193,37 @@ def parse_arguments():
         metavar="OUTPUT_PATH",
         help="Optional path to save the results/output to a file."
         " If not specified, output might go to stdout or a default location.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        metavar="OUTPUT_DIR",
+        help="Optional directory to write sweep artifacts: manifest.yaml and per-run outputs in runs/.",
+    )
+    parser.add_argument(
+        "--save-run-artifacts",
+        action="store_true",
+        help=(
+            "When --output-dir is set, also write one YAML per sweep point under runs/. "
+            "Disabled by default to reduce I/O for large sweeps."
+        ),
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default="scalescope_run",
+        help="Name used for the output subdirectory when --output-dir is set.",
+    )
+    parser.add_argument(
+        "--no-timestamp",
+        action="store_true",
+        help="When --output-dir is set, do not append a timestamp to the run directory name (useful for tests/CI).",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="When --output-dir is set and the run directory already exists, overwrite files in-place.",
     )
 
     parser.add_argument(
@@ -172,28 +245,223 @@ def parse_arguments():
         action="store_true",
         help="Disable human-readable formatting in the YAML file and show raw numerical values instead.",
     )
+    parser.add_argument(
+        "--quiet-layout-trace",
+        action="store_true",
+        help=(
+            "Suppress decode layout trace build/print (expected vs actual tables). "
+            "Recommended for large sweeps."
+        ),
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help=(
+            "Suppress verbose console output: layout traces and per-row statistics. "
+            "Recommended for large sweeps and automated pipelines."
+        ),
+    )
 
     args = parser.parse_args()
 
     # Perform basic validation on paths
-    paths_to_check = {
+    required_paths_to_check = {
         "Hardware library": args.hardware_lib,
         "Physical Topology": args.physical_topology,
         "Logical Topology": args.logical_topology,
         "Model spec": args.model_spec,
         "Workload spec": args.workload_spec,
-        "Sweep config": args.sweep_config,
     }
-    for name, path in paths_to_check.items():
+    for name, path in required_paths_to_check.items():
         if not os.path.exists(path):
             parser.error(f"{name} file not found: {path}")
+    if args.sweep_config is not None and not os.path.exists(args.sweep_config):
+        parser.error(f"Sweep config file not found: {args.sweep_config}")
 
     return args
+
+
+def _git_head_sha(repo_root: Path) -> str | None:
+    """Best-effort git SHA capture for provenance."""
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(repo_root), stderr=subprocess.DEVNULL
+        )
+        return out.decode("utf-8").strip() or None
+    except Exception:
+        return None
+
+
+def _stable_run_id(*, sweep_case: dict, labels: dict) -> str:
+    """Stable ID for a sweep point derived from (case, labels)."""
+    payload = {"case": sweep_case, "labels": labels}
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return sha256(blob).hexdigest()[:16]
+
+
+def _default_single_point_sweep_config() -> SweepConfig:
+    """Return a single identity sweep point when --sweep-config is omitted."""
+    return SweepConfig(
+        leaves={
+            "__base": LeafSpec(name="__base", paths=[], cases=[[]], generator=None, labels=[{}])
+        },
+        sweep=NodeSpec(kind="ref", ref="__base"),
+        report=None,
+    )
+
+
+def _extract_sweep_case_from_row(row: pd.Series) -> dict[str, object]:
+    out: dict[str, object] = {}
+
+    def _set_nested(d: dict, dotted_key: str, value: object) -> None:
+        parts = dotted_key.split(".")
+        cur: dict = d
+        for p in parts[:-1]:
+            nxt = cur.get(p)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                cur[p] = nxt
+            cur = nxt
+        cur[parts[-1]] = value
+
+    for k, v in row.items():
+        if isinstance(k, str) and k.startswith("sweep."):
+            dotted_key = k[len("sweep.") :]  # noqa E203
+            _set_nested(out, dotted_key, v)
+    return out
+
+
+def _resolve_run_output_dir(args) -> Path:
+    base = Path(args.output_dir).expanduser()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_dir_name = args.run_name if args.no_timestamp else f"{args.run_name}__{stamp}"
+    run_dir = base / run_dir_name
+    if run_dir.exists() and not args.overwrite:
+        raise FileExistsError(
+            f"Output dir already exists: {run_dir}. Use --overwrite or --no-timestamp/--run-name to change it."
+        )
+    if run_dir.exists() and args.overwrite:
+        # Avoid stale artifacts from previous runs (e.g., old run YAMLs/summary rows)
+        # mixing with the new run when reusing the same output directory.
+        for child in run_dir.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_run_artifacts:
+        (run_dir / "runs").mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def _extract_by_path(obj: object, path: str):
+    """Extract a nested value from dict-like objects using dotted paths (e.g. 'time.total_time_seconds')."""
+    cur = obj
+    for part in path.split("."):
+        if isinstance(cur, dict):
+            if part not in cur:
+                return None
+            cur = cur[part]
+        else:
+            return None
+    return cur
+
+
+def _where_predicate_ok(row: dict, pred: dict) -> bool:
+    lhs = row.get(pred["col"])
+    rhs = pred.get("value")
+    op = pred["op"]
+    try:
+        if op == "==":
+            return lhs == rhs
+        if op == "!=":
+            return lhs != rhs
+        if op == "<":
+            return lhs < rhs
+        if op == "<=":
+            return lhs <= rhs
+        if op == ">":
+            return lhs > rhs
+        if op == ">=":
+            return lhs >= rhs
+    except Exception:
+        return False
+    return False
+
+
+def _write_summary_csv(*, run_dir: Path, manifest: dict, records: list[dict], report_spec) -> None:
+    """Write summary.csv for a sweep run directory if a report spec is present."""
+    if report_spec is None:
+        return
+
+    # Build flat rows by extracting requested columns from each record by path.
+    rows: list[dict] = []
+    for rec in records:
+        flat = {}
+        for col in report_spec.columns:
+            flat[col.name] = _extract_by_path(rec, col.path)
+        rows.append(flat)
+
+    # Compute BEST markers (optional).
+    best_col = "Best"
+    for r in rows:
+        r[best_col] = ""
+    if report_spec.best:
+        for rule in report_spec.best:
+            eligible_idx = list(range(len(rows)))
+            if rule.where:
+                eligible_idx = [
+                    i
+                    for i in eligible_idx
+                    if all(
+                        _where_predicate_ok(rows[i], {"col": p.col, "op": p.op, "value": p.value})
+                        for p in rule.where
+                    )
+                ]
+
+            # Group and select winner by metric.
+            groups: dict[tuple, list[int]] = {}
+            for i in eligible_idx:
+                key = tuple(rows[i].get(k) for k in rule.group_by)
+                groups.setdefault(key, []).append(i)
+
+            for _, idxs in groups.items():
+
+                def metric_val(ii: int):
+                    return rows[ii].get(rule.metric)
+
+                # Prefer numeric comparison; if missing, ignore those rows.
+                valid = [ii for ii in idxs if metric_val(ii) is not None]
+                if not valid:
+                    continue
+                if rule.mode == "min":
+                    winner = min(valid, key=lambda ii: metric_val(ii))
+                else:
+                    winner = max(valid, key=lambda ii: metric_val(ii))
+                cur = rows[winner].get(best_col) or ""
+                rows[winner][best_col] = (cur + " " + rule.name).strip()
+
+    # Write CSV.
+    import csv
+
+    out_path = run_dir / "summary.csv"
+    fieldnames = [c.name for c in report_spec.columns] + [best_col]
+    with open(out_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k) for k in fieldnames})
+
+    # Also record in manifest that summary exists.
+    manifest.setdefault("artifacts", {})
+    manifest["artifacts"]["summary_csv"] = "summary.csv"
 
 
 def main():
     try:
         args = parse_arguments()
+        quiet = bool(args.quiet) or bool(args.quiet_layout_trace)
+        enable_decode_layout_trace = not quiet
 
         print("--- Parsed Arguments ---")
         print(f"Hardware Library: {args.hardware_lib}")
@@ -201,7 +469,7 @@ def main():
         print(f"Workload Spec:    {args.workload_spec}")
         print(f"Physical Topology File: {args.physical_topology}")
         print(f"Logical Topology File: {args.logical_topology}")
-        print(f"Sweep Configuration: {args.sweep_config}")
+        print(f"Sweep Configuration: {args.sweep_config or '(none; single default point)'}")
 
     except SystemExit:
         # argparse raises SystemExit on error or --help, allow it to exit cleanly
@@ -261,29 +529,12 @@ def main():
         base_specs["physical_topology"] = phys_topo
         base_specs["logical_topology"] = log_topo
 
-        # load sweep config
-        with open(args.sweep_config, "r") as f:
-            sweep_yaml_data = yaml.safe_load(f)
-
-        # Distinguish empty vs malformed
-        if sweep_yaml_data is None:
-            print("Sweep YAML is empty. Proceeding with no sweep.")
-            processed_sweep_config = {}
-        elif not isinstance(sweep_yaml_data, dict):
-            raise TypeError("Sweep YAML is malformed: top-level must be a mapping (dictionary).")
+        if args.sweep_config:
+            sweep_cfg = SweepConfig.load_from_yaml(args.sweep_config)
+            print("\nLoaded sweep DSL config.")
         else:
-            if "sweep" not in sweep_yaml_data:
-                print("Sweep YAML has no 'sweep' key. Proceeding with no sweep.")
-                processed_sweep_config = {}
-            else:
-                raw_sweep_dict = sweep_yaml_data["sweep"]
-                if not isinstance(raw_sweep_dict, dict):
-                    raise TypeError("Sweep YAML is malformed: 'sweep' value must be a dictionary.")
-                # convert sweep values (e.g., strings to Enums) ---
-                processed_sweep_config = convert_sweep_values(raw_sweep_dict, base_specs)
-
-        print("\nProcessed sweep config (Python types):")
-        print(processed_sweep_config)
+            sweep_cfg = _default_single_point_sweep_config()
+            print("\nNo sweep config provided; using single default point.")
 
     except Exception as e:
         print(f"Error loading configuration files: {e}")
@@ -291,7 +542,12 @@ def main():
 
     # Do not mutate or replace model_spec here; compute per-stage layers later per sweep iteration
     # Build results dataframe (separate from plotting)
-    df = build_results_df(base_specs, processed_sweep_config, args.pass_mode)
+    df = build_results_df(
+        base_specs,
+        sweep_cfg,
+        args.pass_mode,
+        enable_decode_layout_trace=enable_decode_layout_trace,
+    )
 
     # Save sweep results if requested
     if args.output_file:
@@ -309,26 +565,109 @@ def main():
                 )
             print(f"Saved detailed results to {args.output_file}")
 
-    # Display concise summary to console
-    try:
-        print("\n--- Row-wise Statistics ---")
-        for i, row in df.iterrows():
-            try:
-                tp = row.get(plotting.tp_xpu_count_label, None)
-                dp = row.get(plotting.dp_ranks_label, None)
-                secs = row[plotting.time_to_train_sec_label]
-                days = row[plotting.time_to_train_day_label]
-                tps = row.get(plotting.tokens_per_second_label, None)
-                print(
-                    f"row {i+1}: TP_XPU_Count={tp}, DP_Ranks={dp}, Time_Sec={secs}, Time_Day={days}, Tokens_Per_Sec={tps}"
+    # Save sweep artifacts directory if requested
+    if args.output_dir:
+        repo_root = Path(__file__).resolve().parents[1]
+        run_dir = _resolve_run_output_dir(args)
+        git_sha = _git_head_sha(repo_root)
+
+        runs_index = []
+        run_records = []
+        total_records = int(df.shape[0])
+        if args.save_run_artifacts:
+            print(f"Writing run artifacts: {total_records} files")
+            artifact_iter = tqdm(
+                df.iterrows(),
+                total=total_records,
+                desc="Artifact progress",
+                unit="run",
+                dynamic_ncols=True,
+                leave=False,
+            )
+        else:
+            print(
+                "Run artifacts disabled (use --save-run-artifacts to enable per-point YAML files)."
+            )
+            artifact_iter = df.iterrows()
+
+        for step, (_, row) in enumerate(artifact_iter, start=1):
+            record = structure_run_results(row, not args.raw_output)
+            sweep_case = record.get("sweep_case") or {}
+            labels = record.get("labels") or {}
+            run_id = _stable_run_id(sweep_case=sweep_case, labels=labels)
+            record["run_id"] = run_id
+            run_records.append(record)
+            if args.save_run_artifacts:
+                run_rel = Path("runs") / f"{run_id}.yaml"
+                run_path = run_dir / run_rel
+                with open(run_path, "w") as f:
+                    yaml.dump(record, f, indent=2, sort_keys=False, default_flow_style=False)
+                runs_index.append(
+                    {
+                        "run_id": run_id,
+                        "path": str(run_rel),
+                        "labels": labels,
+                        "sweep_case": sweep_case,
+                    }
                 )
-                # Required final lines per row
-                print(f"workload_time_days: {days}")
-                print(f"workload_time_seconds: {secs}")
-            except Exception as e:
-                print(f"row {i+1}: (unable to print all stats: {e})")
-    except Exception as e:
-        print(f"Warning: Failed to compute/print summary stats: {e}")
+
+        if args.save_run_artifacts:
+            artifact_iter.close()
+
+        manifest = {
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "git": {"head_sha": git_sha},
+            "inputs": {
+                "hardware_lib": args.hardware_lib,
+                "physical_topology": args.physical_topology,
+                "logical_topology": args.logical_topology,
+                "workload_spec": args.workload_spec,
+                "model_spec": args.model_spec,
+                "sweep_config": args.sweep_config,
+                "pass_mode": (
+                    args.pass_mode.value
+                    if hasattr(args.pass_mode, "value")
+                    else str(args.pass_mode)
+                ),
+                "raw_output": bool(args.raw_output),
+            },
+            "run": {
+                "run_name": args.run_name,
+                "timestamped": (not args.no_timestamp),
+            },
+            "num_runs": len(run_records),
+            "num_run_artifacts": len(runs_index),
+            "save_run_artifacts": bool(args.save_run_artifacts),
+            "runs": runs_index if args.save_run_artifacts else [],
+        }
+        # Optional summary/reporting (driven by sweep config's `report:` section).
+        _write_summary_csv(
+            run_dir=run_dir, manifest=manifest, records=run_records, report_spec=sweep_cfg.report
+        )
+        with open(run_dir / "manifest.yaml", "w") as f:
+            yaml.dump(manifest, f, indent=2, sort_keys=False, default_flow_style=False)
+        print(f"Saved sweep artifacts to {run_dir}")
+
+    # Display per-row summary to console (suppressed by --quiet)
+    if not quiet:
+        try:
+            print("\n--- Row-wise Statistics ---")
+            for i, row in df.iterrows():
+                try:
+                    tp = row.get(plotting.tp_xpu_count_label, None)
+                    dp = row.get(plotting.dp_ranks_label, None)
+                    secs = row[plotting.time_to_train_sec_label]
+                    days = row[plotting.time_to_train_day_label]
+                    tps = row.get(plotting.tokens_per_second_label, None)
+                    print(
+                        f"row {i+1}: TP_XPU_Count={tp}, DP_Ranks={dp}, Time_Sec={secs}, Time_Day={days}, Tokens_Per_Sec={tps}"
+                    )
+                    print(f"workload_time_days: {days}")
+                    print(f"workload_time_seconds: {secs}")
+                except Exception as e:
+                    print(f"row {i+1}: (unable to print all stats: {e})")
+        except Exception as e:
+            print(f"Warning: Failed to compute/print summary stats: {e}")
 
     # Optional plotting
     try:
@@ -338,16 +677,206 @@ def main():
             print(f"Warning: plotting failed: {e}")
 
 
+_decode_trace_emitted: set[str] = set()
+
+
+def _resolve_decode_trace_params(
+    *,
+    model_spec: TransformerConfig,
+    moe_config,
+    proj_tp_topology_view,
+    attn_tp_topology_view,
+    moe_tp_topology_view,
+    proj_x_dims,
+    proj_yz_dims,
+    attn_yz_dims,
+    moe_x_dims,
+    moe_yz_dims,
+    g: int,
+    router_sync_mode,
+):
+    """Extract resolved TP params needed for trace construction."""
+
+    def _prod(shape, indices):
+        if indices is None:
+            return 1
+        p = 1
+        for idx in indices:
+            p *= shape[idx]
+        return p
+
+    shape_proj = proj_tp_topology_view.shape
+    shape_moe = moe_tp_topology_view.shape
+    tp_x = _prod(shape_proj, proj_x_dims)
+    tp_yz_proj = _prod(shape_proj, proj_yz_dims)
+    tp_y = tp_yz_proj * g
+    if moe_x_dims is None and moe_yz_dims is None:
+        # 1D MoE TP: treat full MoE mesh size as effective YZ and X=1 for trace consistency.
+        moe_tp_x = 1
+        moe_tp_yz = _prod(shape_moe, range(len(shape_moe)))
+    else:
+        moe_tp_x = _prod(shape_moe, moe_x_dims)
+        moe_tp_yz = _prod(shape_moe, moe_yz_dims)
+
+    n_experts = model_spec.num_regular_experts
+    top_k = model_spec.num_selected_experts
+    c = moe_config.num_colocated_experts
+
+    if hasattr(router_sync_mode, "value"):
+        s = str(router_sync_mode.value).lower()
+    elif isinstance(router_sync_mode, str):
+        s = router_sync_mode.lower()
+    else:
+        raise ValueError(
+            "router_sync_mode must have .value or be str, got " f"{type(router_sync_mode).__name__}"
+        )
+    if "sharded" in s:
+        router_mode = "sharded"
+    elif "replicated" in s:
+        router_mode = "replicated"
+    else:
+        raise ValueError(
+            f"router_sync_mode value must contain 'sharded' or 'replicated', got {s!r}"
+        )
+
+    return dict(
+        tp_x=tp_x,
+        tp_y=tp_y,
+        moe_tp_x=moe_tp_x,
+        moe_tp_yz=moe_tp_yz,
+        g=g,
+        c=c,
+        n_experts=n_experts,
+        top_k=top_k,
+        router_mode=router_mode,
+    )
+
+
+def _emit_decode_layout_trace(
+    *,
+    model_spec: TransformerConfig,
+    workload_spec,
+    moe_config,
+    attn_tp_topology_view,
+    proj_tp_topology_view,
+    moe_tp_topology_view,
+    attn_x_dims,
+    attn_yz_dims,
+    proj_x_dims,
+    proj_yz_dims,
+    moe_x_dims,
+    moe_yz_dims,
+    g: int,
+    router_sync_mode,
+    actual_trace: "LayoutTrace | None" = None,
+):
+    """Build the expected decode pipeline layout trace and compare against actual.
+
+    Prints the expected trace table and any diffs with the actual trace once per
+    unique (tp_x, tp_y, g, c, router_mode) combination.
+    """
+    import logging
+
+    log = logging.getLogger("scalescope.decode_layout_trace")
+
+    params = _resolve_decode_trace_params(
+        model_spec=model_spec,
+        moe_config=moe_config,
+        proj_tp_topology_view=proj_tp_topology_view,
+        attn_tp_topology_view=attn_tp_topology_view,
+        moe_tp_topology_view=moe_tp_topology_view,
+        proj_x_dims=proj_x_dims,
+        proj_yz_dims=proj_yz_dims,
+        attn_yz_dims=attn_yz_dims,
+        moe_x_dims=moe_x_dims,
+        moe_yz_dims=moe_yz_dims,
+        g=g,
+        router_sync_mode=router_sync_mode,
+    )
+
+    n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
+    context_len = workload_spec.prefill_seq_len
+
+    trace_key = (
+        params["tp_x"],
+        params["tp_y"],
+        params["moe_tp_x"],
+        params["moe_tp_yz"],
+        params["g"],
+        params["c"],
+        params["router_mode"],
+        model_spec.d_model,
+        model_spec.mlp_hidden_size,
+        n_batch,
+        context_len,
+    )
+    if trace_key in _decode_trace_emitted:
+        return
+    _decode_trace_emitted.add(trace_key)
+
+    try:
+        expected = build_decode_2dtp_trace(
+            d_model=model_spec.d_model,
+            d_ff=model_spec.mlp_hidden_size,
+            n_heads=model_spec.num_heads,
+            n_kv_heads=model_spec.num_kv_heads,
+            n_experts=params["n_experts"],
+            top_k=params["top_k"],
+            tp_x=params["tp_x"],
+            tp_y=params["tp_y"],
+            g=params["g"],
+            c=params["c"],
+            router_mode=params["router_mode"],
+            s=1,
+            dtype_bytes=workload_spec.float_size_bytes,
+            context_len=context_len,
+            moe_tp_x=params["moe_tp_x"],
+            moe_tp_yz=params["moe_tp_yz"],
+        )
+        print(
+            f"\n--- Decode 2D-TP Layout Trace [expected] (router_mode={params['router_mode']}, batch={n_batch}, ctx={context_len}) ---"
+        )
+        print(expected.format_table())
+        print()
+
+        if actual_trace is not None and actual_trace.records:
+            print(
+                f"--- Decode 2D-TP Layout Trace [actual from code] (batch={n_batch}, ctx={context_len}) ---"
+            )
+            print(actual_trace.format_table())
+            print()
+
+            diffs = actual_trace.compare_with(expected)
+            if diffs:
+                print("=== Expected vs Actual DIFFERENCES ===")
+                for d in diffs:
+                    print(f"  DIFF: {d}")
+            else:
+                print("=== Expected vs Actual: MATCH (all partitions consistent) ===")
+            print()
+
+    except Exception as exc:
+        log.warning("Decode layout trace failed: %s", exc, exc_info=True)
+
+
 def get_model_stats(
     cluster_physical_topology,
     cluster_logical_topology,
     model_spec: TransformerConfig,
     workload_spec: WorkloadSpec,
     pass_mode,
+    *,
+    enable_decode_layout_trace: bool = True,
 ):
 
     d_model = model_spec.d_model
-    tensor_parallel_variant = workload_spec.tp_spec.variant
+    # Allow different TP strategies for attention vs MoE (explicit V2 specs).
+    attn_tp_spec = workload_spec.get_attn_tp_spec()
+    proj_tp_spec = workload_spec.get_proj_tp_spec()
+    moe_tp_spec = workload_spec.get_moe_tp_spec()
+    attn_tp_variant = attn_tp_spec.variant
+    proj_tp_variant = proj_tp_spec.variant
+    moe_tp_variant = moe_tp_spec.variant
     data_parallel_variant = workload_spec.dp_spec.variant
     # Derive PP stages strictly from the logical topology (PP tag size)
     pp_stages = cluster_logical_topology.get_mapping_for_tag("PP").size
@@ -374,6 +903,10 @@ def get_model_stats(
         view_name="EP_View", prefix="EP", global_sharing_context="max_exclusive"
     )
 
+    pp_topology_view = cluster_logical_topology.create_view(
+        view_name="PP_View", relevant_tags=["PP"], global_sharing_context="max_exclusive"
+    )
+
     tp_topology_view = cluster_logical_topology.create_view_from_prefix(
         view_name="TP_View", prefix="TP", global_sharing_context="max_exclusive"
     )
@@ -381,6 +914,21 @@ def get_model_stats(
     attn_tp_topology_view = tp_topology_view.create_view_from_prefix(
         view_name="TP_Attn_View", prefix="TP_Attn", global_sharing_context="max_exclusive"
     )
+
+    # Optional TP_Proj view: only created/used if tp_proj_spec is explicitly provided in the workload.
+    # If omitted, we explicitly reuse TP_Attn_View (current behavior).
+    if getattr(workload_spec, "tp_proj_spec", None) is not None:
+        proj_tp_topology_view = tp_topology_view.create_view_from_prefix(
+            view_name="TP_Proj_View", prefix="TP_Proj", global_sharing_context="max_exclusive"
+        )
+    else:
+        proj_tp_topology_view = attn_tp_topology_view
+
+    # For now, require proj TP variant to match attn TP variant (keeps integration simple and avoids silent changes).
+    if proj_tp_variant != attn_tp_variant:
+        raise ValueError(
+            f"tp_proj_spec.variant ({proj_tp_variant}) must match tp_attn_spec.variant ({attn_tp_variant}) for now."
+        )
 
     moe_tp_topology_view = tp_topology_view.create_view_from_prefix(
         view_name="TP_MoE_View", prefix="TP_MoE", global_sharing_context="max_exclusive"
@@ -406,22 +954,57 @@ def get_model_stats(
         view_name="DP_MoE", relevant_tags=["DP_MoE"], global_sharing_context="max_exclusive"
     )
 
-    # Configure MoE from v2 spec and derive EP placement directly
-    # Use the size of the IntraPodFabric physical dimension as the expert high-bandwidth group
-    phys_expert_hb_group = cluster_physical_topology.get_dimension("IntraPodFabric").size
+    # Configure MoE from v2 spec and derive EP placement directly.
+    #
+    # Policy: require EP_SU to be present in the logical topology. We do not accept any alternate
+    # physical-topology knobs for this (lab-style and production topologies should encode it in EP_SU).
     v2_spec = workload_spec.moe_spec_v2
-    v2_spec = v2_spec.model_copy(
-        update={"expert_high_bandwidth_group_size_xpus": phys_expert_hb_group}
-    )
+    try:
+        _ = cluster_logical_topology.get_mapping_for_tag("EP_SU").size
+    except Exception as e:
+        raise ValueError(
+            "Logical topology must define `EP_SU` (size >= 1). ScaleScope uses EP_SU to define the "
+            f"expert high-bandwidth group. Error: {e}"
+        ) from e
+
+    if pass_mode == PassMode.INFERENCE_DECODE:
+        assert isinstance(workload_spec, InferenceDecodeSpec)
+        router_sync_mode = workload_spec.decode_moe_router_sync_mode
+    else:
+        router_sync_mode = MoERouterSyncMode.REPLICATED_ROUTER
+
+    # Resolve router_shard_factor: number of ranks across which the router
+    # weight is sharded.  After AG(X) in 2D TP the router sees D/Y_eff, so
+    # sharded_router uses Y_eff; replicated_router is always 1.
+    # For 1D TP, sharded_router uses the full attention TP size.
+    if router_sync_mode == MoERouterSyncMode.REPLICATED_ROUTER:
+        _router_shard_factor = 1
+    elif router_sync_mode == MoERouterSyncMode.SHARDED_ROUTER:
+        if moe_tp_variant == TensorParallelVariant.SHARD_WEIGHTS_2D:
+            _resolved_moe_split = resolve_tp2d_split(
+                tp_view=moe_tp_topology_view,
+                split_2d=moe_tp_spec.split_2d,
+                view_name="TP_MoE_router",
+            )
+            _router_shard_factor = _resolved_moe_split.tp_yz
+        else:
+            _router_shard_factor = attn_tp_topology_view.num_chips
+    else:
+        raise ValueError(f"Unsupported router_sync_mode: {router_sync_mode}")
 
     moe_config = infer_expert_placement_per_xpu(
         model_spec=model_spec,
         moe_v2=v2_spec,
         attn_tp_size=attn_tp_topology_view.num_chips,
-        expert_tp_size=moe_tp_topology_view.num_chips,
+        xpus_per_colocated_group=moe_tp_topology_view.num_chips,
         ep_chips_per_pp_stage=attn_dp_topology_view.num_chips * attn_tp_topology_view.num_chips,
+        router_sync_mode=router_sync_mode,
+        router_shard_factor=_router_shard_factor,
+        tp_moe_a2a_replication_optimization_enabled=workload_spec.tp_moe_a2a_replication_optimization,
     )
-
+    # MoE placement fields in `moe_config` drive both EP A2A and TP-MoE comm paths.
+    # We intentionally use the same placement-locality semantics for both (smooth remote fraction
+    # over DP feeder groups and colocated expert groups) so TP1D/TP2D comparisons are consistent.
     # Attach resolved batch sizes to the workload spec (global-first derivation)
     workload_spec = workload_spec.with_resolved_batches(
         attn_dp_topology_view.num_chips,
@@ -429,6 +1012,98 @@ def get_model_stats(
     )
     batch_sizes = workload_spec.get_resolved_batches()
     batch_size_per_dp = batch_sizes.batch_size_per_dp
+
+    # ------------------------------------------------------------------------------------------
+    # Decode-only TP2D policy: decode_tp2d_qkv_groups
+    #
+    # Semantics (global, not comm-only):
+    # - We reduce the *effective* TP2D YZ degree for attention/projection by a factor of g.
+    # - This models "replicating" work across g independent YZ groups: comm collectives run on a
+    #   smaller group, but compute + memory + KV-cache footprint per chip increase accordingly
+    #   because sharding is reduced.
+    # - Physical XPU counts/topology are unchanged; we only create derived *model views* for costs.
+    # ------------------------------------------------------------------------------------------
+    def _resize_view_tag_size(*, view, tag: str, new_size: int, view_name: str):
+        mapping = view.get_mapping_for_tag(tag)
+        if mapping.size == new_size:
+            return view
+        new_dims = []
+        for d in view.dimensions:
+            d_tag = d.logical_tag.value if isinstance(d.logical_tag, Enum) else d.logical_tag
+            if d_tag == tag:
+                new_dims.append(d.model_copy(update={"size": new_size}))
+            else:
+                new_dims.append(d)
+        return view.model_copy(update={"name": view_name, "dimensions": new_dims})
+
+    if pass_mode == PassMode.INFERENCE_DECODE:
+        assert isinstance(workload_spec, InferenceDecodeSpec)
+        g = int(getattr(workload_spec, "decode_tp2d_qkv_groups", 1) or 1)
+        if g < 1:
+            raise ValueError("decode_tp2d_qkv_groups must be >= 1")
+        if g > 1:
+            if attn_tp_variant != TensorParallelVariant.SHARD_WEIGHTS_2D:
+                raise ValueError(
+                    "decode_tp2d_qkv_groups > 1 currently requires TP-2D attention (variant: SHARD_WEIGHTS_2D)."
+                )
+            if attn_tp_spec.split_2d is None or proj_tp_spec.split_2d is None:
+                raise ValueError(
+                    "decode_tp2d_qkv_groups > 1 requires explicit tp_attn_spec.split_2d and tp_proj_spec.split_2d."
+                )
+            if len(attn_tp_spec.split_2d.yz_tags) == 0 or len(proj_tp_spec.split_2d.yz_tags) == 0:
+                raise ValueError(
+                    "decode_tp2d_qkv_groups requires non-empty yz_tags for both attn and proj split_2d specs."
+                )
+            proj_yz_tags = proj_tp_spec.split_2d.yz_tags
+            proj_yz_size = 1
+            for proj_yz_tag in proj_yz_tags:
+                proj_yz_size *= proj_tp_topology_view.get_mapping_for_tag(proj_yz_tag).size
+            if proj_yz_size % g != 0:
+                raise ValueError(
+                    f"decode_tp2d_qkv_groups={g} must divide projection TP2D YZ size {proj_yz_size} "
+                    f"(yz_tags={proj_yz_tags})."
+                )
+
+            # IMPORTANT: This policy is intended to affect *projection-domain* work (Q/K/V projections and
+            # output projection) without changing attention-core sharding / KV-cache footprint.
+            #
+            # Therefore, we only shrink the *projection* effective YZ degree. Attention TP2D (and KV-cache
+            # sequence sharding on YZ) remains determined by TP_Attn_View.
+            #
+            # If projection and attention share the same physical TP view (common case), we must create a
+            # derived projection view rather than aliasing the attention view.
+            if proj_tp_topology_view is attn_tp_topology_view:
+                proj_tp_topology_view = proj_tp_topology_view.model_copy(
+                    update={"name": f"{proj_tp_topology_view.name}__proj_domain"}
+                )
+            # Distribute the projection-domain shrink factor `g` across multiple YZ tags.
+            # We walk tags in reverse order and, for each tag, take the largest divisor that
+            # divides both (a) the remaining `g` factor and (b) that tag's current size. Each
+            # accepted divisor reduces that tag size and updates the remaining factor. If any
+            # factor remains at the end, this split is infeasible for the current yz_tags sizes.
+            remaining_divisor = g
+            for proj_yz_tag in reversed(proj_yz_tags):
+                if remaining_divisor == 1:
+                    break
+                current_size = proj_tp_topology_view.get_mapping_for_tag(proj_yz_tag).size
+                tag_divisor = remaining_divisor
+                while tag_divisor > 1 and (
+                    remaining_divisor % tag_divisor != 0 or current_size % tag_divisor != 0
+                ):
+                    tag_divisor -= 1
+                if tag_divisor > 1:
+                    proj_tp_topology_view = _resize_view_tag_size(
+                        view=proj_tp_topology_view,
+                        tag=proj_yz_tag,
+                        new_size=current_size // tag_divisor,
+                        view_name=f"{proj_tp_topology_view.name}__{proj_yz_tag}_div{tag_divisor}",
+                    )
+                    remaining_divisor //= tag_divisor
+
+            if remaining_divisor != 1:
+                raise ValueError(
+                    f"decode_tp2d_qkv_groups={g} could not be distributed across projection yz_tags={proj_yz_tags}."
+                )
 
     match pass_mode:
         case PassMode.TRAINING:
@@ -444,7 +1119,28 @@ def get_model_stats(
                 compute_time_attn_fwd,
                 compute_time_moe_fwd,
             ) = forward_prefill_flops_per_chip(
-                attn_tp_topology_view, moe_tp_topology_view, model_spec, moe_config, workload_spec
+                proj_tp_topology_view,  # proj_tp_topology
+                attn_tp_topology_view,
+                moe_tp_topology_view,
+                model_spec,
+                moe_config,
+                workload_spec,
+            )
+
+            # Attention compute breakdown: projection vs core attention (per-batch, per-chip)
+            attn_proj_compute_time_fwd_per_layer, _, attn_core_compute_time_fwd_per_layer, _ = (
+                prefill_attention_compute_breakdown_per_layer(
+                    proj_tp_topology=proj_tp_topology_view,
+                    attn_tp_topology=attn_tp_topology_view,
+                    transformer_config=model_spec,
+                    workload_spec=workload_spec,
+                )
+            )
+            attn_proj_compute_time_fwd = (
+                attn_proj_compute_time_fwd_per_layer * workload_spec.get_layers_per_pp_stage()
+            )
+            attn_core_compute_time_fwd = (
+                attn_core_compute_time_fwd_per_layer * workload_spec.get_layers_per_pp_stage()
             )
 
             # Embedding/Unembedding compute (prefill)
@@ -469,6 +1165,7 @@ def get_model_stats(
                 compute_time_attn_bwd,
                 compute_time_moe_bwd,
             ) = backward_pass_flops_per_chip(
+                proj_tp_topology_view,  # proj_tp_topology
                 attn_tp_topology_view,
                 moe_tp_topology_view,
                 model_spec,
@@ -493,7 +1190,28 @@ def get_model_stats(
                 compute_time_attn_fwd,
                 compute_time_moe_fwd,
             ) = forward_prefill_flops_per_chip(
-                attn_tp_topology_view, moe_tp_topology_view, model_spec, moe_config, workload_spec
+                proj_tp_topology_view,  # proj_tp_topology
+                attn_tp_topology_view,
+                moe_tp_topology_view,
+                model_spec,
+                moe_config,
+                workload_spec,
+            )
+
+            # Attention compute breakdown: projection vs core attention (per-batch, per-chip)
+            attn_proj_compute_time_fwd_per_layer, _, attn_core_compute_time_fwd_per_layer, _ = (
+                prefill_attention_compute_breakdown_per_layer(
+                    proj_tp_topology=proj_tp_topology_view,
+                    attn_tp_topology=attn_tp_topology_view,
+                    transformer_config=model_spec,
+                    workload_spec=workload_spec,
+                )
+            )
+            attn_proj_compute_time_fwd = (
+                attn_proj_compute_time_fwd_per_layer * workload_spec.get_layers_per_pp_stage()
+            )
+            attn_core_compute_time_fwd = (
+                attn_core_compute_time_fwd_per_layer * workload_spec.get_layers_per_pp_stage()
             )
 
             # backward pass
@@ -522,9 +1240,28 @@ def get_model_stats(
             moe_flops_forward_pass = 0
             compute_time_attn_fwd = 0
             compute_time_moe_fwd = 0
+            attn_proj_compute_time_fwd = 0.0
+            attn_core_compute_time_fwd = 0.0
 
             for i in range(num_decode_steps):
                 n_seq_so_far = prefill_seq_len + i
+                (
+                    step_attn_proj_time,
+                    _,
+                    step_attn_core_time,
+                    _,
+                ) = decode_attention_compute_breakdown_per_layer(
+                    proj_tp_topology=proj_tp_topology_view,
+                    attn_tp_topology=attn_tp_topology_view,
+                    transformer_config=model_spec,
+                    workload_spec=workload_spec,
+                    n_seq_so_far=n_seq_so_far,
+                )
+                # Scale per-layer per-chip breakdown to per-PP-stage totals for this decode step
+                step_attn_proj_time *= workload_spec.get_layers_per_pp_stage()
+                step_attn_core_time *= workload_spec.get_layers_per_pp_stage()
+                attn_proj_compute_time_fwd += step_attn_proj_time
+                attn_core_compute_time_fwd += step_attn_core_time
                 (
                     step_time,
                     step_flops,
@@ -533,6 +1270,7 @@ def get_model_stats(
                     step_attn_time,
                     step_moe_time,
                 ) = forward_decode_flops_per_chip(
+                    proj_tp_topology_view,  # proj_tp_topology
                     attn_tp_topology_view,
                     moe_tp_topology_view,
                     model_spec,
@@ -582,15 +1320,60 @@ def get_model_stats(
     # batch_mem_time_forward_pass, batch_mem_forward_pass = forward_pass_mem_per_chip(tp_node, tp_topology, transformer_config, batch_size_per_dp, n_seq, float_size)
     # batch_mem_time_backward_pass, batch_mem_backward_pass = backward_pass_mem_per_chip(tp_node, tp_topology, transformer_config, batch_size_per_dp, n_seq, optimizer=optimizer, float_size=float_size)
 
-    # Derive TP 2D dims (X and YZ) when needed
-    try:
-        x_dims, yz_dims = get_2d_tp_dims(attn_tp_topology_view)
-        if workload_spec.tp_spec.variant.name == "SHARD_WEIGHTS_2D":
-            validate_2d_tp_invariants(model_spec, attn_tp_topology_view, x_dims, yz_dims)
-    except Exception:
-        # Fall back to defaults if not 2D-capable topology; 1D paths won’t use these
-        x_dims = [0]
-        yz_dims = [n for n in range(1, len(attn_tp_topology_view.shape))]
+    def _dims_from_split_or_default(tp_view, tp_spec_v2):
+        if tp_spec_v2.variant != TensorParallelVariant.SHARD_WEIGHTS_2D:
+            return None, None
+        if tp_spec_v2.split_2d is None:
+            raise ValueError(
+                "Explicit TP-2D split is required (split_2d). "
+                "Provide `split_2d: {x_tags: [...], yz_tags: [...]}` for any *variant: SHARD_WEIGHTS_2D*."
+            )
+        resolved = resolve_tp2d_split(tp_view=tp_view, split_2d=tp_spec_v2.split_2d, view_name="TP")
+        return resolved.x_dims, resolved.yz_dims
+
+    # Derive explicit 2D dims for Attn / Proj / MoE when needed
+    attn_x_dims, attn_yz_dims = _dims_from_split_or_default(attn_tp_topology_view, attn_tp_spec)
+    proj_x_dims, proj_yz_dims = _dims_from_split_or_default(proj_tp_topology_view, proj_tp_spec)
+    moe_x_dims, moe_yz_dims = _dims_from_split_or_default(moe_tp_topology_view, moe_tp_spec)
+
+    if attn_tp_variant == TensorParallelVariant.SHARD_WEIGHTS_2D:
+        validate_2d_tp_invariants_attn(model_spec, attn_tp_topology_view, attn_x_dims, attn_yz_dims)
+        validate_2d_tp_invariants_proj(model_spec, proj_tp_topology_view, proj_x_dims, proj_yz_dims)
+    elif attn_tp_variant == TensorParallelVariant.SHARD_WEIGHTS_1D:
+        validate_1d_tp_invariants_attn(model_spec, attn_tp_topology_view)
+    if moe_tp_variant == TensorParallelVariant.SHARD_WEIGHTS_2D:
+        validate_2d_tp_invariants_moe(model_spec, moe_tp_topology_view, moe_x_dims, moe_yz_dims)
+
+    # --- Decode layout trace: actual trace object (populated during first decode step) ---
+    _actual_layout_trace = NULL_LAYOUT_TRACE
+    if (
+        enable_decode_layout_trace
+        and pass_mode == PassMode.INFERENCE_DECODE
+        and attn_tp_variant == TensorParallelVariant.SHARD_WEIGHTS_2D
+    ):
+        params = _resolve_decode_trace_params(
+            model_spec=model_spec,
+            moe_config=moe_config,
+            proj_tp_topology_view=proj_tp_topology_view,
+            attn_tp_topology_view=attn_tp_topology_view,
+            moe_tp_topology_view=moe_tp_topology_view,
+            proj_x_dims=proj_x_dims,
+            proj_yz_dims=proj_yz_dims,
+            attn_yz_dims=attn_yz_dims,
+            moe_x_dims=moe_x_dims,
+            moe_yz_dims=moe_yz_dims,
+            g=g,
+            router_sync_mode=router_sync_mode,
+        )
+        _actual_layout_trace = LayoutTrace(
+            mesh=build_decode_2dtp_mesh(
+                params["tp_x"],
+                params["tp_y"],
+                params["g"],
+                params["n_experts"],
+                params["c"],
+            )
+        )
 
     # TODO(MB) : move this to config
     activation_checkpointing = False  # (workload_spec.activation_recomputation != 0)
@@ -607,11 +1390,17 @@ def get_model_stats(
                 moe_config,
                 batch_size_per_dp,
                 seq_length,
-                tensor_parallel_variant,
-                x_dims,
-                yz_dims,
+                attn_tp_variant,
+                moe_tp_variant,
+                attn_x_dims,
+                attn_yz_dims,
+                moe_x_dims,
+                moe_yz_dims,
                 pass_mode,
                 workload_spec.float_size_bytes,
+                proj_tp_topology=proj_tp_topology_view,
+                proj_x_dims=proj_x_dims,
+                proj_yz_dims=proj_yz_dims,
                 activation_checkpointing=activation_checkpointing,
                 device_for=device_for_map,
                 workload_spec=workload_spec,
@@ -689,11 +1478,17 @@ def get_model_stats(
                         moe_config,
                         batch_size_per_dp,
                         n_seq_so_far,
-                        tensor_parallel_variant,
-                        x_dims,
-                        yz_dims,
+                        attn_tp_variant,
+                        moe_tp_variant,
+                        attn_x_dims,
+                        attn_yz_dims,
+                        moe_x_dims,
+                        moe_yz_dims,
                         pass_mode,
                         workload_spec.float_size_bytes,
+                        proj_tp_topology=proj_tp_topology_view,
+                        proj_x_dims=proj_x_dims,
+                        proj_yz_dims=proj_yz_dims,
                         activation_checkpointing=activation_checkpointing,
                         device_for=device_for_map,
                         workload_spec=workload_spec,
@@ -767,9 +1562,12 @@ def get_model_stats(
     )
     # memory_bandwidth = node.memory_bandwidth
     # mem_stats["memory_bandwidth_utilization"] = mem_stats["total_memory_B"] / mem_stats["total_memory_time_s"] / memory_bandwidth if mem_stats["total_memory_time_s"] > 0 else 0
-    mem_stats["tp_variant"] = tensor_parallel_variant
-    mem_stats["tp_size_x"] = x_dims
-    mem_stats["tp_size_y"] = yz_dims
+    mem_stats["tp_attn_variant"] = attn_tp_variant
+    mem_stats["tp_moe_variant"] = moe_tp_variant
+    mem_stats["tp_attn_x_dims"] = attn_x_dims
+    mem_stats["tp_attn_yz_dims"] = attn_yz_dims
+    mem_stats["tp_moe_x_dims"] = moe_x_dims
+    mem_stats["tp_moe_yz_dims"] = moe_yz_dims
     mem_stats["activation_checkpointing"] = activation_checkpointing
 
     attn_footprint = MemoryFootprint(name="attn", device_for=device_for_fp, node=node)
@@ -837,14 +1635,74 @@ def get_model_stats(
             except Exception:
                 pass
 
-    attn_footprint.transient_forward_peak = calculate_attn_forward_transient_peak_memory_footprint(
-        model_spec, ws_for_footprint, attn_tp_size
-    )
-    ffn_moe_footprint.transient_forward_peak = (
-        calculate_ffn_moe_forward_transient_peak_memory_footprint(
-            model_spec, ws_for_footprint, moe_tp_size
-        )
-    )
+    # Forward transient peaks apply to all pass modes.
+    # For TP-2D attention we use a stage-aware, phase-aware sizing that reflects:
+    # - Phase 1 QKV output (sharded on X*YZ)
+    # - Phase 2 score buffer (non-fused model) with sequence sharding on YZ
+    # - Phase 3 output projection staging (gathered E/X and partial E/YZ)
+    match attn_tp_variant:
+        case TensorParallelVariant.SHARD_WEIGHTS_2D:
+            if attn_tp_spec.split_2d is None:
+                raise ValueError("TP-2D attention requires tp_attn_spec.split_2d for footprint.")
+            resolved = resolve_tp2d_split(
+                tp_view=attn_tp_topology_view, split_2d=attn_tp_spec.split_2d, view_name="TP_Attn"
+            )
+            match pass_mode:
+                case PassMode.INFERENCE_DECODE:
+                    assert isinstance(workload_spec, InferenceDecodeSpec)
+                    kv_total_len = (
+                        workload_spec.prefill_seq_len + workload_spec.num_generated_tokens
+                    )
+                case PassMode.TRAINING | PassMode.INFERENCE_PREFILL:
+                    kv_total_len = None
+                case _:
+                    raise ValueError(f"Unsupported pass_mode for footprint: {pass_mode}")
+            attn_footprint.transient_forward_peak = (
+                calculate_attn_forward_transient_peak_memory_footprint_tp2d(
+                    transformer_config=model_spec,
+                    workload_spec=ws_for_footprint,
+                    attn_tp_size_x=resolved.tp_x,
+                    attn_tp_size_yz=resolved.tp_yz,
+                    pass_mode=pass_mode,
+                    kv_total_len=kv_total_len,
+                )
+            )
+        case TensorParallelVariant.NONE | TensorParallelVariant.SHARD_WEIGHTS_1D:
+            attn_footprint.transient_forward_peak = (
+                calculate_attn_forward_transient_peak_memory_footprint_tp1d(
+                    model_spec, ws_for_footprint, attn_tp_size
+                )
+            )
+        case _:
+            raise ValueError(f"Unsupported attention TP variant for footprint: {attn_tp_variant}")
+
+    match moe_tp_variant:
+        case TensorParallelVariant.SHARD_WEIGHTS_2D:
+            if moe_tp_spec.split_2d is None:
+                raise ValueError("TP-2D MoE requires tp_moe_spec.split_2d for footprint.")
+            resolved_moe = resolve_tp2d_split(
+                tp_view=moe_tp_topology_view,
+                split_2d=moe_tp_spec.split_2d,
+                view_name="TP_MoE",
+            )
+            ffn_moe_footprint.transient_forward_peak = (
+                calculate_ffn_moe_forward_transient_peak_memory_footprint_tp2d(
+                    transformer_config=model_spec,
+                    moe_config=moe_config,
+                    workload_spec=ws_for_footprint,
+                    moe_tp_size_x=resolved_moe.tp_x,
+                    moe_tp_size_yz=resolved_moe.tp_yz,
+                    pass_mode=pass_mode,
+                )
+            )
+        case TensorParallelVariant.NONE | TensorParallelVariant.SHARD_WEIGHTS_1D:
+            ffn_moe_footprint.transient_forward_peak = (
+                calculate_ffn_moe_forward_transient_peak_memory_footprint_tp1d(
+                    model_spec, ws_for_footprint, moe_tp_size
+                )
+            )
+        case _:
+            raise ValueError(f"Unsupported MoE TP variant for footprint: {moe_tp_variant}")
 
     if pass_mode == PassMode.TRAINING:
         assert isinstance(workload_spec, TrainSpec)
@@ -898,11 +1756,37 @@ def get_model_stats(
         else:
             assert isinstance(workload_spec, InferenceDecodeSpec)
             kv_len = workload_spec.prefill_seq_len + workload_spec.num_generated_tokens
-        kv_heads_sharded = num_kv_heads // attn_tp_size
+        # KV cache footprint:
+        # - 2D TP attn: heads sharded by X, sequence/KV length sharded by YZ (use per-XPU max via ceil)
+        # - 1D/None: heads sharded by total TP size, full KV length per XPU
+        match attn_tp_variant:
+            case TensorParallelVariant.SHARD_WEIGHTS_2D:
+                if attn_tp_spec.split_2d is None or attn_x_dims is None or attn_yz_dims is None:
+                    raise ValueError(
+                        "TP-2D attention requires explicit split_2d and resolved x/y dims for KV-cache footprint."
+                    )
+                resolved = resolve_tp2d_split(
+                    tp_view=attn_tp_topology_view,
+                    split_2d=attn_tp_spec.split_2d,
+                    view_name="TP_Attn",
+                )
+                kv_heads_sharded, _kv_rep = resolve_kv_heads_per_partition(
+                    num_kv_heads=num_kv_heads, tp_x=resolved.tp_x
+                )
+                kv_len_per_shard = int(np.ceil(kv_len / resolved.tp_yz))
+            case TensorParallelVariant.NONE | TensorParallelVariant.SHARD_WEIGHTS_1D:
+                kv_heads_sharded, _kv_rep = resolve_kv_heads_per_partition(
+                    num_kv_heads=num_kv_heads, tp_x=attn_tp_size
+                )
+                kv_len_per_shard = kv_len
+            case _:
+                raise ValueError(
+                    f"Unsupported attention TP variant for KV-cache footprint: {attn_tp_variant}"
+                )
         kv_bytes_per_layer_per_xpu = (
             2
             * batch_size_per_dp
-            * kv_len
+            * kv_len_per_shard
             * (kv_heads_sharded * head_dim)
             * workload_spec.float_size_bytes
         )
@@ -960,7 +1844,9 @@ def get_model_stats(
             comm_stats = get_transformer_comm_stats(
                 attn_dp_topology_view,
                 moe_dp_topology_view,
+                pp_topology_view,
                 attn_tp_topology_view,
+                proj_tp_topology_view,  # proj_tp_topology (explicit; defaults to attn if absent)
                 moe_tp_topology_view,
                 ep_topology_view,
                 model_spec,
@@ -971,9 +1857,17 @@ def get_model_stats(
             )
             # Typical practice avoids all-gather; unembedding_comm_* remain zero
         case PassMode.INFERENCE_DECODE:
-            # Initialize all comm stats to zero for decode
+            assert isinstance(workload_spec, InferenceDecodeSpec)
+            num_decode_steps = workload_spec.num_generated_tokens
+
+            # Initialize comm stats to zero, then explicitly accumulate per decode step.
+            # Even though comm is currently modeled as per-step constant, decode is synchronous
+            # and we already iterate per step for compute/memory; keep comm explicit too.
             comm_stats = {
                 "tp_attn_fwd": CommStats(),
+                "tp_attn_fwd_phase1": CommStats(),
+                "tp_attn_fwd_phase2": CommStats(),
+                "tp_attn_fwd_phase3": CommStats(),
                 "tp_moe_fwd": CommStats(),
                 "tp_attn_bwd": CommStats(),
                 "tp_moe_bwd": CommStats(),
@@ -981,31 +1875,53 @@ def get_model_stats(
                 "dp_moe_fwd": CommStats(),
                 "dp_attn_bwd": CommStats(),
                 "dp_moe_bwd": CommStats(),
+                "pp_fwd": CommStats(),
+                "pp_bwd": CommStats(),
                 "moe_a2a_fwd_1": CommStats(),
                 "moe_a2a_fwd_2": CommStats(),
             }
-            assert isinstance(workload_spec, InferenceDecodeSpec)
-            num_decode_steps = workload_spec.num_generated_tokens
 
             for i in range(num_decode_steps):
                 # We use seq_length = 1 for decode steps in TP Megatron
-                seq_length = 1
                 step_comm_stats = get_transformer_comm_stats(
                     attn_dp_topology_view,
                     moe_dp_topology_view,
+                    pp_topology_view,
                     attn_tp_topology_view,
+                    proj_tp_topology_view,  # proj_tp_topology (explicit; defaults to attn if absent)
                     moe_tp_topology_view,
                     ep_topology_view,
                     model_spec,
                     moe_config,
                     workload_spec,
-                    seq_length,
-                    pass_mode,
+                    n_seq=1,
+                    pass_mode=pass_mode,
+                    layout_trace=_actual_layout_trace if i == 0 else NULL_LAYOUT_TRACE,
                 )
                 # Accumulate stats for each decode step
-                for key in comm_stats:
-                    comm_stats[key] += step_comm_stats[key]
+                for key, val in step_comm_stats.items():
+                    comm_stats[key] += val
                 # Typical practice avoids all-gather; unembedding_comm_* remain zero
+
+            # Emit expected vs actual layout trace comparison
+            if enable_decode_layout_trace and _actual_layout_trace is not NULL_LAYOUT_TRACE:
+                _emit_decode_layout_trace(
+                    model_spec=model_spec,
+                    workload_spec=workload_spec,
+                    moe_config=moe_config,
+                    attn_tp_topology_view=attn_tp_topology_view,
+                    proj_tp_topology_view=proj_tp_topology_view,
+                    moe_tp_topology_view=moe_tp_topology_view,
+                    attn_x_dims=attn_x_dims,
+                    attn_yz_dims=attn_yz_dims,
+                    proj_x_dims=proj_x_dims,
+                    proj_yz_dims=proj_yz_dims,
+                    moe_x_dims=moe_x_dims,
+                    moe_yz_dims=moe_yz_dims,
+                    g=g,
+                    router_sync_mode=router_sync_mode,
+                    actual_trace=_actual_layout_trace,
+                )
         case _:
             raise ValueError(
                 f"Unsupported pass mode: {pass_mode}. Supported modes are TRAINING, INFERENCE_PREFILL, and INFERENCE_DECODE."
@@ -1013,6 +1929,9 @@ def get_model_stats(
 
     # Unpack dictionary for aggregated stats
     tp_attn_fwd = comm_stats["tp_attn_fwd"]
+    tp_attn_fwd_phase1 = comm_stats.get("tp_attn_fwd_phase1", CommStats())
+    tp_attn_fwd_phase2 = comm_stats.get("tp_attn_fwd_phase2", CommStats())
+    tp_attn_fwd_phase3 = comm_stats.get("tp_attn_fwd_phase3", CommStats())
     tp_moe_fwd = comm_stats["tp_moe_fwd"]
     tp_attn_bwd = comm_stats["tp_attn_bwd"]
     tp_moe_bwd = comm_stats["tp_moe_bwd"]
@@ -1020,6 +1939,8 @@ def get_model_stats(
     dp_moe_fwd = comm_stats["dp_moe_fwd"]
     dp_attn_bwd = comm_stats["dp_attn_bwd"]
     dp_moe_bwd = comm_stats["dp_moe_bwd"]
+    pp_fwd = comm_stats["pp_fwd"]
+    pp_bwd = comm_stats["pp_bwd"]
     moe_a2a_fwd_1 = comm_stats["moe_a2a_fwd_1"]
     moe_a2a_fwd_2 = comm_stats["moe_a2a_fwd_2"]
 
@@ -1031,6 +1952,7 @@ def get_model_stats(
         + tp_moe_fwd.total_comm_time
         + dp_attn_fwd.total_comm_time
         + dp_moe_fwd.total_comm_time
+        + pp_fwd.total_comm_time
         + moe_a2a_fwd_1.total_comm_time
         + moe_a2a_fwd_2.total_comm_time
     )
@@ -1039,6 +1961,7 @@ def get_model_stats(
         + tp_moe_bwd.total_comm_time
         + dp_attn_bwd.total_comm_time
         + dp_moe_bwd.total_comm_time
+        + pp_bwd.total_comm_time
         + moe_a2a_bwd.total_comm_time
     )
     batch_comm_vol_forward_pass = (
@@ -1046,6 +1969,7 @@ def get_model_stats(
         + tp_moe_fwd.comm_vol
         + dp_attn_fwd.comm_vol
         + dp_moe_fwd.comm_vol
+        + pp_fwd.comm_vol
         + moe_a2a_fwd_1.comm_vol
         + moe_a2a_fwd_2.comm_vol
     )
@@ -1054,32 +1978,136 @@ def get_model_stats(
         + tp_moe_bwd.comm_vol
         + dp_attn_bwd.comm_vol
         + dp_moe_bwd.comm_vol
+        + pp_bwd.comm_vol
         + moe_a2a_bwd.comm_vol
+    )
+    batch_comm_startup_forward_pass = (
+        tp_attn_fwd.startup_latency
+        + tp_moe_fwd.startup_latency
+        + dp_attn_fwd.startup_latency
+        + dp_moe_fwd.startup_latency
+        + pp_fwd.startup_latency
+        + moe_a2a_fwd_1.startup_latency
+        + moe_a2a_fwd_2.startup_latency
+    )
+    batch_comm_startup_backward_pass = (
+        tp_attn_bwd.startup_latency
+        + tp_moe_bwd.startup_latency
+        + dp_attn_bwd.startup_latency
+        + dp_moe_bwd.startup_latency
+        + pp_bwd.startup_latency
+        + moe_a2a_bwd.startup_latency
+    )
+    batch_comm_data_transfer_forward_pass = (
+        tp_attn_fwd.transmission_time
+        + tp_moe_fwd.transmission_time
+        + dp_attn_fwd.transmission_time
+        + dp_moe_fwd.transmission_time
+        + pp_fwd.transmission_time
+        + moe_a2a_fwd_1.transmission_time
+        + moe_a2a_fwd_2.transmission_time
+    )
+    batch_comm_data_transfer_backward_pass = (
+        tp_attn_bwd.transmission_time
+        + tp_moe_bwd.transmission_time
+        + dp_attn_bwd.transmission_time
+        + dp_moe_bwd.transmission_time
+        + pp_bwd.transmission_time
+        + moe_a2a_bwd.transmission_time
+    )
+
+    def _alpha_for_view(view: LogicalTopology) -> float | None:
+        alphas = []
+        for dim in getattr(view, "dimensions", []):
+            if dim.size <= 1:
+                continue
+            tag = dim.logical_tag.value if hasattr(dim.logical_tag, "value") else dim.logical_tag
+            _, alpha_sec, _, _ = view.get_hockney_model_params(
+                tag_in_view=tag,
+                float_size_bytes=workload_spec.float_size_bytes,
+                context=getattr(view, "global_sharing_context", "concurrent_baseline"),
+            )
+            if alpha_sec > 0:
+                alphas.append(alpha_sec)
+        if alphas:
+            return min(alphas)
+        # Some derived views may have size-1 logical dims while comm is priced
+        # on the underlying fabric; use physical interconnect latency explicitly.
+        phys_alphas = []
+        for phys_dim in getattr(view.physical_topology, "dimensions", []):
+            ic = view.physical_topology.node_definition.get_interconnect(phys_dim.interconnect_name)
+            if ic.latency_sec > 0:
+                phys_alphas.append(ic.latency_sec)
+        return min(phys_alphas) if phys_alphas else None
+
+    def _startup_phase_count(comm: CommStats, view: LogicalTopology) -> int:
+        if getattr(comm, "startup_phase_count", 0) > 0:
+            return int(comm.startup_phase_count)
+        if comm.startup_latency <= 0:
+            return 0
+        alpha_sec = _alpha_for_view(view)
+        if alpha_sec is None:
+            raise ValueError(
+                "Unable to infer startup alpha for non-zero startup latency; "
+                "topology view has no active communication dimensions."
+            )
+        return int(round(comm.startup_latency / alpha_sec))
+
+    startup_phase_count_tp_moe_fwd = _startup_phase_count(tp_moe_fwd, moe_tp_topology_view)
+    startup_phase_count_a2a_to_fwd = _startup_phase_count(moe_a2a_fwd_1, ep_topology_view)
+    startup_phase_count_a2a_from_fwd = _startup_phase_count(moe_a2a_fwd_2, ep_topology_view)
+    startup_phase_count_a2a_bwd = _startup_phase_count(moe_a2a_bwd, ep_topology_view)
+    startup_phase_count_total_comm_per_batch = (
+        _startup_phase_count(
+            CommStats(
+                startup_latency=batch_comm_startup_forward_pass + batch_comm_startup_backward_pass
+            ),
+            attn_tp_topology_view,
+        )
+        if (batch_comm_startup_forward_pass + batch_comm_startup_backward_pass) > 0
+        else 0
     )
 
     # Detailed Memory
-    fwd_attn_traffic, fwd_moe_traffic, bwd_attn_traffic, bwd_moe_traffic = get_detailed_mem_stats(
-        attn_tp_topology_view,
-        moe_tp_topology_view,
-        model_spec,
-        moe_config,
-        workload_spec,
-        tensor_parallel_variant,
-        x_dims,
-        yz_dims,
-        pass_mode,
-        activation_checkpointing,
-        device_for_map,
-        node,
+    (
+        fwd_attn_traffic,
+        fwd_attn_proj_traffic,
+        fwd_attn_core_traffic,
+        fwd_moe_traffic,
+        bwd_attn_traffic,
+        bwd_moe_traffic,
+    ) = get_detailed_mem_stats(
+        attn_tp_topology_view=attn_tp_topology_view,
+        proj_tp_topology_view=proj_tp_topology_view,
+        moe_tp_topology_view=moe_tp_topology_view,
+        model_spec=model_spec,
+        moe_config=moe_config,
+        workload_spec=workload_spec,
+        attn_tp_variant=attn_tp_variant,
+        moe_tp_variant=moe_tp_variant,
+        attn_x_dims=attn_x_dims,
+        attn_yz_dims=attn_yz_dims,
+        proj_x_dims=proj_x_dims,
+        proj_yz_dims=proj_yz_dims,
+        moe_x_dims=moe_x_dims,
+        moe_yz_dims=moe_yz_dims,
+        pass_mode=pass_mode,
+        activation_checkpointing=activation_checkpointing,
+        device_for=device_for_map,
+        node=node,
     )
 
     # Prepare detailed per-component memory traffic split by block (attn vs ffn_moe)
     # Scale per-layer component bytes by number of layers per PP stage to get per-batch per-chip totals
     layers_per_stage = num_layers_per_pp_stage
     fwd_attn_layer_stats = fwd_attn_traffic.get_stats(1)
+    fwd_attn_proj_layer_stats = fwd_attn_proj_traffic.get_stats(1)
+    fwd_attn_core_layer_stats = fwd_attn_core_traffic.get_stats(1)
     fwd_moe_layer_stats = fwd_moe_traffic.get_stats(1)
     # Expose detailed per-layer component stats (including read/write times) for forward
     mem_stats.update(fwd_attn_layer_stats)
+    mem_stats.update(fwd_attn_proj_layer_stats)
+    mem_stats.update(fwd_attn_core_layer_stats)
     mem_stats.update(fwd_moe_layer_stats)
     mem_stats.update(
         {
@@ -1092,6 +2120,17 @@ def get_model_stats(
             * fwd_attn_layer_stats.get("fwd_attn_activations_written_bytes_per_layer", 0),
             "attn_fwd_kv_cache_written_bytes": layers_per_stage
             * fwd_attn_layer_stats.get("fwd_attn_kv_cache_written_bytes_per_layer", 0),
+            # Bookkeeping split for attention memory traffic:
+            # - Projection: QKV + output projection (weights + activation buffers)
+            # - Core: KV-cache attention (activation buffers + KV-cache)
+            "attn_fwd_mem_time_proj_s": layers_per_stage
+            * (fwd_attn_proj_layer_stats.get("fwd_attn_proj_time_s", 0.0) or 0.0),
+            "attn_fwd_mem_time_core_s": layers_per_stage
+            * (fwd_attn_core_layer_stats.get("fwd_attn_core_time_s", 0.0) or 0.0),
+            "attn_fwd_mem_bytes_proj": layers_per_stage
+            * (fwd_attn_proj_layer_stats.get("fwd_attn_proj_total_bytes_per_layer", 0) or 0),
+            "attn_fwd_mem_bytes_core": layers_per_stage
+            * (fwd_attn_core_layer_stats.get("fwd_attn_core_total_bytes_per_layer", 0) or 0),
             # Forward MoE/FFN per-batch per-chip
             "ffn_moe_fwd_weights_read_bytes": layers_per_stage
             * fwd_moe_layer_stats.get("fwd_moe_weights_read_bytes_per_layer", 0),
@@ -1158,8 +2197,8 @@ def get_model_stats(
         ffn_bwd_reads_ff1_out_sharded = num_colocated * ff1_out_sharded_per_expert
         ffn_bwd_reads_expert_input = num_colocated * token_vol_per_expert
         # Weight reads per layer (both FFN matrices), sharded by TP and scaled by colocated experts
-        ffn1_weight_size = num_colocated * (d_model * d_ff * float_size) / max(moe_tp_size_val, 1)
-        ffn2_weight_size = num_colocated * (d_ff * d_model * float_size) / max(moe_tp_size_val, 1)
+        ffn1_weight_size = num_colocated * (d_model * d_ff * float_size) / moe_tp_size_val
+        ffn2_weight_size = num_colocated * (d_ff * d_model * float_size) / moe_tp_size_val
         ffn_bwd_reads_weights = ffn1_weight_size + ffn2_weight_size
         # Gradient writes per layer
         ffn_bwd_grad_writes_expert_input = num_colocated * token_vol_per_expert
@@ -1190,6 +2229,55 @@ def get_model_stats(
     comp_comm_efficiency = workload_spec.comp_comm_efficiency
     comp_mem_efficiency = workload_spec.comp_mem_efficiency
     comm_mem_efficiency = workload_spec.comm_mem_efficiency
+
+    # Component-level time breakdowns (forward)
+    #
+    # These are intended for sweep reporting (BEST markers) where you want to optimize a sub-component
+    # (e.g. attention projection) without introducing global toggles.
+    attn_proj_comp_time_fwd = float(attn_proj_compute_time_fwd or 0.0)
+    attn_core_comp_time_fwd = float(attn_core_compute_time_fwd or 0.0)
+    attn_proj_mem_time_fwd = float(mem_stats.get("attn_fwd_mem_time_proj_s", 0.0) or 0.0)
+    attn_core_mem_time_fwd = float(mem_stats.get("attn_fwd_mem_time_core_s", 0.0) or 0.0)
+    attn_proj_comm_time_fwd = float(
+        (tp_attn_fwd_phase1.total_comm_time or 0.0) + (tp_attn_fwd_phase3.total_comm_time or 0.0)
+    )
+    attn_core_comm_time_fwd = float(tp_attn_fwd_phase2.total_comm_time or 0.0)
+
+    attn_proj_overlapped_fwd = calculate_overlapped_time(
+        comp_time=attn_proj_comp_time_fwd,
+        comm_time=attn_proj_comm_time_fwd,
+        mem_time=attn_proj_mem_time_fwd,
+        comp_comm_efficiency=comp_comm_efficiency,
+        comp_mem_efficiency=comp_mem_efficiency,
+        comm_mem_efficiency=comm_mem_efficiency,
+    )
+    attn_core_overlapped_fwd = calculate_overlapped_time(
+        comp_time=attn_core_comp_time_fwd,
+        comm_time=attn_core_comm_time_fwd,
+        mem_time=attn_core_mem_time_fwd,
+        comp_comm_efficiency=comp_comm_efficiency,
+        comp_mem_efficiency=comp_mem_efficiency,
+        comm_mem_efficiency=comm_mem_efficiency,
+    )
+
+    # FFN/MoE block totals (forward) for reporting
+    ffn_comp_time_fwd = float(compute_time_moe_fwd or 0.0)
+    ffn_mem_time_fwd = float(
+        (fwd_moe_layer_stats.get("fwd_moe_time_s", 0.0) or 0.0) * layers_per_stage
+    )
+    ffn_comm_time_fwd = float(
+        (tp_moe_fwd.total_comm_time or 0.0)
+        + (moe_a2a_fwd_1.total_comm_time or 0.0)
+        + (moe_a2a_fwd_2.total_comm_time or 0.0)
+    )
+    ffn_overlapped_fwd = calculate_overlapped_time(
+        comp_time=ffn_comp_time_fwd,
+        comm_time=ffn_comm_time_fwd,
+        mem_time=ffn_mem_time_fwd,
+        comp_comm_efficiency=comp_comm_efficiency,
+        comp_mem_efficiency=comp_mem_efficiency,
+        comm_mem_efficiency=comm_mem_efficiency,
+    )
 
     batch_overlapped_time_forward_pass = calculate_overlapped_time(
         comp_time=batch_compute_time_forward_pass,
@@ -1238,6 +2326,12 @@ def get_model_stats(
 
     # Aggregate MoE A2A time (forward + backward) and fraction of total overlapped time
     total_moe_a2a_time_fwd_bwd = (
+        moe_a2a_fwd_1.total_comm_time + moe_a2a_fwd_2.total_comm_time + moe_a2a_bwd.total_comm_time
+    )
+    total_moe_a2a_startup_fwd_bwd = (
+        moe_a2a_fwd_1.startup_latency + moe_a2a_fwd_2.startup_latency + moe_a2a_bwd.startup_latency
+    )
+    total_moe_a2a_data_transfer_fwd_bwd = (
         moe_a2a_fwd_1.transmission_time
         + moe_a2a_fwd_2.transmission_time
         + moe_a2a_bwd.transmission_time
@@ -1289,6 +2383,26 @@ def get_model_stats(
     total_xpus_val = attn_tp_topology_view.num_chips * attn_dp_topology_view.num_chips * pp_stages
     tokens_per_second_per_xpu = tokens_per_second / total_xpus_val
 
+    # Decode-only TPOT:
+    # - System TPOT: wall-time per *system-level* output token (across the whole batch).
+    # - User TPOT: wall-time per *user-visible* output token (per sequence). This depends on
+    #   batch size by definition (User TPOT = System TPOT * global_batch_size).
+    match pass_mode:
+        case PassMode.INFERENCE_DECODE:
+            num_decode_steps = workload_spec.num_generated_tokens
+            global_batch_size = workload_spec.global_batch_size
+            tpot_system_sec = (
+                (time_to_train_sec / (num_decode_steps * global_batch_size))
+                if (num_decode_steps > 0 and global_batch_size > 0)
+                else None
+            )
+            tpot_user_sec = (
+                (tpot_system_sec * global_batch_size) if tpot_system_sec is not None else None
+            )
+        case _:
+            tpot_system_sec = None
+            tpot_user_sec = None
+
     # batch_comm_vol_forward_pass = batch_forward_pass_comm_stats.comm_vol
     # batch_comm_vol_backward_pass = batch_backward_pass_comm_stats.comm_vol
 
@@ -1315,7 +2429,8 @@ def get_model_stats(
         plotting.float_size_label: workload_spec.float_size_bytes,
         plotting.mlp_ratio_label: model_spec.mlp_ratio,
         plotting.topology_dims_label: attn_tp_topology_view.shape,
-        plotting.tensor_parallel_variant_label: workload_spec.tp_spec.variant,
+        # Backward-compatible single label; encode attn/moe variants explicitly.
+        plotting.tensor_parallel_variant_label: f"{attn_tp_variant.name}|{moe_tp_variant.name}",
         plotting.n_layers_label: num_layers_per_pp_stage,
         plotting.pp_stages_label: pp_stages,
         plotting.seq_len_label: seq_length,
@@ -1324,6 +2439,8 @@ def get_model_stats(
         plotting.time_to_train_day_label: time_to_train_sec / (3600 * 24),
         plotting.tokens_per_second_label: tokens_per_second,
         plotting.tokens_per_second_per_xpu_label: tokens_per_second_per_xpu,
+        plotting.tpot_system_sec_label: tpot_system_sec,
+        plotting.tpot_user_sec_label: tpot_user_sec,
         plotting.ttft_forward_sec_label: ttft_forward_sec,
         plotting.flops_forward_pass_label: batch_flops_forward_pass,
         plotting.flops_backward_pass_label: batch_flops_backward_pass,
@@ -1352,6 +2469,9 @@ def get_model_stats(
         # Unembedding comm omitted (typical vocab-parallel path)
         # Detailed comm stats
         plotting.comm_vol_tp_attn_fwd_label: tp_attn_fwd.comm_vol,
+        plotting.comm_vol_tp_attn_fwd_phase1_label: tp_attn_fwd_phase1.comm_vol,
+        plotting.comm_vol_tp_attn_fwd_phase2_label: tp_attn_fwd_phase2.comm_vol,
+        plotting.comm_vol_tp_attn_fwd_phase3_label: tp_attn_fwd_phase3.comm_vol,
         plotting.comm_vol_tp_moe_fwd_label: tp_moe_fwd.comm_vol,
         plotting.comm_vol_tp_attn_bwd_label: tp_attn_bwd.comm_vol,
         plotting.comm_vol_tp_moe_bwd_label: tp_moe_bwd.comm_vol,
@@ -1359,7 +2479,12 @@ def get_model_stats(
         plotting.comm_vol_dp_moe_fwd_label: dp_moe_fwd.comm_vol,
         plotting.comm_vol_dp_attn_bwd_label: dp_attn_bwd.comm_vol,
         plotting.comm_vol_dp_moe_bwd_label: dp_moe_bwd.comm_vol,
+        plotting.comm_vol_pp_fwd_label: pp_fwd.comm_vol,
+        plotting.comm_vol_pp_bwd_label: pp_bwd.comm_vol,
         plotting.comm_time_tp_attn_fwd_label: tp_attn_fwd.total_comm_time,
+        plotting.comm_time_tp_attn_fwd_phase1_label: tp_attn_fwd_phase1.total_comm_time,
+        plotting.comm_time_tp_attn_fwd_phase2_label: tp_attn_fwd_phase2.total_comm_time,
+        plotting.comm_time_tp_attn_fwd_phase3_label: tp_attn_fwd_phase3.total_comm_time,
         plotting.comm_time_tp_moe_fwd_label: tp_moe_fwd.total_comm_time,
         plotting.comm_time_tp_attn_bwd_label: tp_attn_bwd.total_comm_time,
         plotting.comm_time_tp_moe_bwd_label: tp_moe_bwd.total_comm_time,
@@ -1367,11 +2492,25 @@ def get_model_stats(
         plotting.comm_time_dp_moe_fwd_label: dp_moe_fwd.total_comm_time,
         plotting.comm_time_dp_attn_bwd_label: dp_attn_bwd.total_comm_time,
         plotting.comm_time_dp_moe_bwd_label: dp_moe_bwd.total_comm_time,
+        plotting.comm_time_pp_fwd_label: pp_fwd.total_comm_time,
+        plotting.comm_time_pp_bwd_label: pp_bwd.total_comm_time,
         # Backward MoE all-to-all
-        plotting.moe_alltoall_bwd_time_label: moe_a2a_bwd.transmission_time,
+        plotting.moe_alltoall_bwd_time_label: moe_a2a_bwd.total_comm_time,
         plotting.moe_alltoall_bwd_vol_label: moe_a2a_bwd.comm_vol,
+        "Startup_Phase_Count_TP_MoE_Fwd": startup_phase_count_tp_moe_fwd,
+        "Startup_Phase_Count_MoE_A2A_To_Fwd": startup_phase_count_a2a_to_fwd,
+        "Startup_Phase_Count_MoE_A2A_From_Fwd": startup_phase_count_a2a_from_fwd,
+        "Startup_Phase_Count_MoE_A2A_Bwd": startup_phase_count_a2a_bwd,
+        "Startup_Phase_Count_MoE_A2A_Total_FwdBwd": (
+            startup_phase_count_a2a_to_fwd
+            + startup_phase_count_a2a_from_fwd
+            + startup_phase_count_a2a_bwd
+        ),
+        "Startup_Phase_Count_Total_Comm_Per_Batch": startup_phase_count_total_comm_per_batch,
         # MoE A2A forward+backward aggregate and fraction of total overlapped time
         "MoE_A2A_Total_Time_FwdBwd": total_moe_a2a_time_fwd_bwd,
+        "MoE_A2A_Startup_Latency_FwdBwd": total_moe_a2a_startup_fwd_bwd,
+        "MoE_A2A_Data_Transfer_Time_FwdBwd": total_moe_a2a_data_transfer_fwd_bwd,
         "FwdBwd_Total_Time": total_fwd_bwd_time,
         "MoE_A2A_Time_Fraction_FwdBwd": moe_a2a_time_fraction_fwd_bwd,
         # Communication fraction over overlapped batch time
@@ -1411,21 +2550,119 @@ def get_model_stats(
         ],
         plotting.moe_to_experts_vol_label: moe_a2a_fwd_1.comm_vol,
         plotting.moe_from_experts_vol_label: moe_a2a_fwd_2.comm_vol,
-        plotting.moe_to_experts_time_label: moe_a2a_fwd_1.transmission_time,
-        plotting.moe_from_experts_time_label: moe_a2a_fwd_2.transmission_time,
+        plotting.moe_to_experts_time_label: moe_a2a_fwd_1.total_comm_time,
+        plotting.moe_from_experts_time_label: moe_a2a_fwd_2.total_comm_time,
+        # --- Component-level timing breakdowns (forward) ---
+        # Attention projection (QKV + output projection)
+        "Attn_Proj_Fwd_Compute_Time_Sec": attn_proj_comp_time_fwd,
+        "Attn_Proj_Fwd_Mem_Time_Sec": attn_proj_mem_time_fwd,
+        "Attn_Proj_Fwd_Comm_Time_Sec": attn_proj_comm_time_fwd,
+        "Attn_Proj_Fwd_Total_Time_Overlapped_Sec": attn_proj_overlapped_fwd["total_time"],
+        # Attention core (KV-cache attention)
+        "Attn_Core_Fwd_Compute_Time_Sec": attn_core_comp_time_fwd,
+        "Attn_Core_Fwd_Mem_Time_Sec": attn_core_mem_time_fwd,
+        "Attn_Core_Fwd_Comm_Time_Sec": attn_core_comm_time_fwd,
+        "Attn_Core_Fwd_Total_Time_Overlapped_Sec": attn_core_overlapped_fwd["total_time"],
+        # FFN/MoE block
+        "FFN_Fwd_Compute_Time_Sec": ffn_comp_time_fwd,
+        "FFN_Fwd_Mem_Time_Sec": ffn_mem_time_fwd,
+        "FFN_Fwd_Comm_Time_Sec": ffn_comm_time_fwd,
+        "FFN_Fwd_Total_Time_Overlapped_Sec": ffn_overlapped_fwd["total_time"],
     }
 
+    # Per-component comm timing triplets.
+    # Base keys now consistently represent total communication time.
+    comm_components = {
+        plotting.comm_time_label: CommStats(
+            startup_latency=batch_comm_startup_forward_pass + batch_comm_startup_backward_pass,
+            transmission_time=batch_comm_data_transfer_forward_pass
+            + batch_comm_data_transfer_backward_pass,
+        ),
+        plotting.comm_time_forward_pass_label: CommStats(
+            startup_latency=batch_comm_startup_forward_pass,
+            transmission_time=batch_comm_data_transfer_forward_pass,
+        ),
+        plotting.comm_time_backward_pass_label: CommStats(
+            startup_latency=batch_comm_startup_backward_pass,
+            transmission_time=batch_comm_data_transfer_backward_pass,
+        ),
+        plotting.comm_time_tp_attn_fwd_label: tp_attn_fwd,
+        plotting.comm_time_tp_attn_fwd_phase1_label: tp_attn_fwd_phase1,
+        plotting.comm_time_tp_attn_fwd_phase2_label: tp_attn_fwd_phase2,
+        plotting.comm_time_tp_attn_fwd_phase3_label: tp_attn_fwd_phase3,
+        plotting.comm_time_tp_moe_fwd_label: tp_moe_fwd,
+        plotting.comm_time_tp_attn_bwd_label: tp_attn_bwd,
+        plotting.comm_time_tp_moe_bwd_label: tp_moe_bwd,
+        plotting.comm_time_dp_attn_fwd_label: dp_attn_fwd,
+        plotting.comm_time_dp_moe_fwd_label: dp_moe_fwd,
+        plotting.comm_time_dp_attn_bwd_label: dp_attn_bwd,
+        plotting.comm_time_dp_moe_bwd_label: dp_moe_bwd,
+        plotting.comm_time_pp_fwd_label: pp_fwd,
+        plotting.comm_time_pp_bwd_label: pp_bwd,
+        plotting.moe_to_experts_time_label: moe_a2a_fwd_1,
+        plotting.moe_from_experts_time_label: moe_a2a_fwd_2,
+        plotting.moe_alltoall_bwd_time_label: moe_a2a_bwd,
+    }
+    for label, comm in comm_components.items():
+        stats[f"{label}_Total"] = comm.total_comm_time
+        stats[f"{label}_Startup_Latency"] = comm.startup_latency
+        stats[f"{label}_Data_Transfer"] = comm.transmission_time
+
     stats.update(mem_stats)
+
+    # --- Base (non-swept) config fields for reporting ---
+    #
+    # The sweep `report:` extracts columns from `structure_run_results()` output, which is built
+    # from the DataFrame row. If a field is not part of the sweep_case (i.e., not explicitly swept),
+    # it won't appear in summary.csv unless we surface it here.
+    stats["base.model_spec.num_heads"] = model_spec.num_heads
+    stats["base.model_spec.num_kv_heads"] = model_spec.num_kv_heads
+    stats["base.workload_spec.comp_comm_efficiency"] = workload_spec.comp_comm_efficiency
+    stats["base.workload_spec.comp_mem_efficiency"] = workload_spec.comp_mem_efficiency
+    stats["base.workload_spec.comm_mem_efficiency"] = workload_spec.comm_mem_efficiency
+    # Decode-only knobs (surface even when not explicitly swept).
+    stats["base.workload_spec.decode_tp2d_kv_comm_mode"] = getattr(
+        workload_spec, "decode_tp2d_kv_comm_mode", None
+    )
+    stats["base.workload_spec.decode_moe_router_sync_mode"] = getattr(
+        workload_spec, "decode_moe_router_sync_mode", None
+    )
+    stats["base.workload_spec.tp_moe_a2a_replication_optimization"] = getattr(
+        workload_spec, "tp_moe_a2a_replication_optimization", None
+    )
+    stats["base.workload_spec.moe_a2a_comm_mode"] = getattr(
+        workload_spec, "moe_a2a_comm_mode", None
+    )
 
     return stats
 
 
-def run_sweep(sweep_fn, base_specs, sweep_config, pass_mode):
+def run_sweep(
+    sweep_fn,
+    base_specs,
+    sweep_cfg: SweepConfig,
+    pass_mode,
+    *,
+    enable_decode_layout_trace: bool = True,
+):
 
     data = []
-    sweep_iterator = generate_specs_from_sweep(base_specs=base_specs, sweep_config=sweep_config)
-    for i, (sweep_params, current_specs) in enumerate(sweep_iterator):
+    points = list(generate_cases(cfg=sweep_cfg, base_specs=base_specs))
+    total_points = len(points)
+    print(f"\nSweep points to evaluate: {total_points}")
+    if total_points == 0:
+        raise ValueError("Sweep expanded to zero points; check sweep filters/verifiers.")
 
+    sweep_iter = tqdm(
+        points,
+        total=total_points,
+        desc="Sweep progress",
+        unit="pt",
+        dynamic_ncols=True,
+    )
+    for i, pt in enumerate(sweep_iter):
+        case = pt.case
+        current_specs = apply_case_to_specs(case, base_specs=base_specs)
         model_spec = current_specs["model_spec"]
         workload_spec = current_specs["workload_spec"]
         logical_topology = current_specs["logical_topology"]
@@ -1444,16 +2681,52 @@ def run_sweep(sweep_fn, base_specs, sweep_config, pass_mode):
                 model_spec,
                 workload_with_layers,
                 pass_mode,
+                enable_decode_layout_trace=enable_decode_layout_trace,
             )
+            # Defensive: ensure we have a plain dict so pandas treats this as a record and we can
+            # reliably add sweep/label fields.
+            if not isinstance(stats, dict):
+                try:
+                    stats = dict(stats)  # type: ignore[arg-type]
+                except Exception as e:
+                    raise TypeError(
+                        f"sweep_fn returned non-dict stats of type {type(stats).__name__}, "
+                        f"and it could not be converted to dict: {e}"
+                    ) from e
+            # include sweep params as flat columns
+            for k, v in case.items():
+                stats[f"sweep.{k}"] = v
+            # attach labels (and a flattened view for convenient summary filtering)
+            stats["labels"] = dict(pt.labels)
+            for lk, lv in pt.labels.items():
+                stats[f"label.{lk}"] = lv
 
             data.append(stats)
         except Exception as e:
             print(f"Error in sweep iteration {i}: {e}")
+            sweep_iter.close()
             raise
             # continue
 
-    df = pd.DataFrame(data)
+    sweep_iter.close()
+
+    df = pd.DataFrame.from_records(data)
     # TODO(MB) we need to add all-reduce flops here as well
+    required = [
+        plotting.compute_time_forward_pass_label,
+        plotting.compute_time_backward_pass_label,
+        plotting.mem_time_forward_pass_label,
+        plotting.mem_time_backward_pass_label,
+        plotting.comm_time_forward_pass_label,
+        plotting.comm_time_backward_pass_label,
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        sample_keys = list(data[0].keys())[:30] if data and isinstance(data[0], dict) else []
+        raise KeyError(
+            "Sweep results are missing required flat columns needed for derived metrics. "
+            f"Missing={missing}. Sample keys (first record)={sample_keys}"
+        )
     compute_time = (
         df[plotting.compute_time_forward_pass_label] + df[plotting.compute_time_backward_pass_label]
     )
@@ -1469,8 +2742,16 @@ def run_sweep(sweep_fn, base_specs, sweep_config, pass_mode):
     return df
 
 
-def build_results_df(base_specs, sweep_config, pass_mode):
-    df = run_sweep(get_model_stats, base_specs, sweep_config, pass_mode=pass_mode)
+def build_results_df(
+    base_specs, sweep_cfg: SweepConfig, pass_mode, *, enable_decode_layout_trace: bool = True
+):
+    df = run_sweep(
+        get_model_stats,
+        base_specs,
+        sweep_cfg,
+        pass_mode=pass_mode,
+        enable_decode_layout_trace=enable_decode_layout_trace,
+    )
     df["Comm_Ineff"] = np.where(df["Comm_Compute_Ratio"] > 1.0, 1, 0.1)
     df["Comp_Util"] = np.where(df["Comm_Compute_Ratio"] > 1.0, 1.0 / df["Comm_Compute_Ratio"], 1)
     df["Comp_Comm_Ratio"] = 1.0 / df["Comm_Compute_Ratio"]
@@ -1481,14 +2762,20 @@ def build_results_df(base_specs, sweep_config, pass_mode):
 
 
 def get_detailed_mem_stats(
-    attn_tp_topology,
-    moe_tp_topology,
+    attn_tp_topology_view,
+    proj_tp_topology_view,
+    moe_tp_topology_view,
     model_spec,
     moe_config,
     workload_spec,
-    tp_variant,
-    x_dims,
-    yz_dims,
+    attn_tp_variant,
+    moe_tp_variant,
+    attn_x_dims,
+    attn_yz_dims,
+    proj_x_dims,
+    proj_yz_dims,
+    moe_x_dims,
+    moe_yz_dims,
     pass_mode,
     activation_checkpointing,
     device_for,
@@ -1496,73 +2783,251 @@ def get_detailed_mem_stats(
 ):
     """Helper to get detailed attn/moe memory traffic."""
 
-    # This requires re-calculating the traffic with a different grouping.
-    # We can create dummy LayerMemoryTraffic objects and call the sub-functions.
+    def _prod_from_shape(shape, indices):
+        p = 1
+        for idx in indices:
+            p *= shape[idx]
+        return p
 
-    # Forward Attention
+    # Forward Attention (bookkeeping split: projection vs core)
+    fwd_attn_proj_traffic = LayerMemoryTraffic("fwd_attn_proj", device_for, node)
+    fwd_attn_core_traffic = LayerMemoryTraffic("fwd_attn_core", device_for, node)
     fwd_attn_traffic = LayerMemoryTraffic("fwd_attn", device_for, node)
-    if tp_variant == TensorParallelVariant.SHARD_WEIGHTS_2D:
-        pass  # TODO: Add 2D support
-    else:
-        if pass_mode in [PassMode.TRAINING, PassMode.INFERENCE_PREFILL]:
-            _forward_pass_prefill_attention_memory_traffic(
-                fwd_attn_traffic,
-                model_spec,
-                workload_spec.seq_length,
-                attn_tp_topology.num_chips,
-                False,
-                workload_spec,
-            )
-        else:
-            _decode_attention_memory_traffic(
-                fwd_attn_traffic,
-                model_spec,
-                workload_spec.prefill_seq_len,
-                attn_tp_topology.num_chips,
-                workload_spec,
+    match attn_tp_variant:
+        case TensorParallelVariant.SHARD_WEIGHTS_2D:
+            if attn_x_dims is None or attn_yz_dims is None:
+                raise ValueError("TP-2D attn requires attn_x_dims and attn_yz_dims to be defined.")
+            shape_attn = attn_tp_topology_view.shape
+            tp_x_attn = _prod_from_shape(shape_attn, attn_x_dims)
+            tp_yz_attn = _prod_from_shape(shape_attn, attn_yz_dims)
+
+            # Projections may be modeled on a different TP domain (e.g., decode_tp2d_qkv_groups).
+            if proj_tp_topology_view is None:
+                proj_tp_topology_view = attn_tp_topology_view
+                proj_x_dims = attn_x_dims
+                proj_yz_dims = attn_yz_dims
+            if proj_x_dims is None or proj_yz_dims is None:
+                raise ValueError("TP-2D proj requires proj_x_dims and proj_yz_dims to be defined.")
+            shape_proj = proj_tp_topology_view.shape
+            tp_x_proj = _prod_from_shape(shape_proj, proj_x_dims)
+            tp_yz_proj = _prod_from_shape(shape_proj, proj_yz_dims)
+            match pass_mode:
+                case PassMode.TRAINING | PassMode.INFERENCE_PREFILL:
+                    _forward_pass_prefill_attention_projection_tp_2d_memory_traffic(
+                        traffic=fwd_attn_proj_traffic,
+                        transformer_config=model_spec,
+                        n_seq=workload_spec.seq_length,
+                        proj_tp_size_x=tp_x_proj,
+                        proj_tp_size_yz=tp_yz_proj,
+                        attn_tp_size_x=tp_x_attn,
+                        attn_tp_size_yz=tp_yz_attn,
+                        workload_spec=workload_spec,
+                    )
+                    _forward_pass_prefill_attention_attn_tp_2d_memory_traffic(
+                        traffic=fwd_attn_core_traffic,
+                        transformer_config=model_spec,
+                        n_seq=workload_spec.seq_length,
+                        proj_tp_size_x=tp_x_proj,
+                        proj_tp_size_yz=tp_yz_proj,
+                        attn_tp_size_x=tp_x_attn,
+                        attn_tp_size_yz=tp_yz_attn,
+                        save_kv_cache=(pass_mode == PassMode.INFERENCE_PREFILL),
+                        workload_spec=workload_spec,
+                    )
+                case PassMode.INFERENCE_DECODE:
+                    _decode_attention_projection_tp_2d_memory_traffic(
+                        traffic=fwd_attn_proj_traffic,
+                        transformer_config=model_spec,
+                        proj_tp_size_x=tp_x_proj,
+                        proj_tp_size_yz=tp_yz_proj,
+                        workload_spec=workload_spec,
+                    )
+                    _decode_attention_attn_tp_2d_memory_traffic(
+                        traffic=fwd_attn_core_traffic,
+                        transformer_config=model_spec,
+                        n_seq_so_far=workload_spec.prefill_seq_len,
+                        proj_tp_size_x=tp_x_proj,
+                        proj_tp_size_yz=tp_yz_proj,
+                        attn_tp_size_x=tp_x_attn,
+                        attn_tp_size_yz=tp_yz_attn,
+                        workload_spec=workload_spec,
+                    )
+                case _:
+                    raise ValueError(
+                        f"Unsupported pass_mode for TP-2D attn detailed traffic: {pass_mode}"
+                    )
+        case TensorParallelVariant.NONE | TensorParallelVariant.SHARD_WEIGHTS_1D:
+            match pass_mode:
+                case PassMode.TRAINING | PassMode.INFERENCE_PREFILL:
+                    _forward_pass_prefill_attention_projection_tp_1d_memory_traffic(
+                        traffic=fwd_attn_proj_traffic,
+                        transformer_config=model_spec,
+                        n_seq=workload_spec.seq_length,
+                        proj_tp_size=(
+                            proj_tp_topology_view.num_chips
+                            if proj_tp_topology_view is not None
+                            else attn_tp_topology_view.num_chips
+                        ),
+                        workload_spec=workload_spec,
+                    )
+                    _forward_pass_prefill_attention_attn_tp_1d_memory_traffic(
+                        traffic=fwd_attn_core_traffic,
+                        transformer_config=model_spec,
+                        n_seq=workload_spec.seq_length,
+                        proj_tp_size=(
+                            proj_tp_topology_view.num_chips
+                            if proj_tp_topology_view is not None
+                            else attn_tp_topology_view.num_chips
+                        ),
+                        attn_tp_size=attn_tp_topology_view.num_chips,
+                        save_kv_cache=(pass_mode == PassMode.INFERENCE_PREFILL),
+                        workload_spec=workload_spec,
+                    )
+                case PassMode.INFERENCE_DECODE:
+                    _decode_attention_projection_tp_1d_memory_traffic(
+                        traffic=fwd_attn_proj_traffic,
+                        transformer_config=model_spec,
+                        proj_tp_size=(
+                            proj_tp_topology_view.num_chips
+                            if proj_tp_topology_view is not None
+                            else attn_tp_topology_view.num_chips
+                        ),
+                        workload_spec=workload_spec,
+                    )
+                    _decode_attention_attn_tp_1d_memory_traffic(
+                        traffic=fwd_attn_core_traffic,
+                        transformer_config=model_spec,
+                        n_seq_so_far=workload_spec.prefill_seq_len,
+                        proj_tp_size=(
+                            proj_tp_topology_view.num_chips
+                            if proj_tp_topology_view is not None
+                            else attn_tp_topology_view.num_chips
+                        ),
+                        attn_tp_size=attn_tp_topology_view.num_chips,
+                        workload_spec=workload_spec,
+                    )
+                case _:
+                    raise ValueError(
+                        f"Unsupported pass_mode for 1D attn detailed traffic: {pass_mode}"
+                    )
+        case _:
+            raise ValueError(
+                f"Unsupported attention TP variant in detailed traffic: {attn_tp_variant}"
             )
 
-    # Forward MoE
+    # Combine bookkeeping split back into the legacy "fwd_attn" traffic (backward compatible totals)
+    fwd_attn_traffic = fwd_attn_proj_traffic + fwd_attn_core_traffic
+
     fwd_moe_traffic = LayerMemoryTraffic("fwd_moe", device_for, node)
-    if tp_variant == TensorParallelVariant.SHARD_WEIGHTS_2D:
-        pass  # TODO: Add 2D support
-    else:
-        _forward_pass_prefill_moe_ffn_tp_1d_memory_traffic(
-            fwd_moe_traffic,
-            model_spec,
-            workload_spec.seq_length,
-            moe_config,
-            moe_tp_topology.num_chips,
-            workload_spec,
-        )
+    match moe_tp_variant:
+        case TensorParallelVariant.SHARD_WEIGHTS_2D:
+            if moe_x_dims is None or moe_yz_dims is None:
+                raise ValueError("TP-2D MoE requires moe_x_dims and moe_yz_dims to be defined.")
+            shape = moe_tp_topology_view.shape
+            tp_x = _prod_from_shape(shape, moe_x_dims)
+            tp_yz = _prod_from_shape(shape, moe_yz_dims)
+            moe_seq = workload_spec.seq_length if pass_mode != PassMode.INFERENCE_DECODE else 1
+            _forward_pass_prefill_moe_ffn_tp_2d_memory_traffic(
+                fwd_moe_traffic,
+                model_spec,
+                moe_seq,
+                moe_tp_size_x=tp_x,
+                moe_tp_size_yz=tp_yz,
+                workload_spec=workload_spec,
+                moe_config=moe_config,
+            )
+        case TensorParallelVariant.NONE | TensorParallelVariant.SHARD_WEIGHTS_1D:
+            moe_seq = workload_spec.seq_length if pass_mode != PassMode.INFERENCE_DECODE else 1
+            _forward_pass_prefill_moe_ffn_tp_1d_memory_traffic(
+                fwd_moe_traffic,
+                model_spec,
+                moe_seq,
+                moe_config,
+                moe_tp_topology_view.num_chips,
+                workload_spec,
+            )
+        case _:
+            raise ValueError(f"Unsupported MoE TP variant in detailed traffic: {moe_tp_variant}")
 
     bwd_attn_traffic = LayerMemoryTraffic("bwd_attn", device_for, node)
     bwd_moe_traffic = LayerMemoryTraffic("bwd_moe", device_for, node)
     if pass_mode == PassMode.TRAINING:
-        if tp_variant == TensorParallelVariant.SHARD_WEIGHTS_2D:
-            pass  # TODO: Add 2D support
-        else:
-            bwd_attn_traffic = _backward_attn_tp_1d_memory_traffic(
-                "bwd_attn",
-                model_spec,
-                workload_spec,
-                attn_tp_topology.num_chips,
-                activation_checkpointing,
-                device_for,
-                node,
-            )
-            bwd_moe_traffic = _backward_moe_tp_1d_memory_traffic(
-                "bwd_moe",
-                model_spec,
-                moe_config,
-                moe_tp_topology,
-                workload_spec,
-                activation_checkpointing,
-                device_for,
-                node,
-            )
+        match attn_tp_variant:
+            case TensorParallelVariant.SHARD_WEIGHTS_2D:
+                if attn_x_dims is None or attn_yz_dims is None:
+                    raise ValueError(
+                        "TP-2D attn requires attn_x_dims and attn_yz_dims to be defined."
+                    )
+                shape = attn_tp_topology_view.shape
+                tp_x = _prod_from_shape(shape, attn_x_dims)
+                tp_yz = _prod_from_shape(shape, attn_yz_dims)
+                bwd_attn_traffic = _backward_attn_tp_2d_memory_traffic(
+                    name="bwd_attn_2d",
+                    transformer_config=model_spec,
+                    workload_spec=workload_spec,
+                    attn_tp_size_x=tp_x,
+                    attn_tp_size_yz=tp_yz,
+                    activation_checkpointing=activation_checkpointing,
+                    device_for=device_for,
+                    node=node,
+                )
+            case TensorParallelVariant.NONE | TensorParallelVariant.SHARD_WEIGHTS_1D:
+                bwd_attn_traffic = _backward_attn_tp_1d_memory_traffic(
+                    name="bwd_attn",
+                    transformer_config=model_spec,
+                    workload_spec=workload_spec,
+                    tp_size=attn_tp_topology_view.num_chips,
+                    activation_checkpointing=activation_checkpointing,
+                    device_for=device_for,
+                    node=node,
+                )
+            case _:
+                raise ValueError(
+                    f"Unsupported attention TP variant in detailed backward: {attn_tp_variant}"
+                )
 
-    return fwd_attn_traffic, fwd_moe_traffic, bwd_attn_traffic, bwd_moe_traffic
+        match moe_tp_variant:
+            case TensorParallelVariant.SHARD_WEIGHTS_2D:
+                if moe_x_dims is None or moe_yz_dims is None:
+                    raise ValueError("TP-2D MoE requires moe_x_dims and moe_yz_dims to be defined.")
+                shape = moe_tp_topology_view.shape
+                tp_x = _prod_from_shape(shape, moe_x_dims)
+                tp_yz = _prod_from_shape(shape, moe_yz_dims)
+                bwd_moe_traffic = _backward_moe_tp_2d_memory_traffic(
+                    name="bwd_moe_2d",
+                    transformer_config=model_spec,
+                    moe_config=moe_config,
+                    workload_spec=workload_spec,
+                    moe_tp_size_x=tp_x,
+                    moe_tp_size_yz=tp_yz,
+                    activation_checkpointing=activation_checkpointing,
+                    device_for=device_for,
+                    node=node,
+                )
+            case TensorParallelVariant.NONE | TensorParallelVariant.SHARD_WEIGHTS_1D:
+                bwd_moe_traffic = _backward_moe_tp_1d_memory_traffic(
+                    name="bwd_moe",
+                    transformer_config=model_spec,
+                    moe_config=moe_config,
+                    moe_tp_topology=moe_tp_topology_view,
+                    workload_spec=workload_spec,
+                    activation_checkpointing=activation_checkpointing,
+                    device_for=device_for,
+                    node=node,
+                )
+            case _:
+                raise ValueError(
+                    f"Unsupported MoE TP variant in detailed backward: {moe_tp_variant}"
+                )
+
+    return (
+        fwd_attn_traffic,
+        fwd_attn_proj_traffic,
+        fwd_attn_core_traffic,
+        fwd_moe_traffic,
+        bwd_attn_traffic,
+        bwd_moe_traffic,
+    )
 
 
 def structure_run_results(row, human_readable=False):
@@ -1587,6 +3052,41 @@ def structure_run_results(row, human_readable=False):
     # Build the structured dictionary
     # Pre-compute per-layer and per-PP-stage memory breakdowns where desired
     num_layers_per_stage = get_val(plotting.n_layers_label)
+    if num_layers_per_stage is None or num_layers_per_stage <= 0:
+        raise ValueError(
+            f"Missing or invalid `{plotting.n_layers_label}` in results row: {num_layers_per_stage}"
+        )
+
+    def comm_seconds_triplet(label):
+        total_s = get_val(f"{label}_Total")
+        if total_s is None:
+            total_s = get_val(label)
+        startup_s = get_val(f"{label}_Startup_Latency")
+        data_transfer_s = get_val(f"{label}_Data_Transfer")
+        return total_s, startup_s, data_transfer_s
+
+    def comm_triplet(label):
+        total_s, startup_s, data_transfer_s = comm_seconds_triplet(label)
+        return {
+            "total_time": fmt_t(total_s),
+            "total_time_seconds": total_s,
+            "startup_latency": fmt_t(startup_s),
+            "startup_latency_seconds": startup_s,
+            "data_transfer_time": fmt_t(data_transfer_s),
+            "data_transfer_time_seconds": data_transfer_s,
+        }
+
+    def comm_triplet_per_layer(label):
+        total_s, startup_s, data_transfer_s = comm_seconds_triplet(label)
+        return {
+            "total_time": fmt_t((total_s or 0.0) / num_layers_per_stage),
+            "total_time_seconds": ((total_s or 0.0) / num_layers_per_stage),
+            "startup_latency": fmt_t((startup_s or 0.0) / num_layers_per_stage),
+            "startup_latency_seconds": ((startup_s or 0.0) / num_layers_per_stage),
+            "data_transfer_time": fmt_t((data_transfer_s or 0.0) / num_layers_per_stage),
+            "data_transfer_time_seconds": ((data_transfer_s or 0.0) / num_layers_per_stage),
+        }
+
     attn_time_per_layer = get_val(plotting.mem_time_attn_fwd_label)
     attn_time_per_stage = (attn_time_per_layer or 0.0) * (num_layers_per_stage or 0)
     attn_vol_per_layer = get_val(plotting.mem_vol_attn_fwd_label)
@@ -1608,7 +3108,29 @@ def structure_run_results(row, human_readable=False):
     bwd_moe_vol_per_layer = get_val(plotting.mem_vol_moe_bwd_label)
     bwd_moe_vol_per_stage = (bwd_moe_vol_per_layer or 0) * (num_layers_per_stage or 0)
 
+    sweep_case = _extract_sweep_case_from_row(row)
     return {
+        "sweep_case": sweep_case,
+        "labels": get_val("labels") or {},
+        "base": {
+            "model_spec": {
+                "num_heads": get_val("base.model_spec.num_heads"),
+                "num_kv_heads": get_val("base.model_spec.num_kv_heads"),
+            },
+            "workload_spec": {
+                "comp_comm_efficiency": get_val("base.workload_spec.comp_comm_efficiency"),
+                "comp_mem_efficiency": get_val("base.workload_spec.comp_mem_efficiency"),
+                "comm_mem_efficiency": get_val("base.workload_spec.comm_mem_efficiency"),
+                "decode_tp2d_kv_comm_mode": get_val("base.workload_spec.decode_tp2d_kv_comm_mode"),
+                "decode_moe_router_sync_mode": get_val(
+                    "base.workload_spec.decode_moe_router_sync_mode"
+                ),
+                "tp_moe_a2a_replication_optimization": get_val(
+                    "base.workload_spec.tp_moe_a2a_replication_optimization"
+                ),
+                "moe_a2a_comm_mode": get_val("base.workload_spec.moe_a2a_comm_mode"),
+            },
+        },
         "configuration": {
             "tp_node": get_val(plotting.tp_node_label),
             "tp_xpu_count": get_val(plotting.tp_xpu_count_label),
@@ -1642,16 +3164,48 @@ def structure_run_results(row, human_readable=False):
             "total_time_seconds": get_val(plotting.time_to_train_sec_label),
             "tokens_per_second": get_val(plotting.tokens_per_second_label),
             "tokens_per_second_per_xpu": get_val(plotting.tokens_per_second_per_xpu_label),
+            "tpot_user": fmt_t(get_val(plotting.tpot_user_sec_label)),
+            "tpot_user_seconds": get_val(plotting.tpot_user_sec_label),
+            "tpot_system": fmt_t(get_val(plotting.tpot_system_sec_label)),
+            "tpot_system_seconds": get_val(plotting.tpot_system_sec_label),
             "ttft_forward": fmt_t(get_val(plotting.ttft_forward_sec_label)),
             "ttft_forward_seconds": get_val(plotting.ttft_forward_sec_label),
         },
+        "time_breakdown": {
+            "forward": {
+                "attn_projection": {
+                    "total_time": fmt_t(get_val("Attn_Proj_Fwd_Total_Time_Overlapped_Sec")),
+                    "total_time_seconds": get_val("Attn_Proj_Fwd_Total_Time_Overlapped_Sec"),
+                    "compute_s": get_val("Attn_Proj_Fwd_Compute_Time_Sec"),
+                    "memory_s": get_val("Attn_Proj_Fwd_Mem_Time_Sec"),
+                    "communication_s": get_val("Attn_Proj_Fwd_Comm_Time_Sec"),
+                },
+                "attn_core": {
+                    "total_time": fmt_t(get_val("Attn_Core_Fwd_Total_Time_Overlapped_Sec")),
+                    "total_time_seconds": get_val("Attn_Core_Fwd_Total_Time_Overlapped_Sec"),
+                    "compute_s": get_val("Attn_Core_Fwd_Compute_Time_Sec"),
+                    "memory_s": get_val("Attn_Core_Fwd_Mem_Time_Sec"),
+                    "communication_s": get_val("Attn_Core_Fwd_Comm_Time_Sec"),
+                },
+                "ffn": {
+                    "total_time": fmt_t(get_val("FFN_Fwd_Total_Time_Overlapped_Sec")),
+                    "total_time_seconds": get_val("FFN_Fwd_Total_Time_Overlapped_Sec"),
+                    "compute_s": get_val("FFN_Fwd_Compute_Time_Sec"),
+                    "memory_s": get_val("FFN_Fwd_Mem_Time_Sec"),
+                    "communication_s": get_val("FFN_Fwd_Comm_Time_Sec"),
+                },
+            }
+        },
         "compute_per_batch_per_xpu": {
             "total_time": fmt_t(get_val(plotting.compute_time_label)),
+            "total_time_seconds": get_val(plotting.compute_time_label),
             "forward": {
                 "time": fmt_t(get_val(plotting.compute_time_forward_pass_label)),
+                "time_seconds": get_val(plotting.compute_time_forward_pass_label),
                 "total_flops": fmt_f(get_val(plotting.flops_forward_pass_label)),
                 "embedding": {
                     "time": fmt_t(get_val(plotting.compute_time_embedding_fwd_label)),
+                    "time_seconds": get_val(plotting.compute_time_embedding_fwd_label),
                     "flops": fmt_f(get_val(plotting.flops_embedding_fwd_label)),
                 },
                 "attn": {
@@ -1659,6 +3213,7 @@ def structure_run_results(row, human_readable=False):
                         (get_val(plotting.compute_time_attn_fwd_label) or 0.0)
                         / num_layers_per_stage
                     ),
+                    "time_per_pp_stage_seconds": get_val(plotting.compute_time_attn_fwd_label),
                     "time_per_pp_stage": fmt_t(get_val(plotting.compute_time_attn_fwd_label)),
                     "flops_per_layer": fmt_f(
                         (get_val(plotting.flops_attn_fwd_label) or 0) / num_layers_per_stage
@@ -1669,6 +3224,7 @@ def structure_run_results(row, human_readable=False):
                     "time_per_layer": fmt_t(
                         (get_val(plotting.compute_time_moe_fwd_label) or 0.0) / num_layers_per_stage
                     ),
+                    "time_per_pp_stage_seconds": get_val(plotting.compute_time_moe_fwd_label),
                     "time_per_pp_stage": fmt_t(get_val(plotting.compute_time_moe_fwd_label)),
                     "flops_per_layer": fmt_f(
                         (get_val(plotting.flops_moe_fwd_label) or 0) / num_layers_per_stage
@@ -1677,17 +3233,20 @@ def structure_run_results(row, human_readable=False):
                 },
                 "unembedding": {
                     "time": fmt_t(get_val(plotting.compute_time_unembedding_fwd_label)),
+                    "time_seconds": get_val(plotting.compute_time_unembedding_fwd_label),
                     "flops": fmt_f(get_val(plotting.flops_unembedding_fwd_label)),
                 },
             },
             "backward": {
                 "time": fmt_t(get_val(plotting.compute_time_backward_pass_label)),
+                "time_seconds": get_val(plotting.compute_time_backward_pass_label),
                 "total_flops": fmt_f(get_val(plotting.flops_backward_pass_label)),
                 "attn": {
                     "time_per_layer": fmt_t(
                         (get_val(plotting.compute_time_attn_bwd_label) or 0.0)
                         / num_layers_per_stage
                     ),
+                    "time_per_pp_stage_seconds": get_val(plotting.compute_time_attn_bwd_label),
                     "time_per_pp_stage": fmt_t(get_val(plotting.compute_time_attn_bwd_label)),
                     "flops_per_layer": fmt_f(
                         (get_val(plotting.flops_attn_bwd_label) or 0) / num_layers_per_stage
@@ -1698,6 +3257,7 @@ def structure_run_results(row, human_readable=False):
                     "time_per_layer": fmt_t(
                         (get_val(plotting.compute_time_moe_bwd_label) or 0.0) / num_layers_per_stage
                     ),
+                    "time_per_pp_stage_seconds": get_val(plotting.compute_time_moe_bwd_label),
                     "time_per_pp_stage": fmt_t(get_val(plotting.compute_time_moe_bwd_label)),
                     "flops_per_layer": fmt_f(
                         (get_val(plotting.flops_moe_bwd_label) or 0) / num_layers_per_stage
@@ -1708,18 +3268,32 @@ def structure_run_results(row, human_readable=False):
         },
         "memory_traffic_per_batch_per_xpu": {
             "total_time": fmt_t(get_val(plotting.memory_time_label)),
+            "total_time_seconds": get_val(plotting.memory_time_label),
             "forward": {
                 "time": fmt_t(get_val(plotting.mem_time_forward_pass_label)),
+                "time_seconds": get_val(plotting.mem_time_forward_pass_label),
                 "total_volume_bytes": fmt_b(get_val(plotting.mem_forward_pass_label)),
                 "embedding": {
                     "time": fmt_t(get_val(plotting.embedding_mem_time_fwd_label)),
+                    "time_seconds": get_val(plotting.embedding_mem_time_fwd_label),
                     "volume_bytes": fmt_b(get_val(plotting.embedding_mem_vol_fwd_label)),
                 },
                 "attn": {
                     "time_per_layer": fmt_t(attn_time_per_layer),
+                    "time_per_pp_stage_seconds": attn_time_per_stage,
                     "time_per_pp_stage": fmt_t(attn_time_per_stage),
                     "volume_bytes_per_layer": fmt_b(attn_vol_per_layer),
                     "volume_bytes_per_pp_stage": fmt_b(attn_vol_per_stage),
+                    "projection": {
+                        "time_per_pp_stage_seconds": get_val("attn_fwd_mem_time_proj_s"),
+                        "time_per_pp_stage": fmt_t(get_val("attn_fwd_mem_time_proj_s")),
+                        "volume_bytes_per_pp_stage": fmt_b(get_val("attn_fwd_mem_bytes_proj")),
+                    },
+                    "attn_core": {
+                        "time_per_pp_stage_seconds": get_val("attn_fwd_mem_time_core_s"),
+                        "time_per_pp_stage": fmt_t(get_val("attn_fwd_mem_time_core_s")),
+                        "volume_bytes_per_pp_stage": fmt_b(get_val("attn_fwd_mem_bytes_core")),
+                    },
                     "by_component": {
                         "weights": {
                             "time_read_per_layer": fmt_t(
@@ -1845,6 +3419,7 @@ def structure_run_results(row, human_readable=False):
                 },
                 "moe": {
                     "time_per_layer": fmt_t(moe_time_per_layer),
+                    "time_per_pp_stage_seconds": moe_time_per_stage,
                     "time_per_pp_stage": fmt_t(moe_time_per_stage),
                     "volume_bytes_per_layer": fmt_b(moe_vol_per_layer),
                     "volume_bytes_per_pp_stage": fmt_b(moe_vol_per_stage),
@@ -1943,18 +3518,22 @@ def structure_run_results(row, human_readable=False):
                 },
                 "unembedding": {
                     "time": fmt_t(get_val(plotting.unembedding_mem_time_fwd_label)),
+                    "time_seconds": get_val(plotting.unembedding_mem_time_fwd_label),
                     "volume_bytes": fmt_b(get_val(plotting.unembedding_mem_vol_fwd_label)),
                 },
             },
             "backward": {
                 "time": fmt_t(get_val(plotting.mem_time_backward_pass_label)),
+                "time_seconds": get_val(plotting.mem_time_backward_pass_label),
                 "total_volume_bytes": fmt_b(get_val(plotting.mem_backward_pass_label)),
                 "embedding": {
                     "time": fmt_t(get_val(plotting.embedding_mem_time_bwd_label)),
+                    "time_seconds": get_val(plotting.embedding_mem_time_bwd_label),
                     "volume_bytes": fmt_b(get_val(plotting.embedding_mem_vol_bwd_label)),
                 },
                 "attn": {
                     "time_per_layer": fmt_t(bwd_attn_time_per_layer),
+                    "time_per_pp_stage_seconds": bwd_attn_time_per_stage,
                     "time_per_pp_stage": fmt_t(bwd_attn_time_per_stage),
                     "volume_bytes_per_layer": fmt_b(bwd_attn_vol_per_layer),
                     "volume_bytes_per_pp_stage": fmt_b(bwd_attn_vol_per_stage),
@@ -2083,6 +3662,7 @@ def structure_run_results(row, human_readable=False):
                 },
                 "moe": {
                     "time_per_layer": fmt_t(bwd_moe_time_per_layer),
+                    "time_per_pp_stage_seconds": bwd_moe_time_per_stage,
                     "time_per_pp_stage": fmt_t(bwd_moe_time_per_stage),
                     "volume_bytes_per_layer": fmt_b(bwd_moe_vol_per_layer),
                     "volume_bytes_per_pp_stage": fmt_b(bwd_moe_vol_per_stage),
@@ -2181,24 +3761,50 @@ def structure_run_results(row, human_readable=False):
                 },
                 "unembedding": {
                     "time": fmt_t(get_val(plotting.unembedding_mem_time_bwd_label)),
+                    "time_seconds": get_val(plotting.unembedding_mem_time_bwd_label),
                     "volume_bytes": fmt_b(get_val(plotting.unembedding_mem_vol_bwd_label)),
                 },
             },
         },
         "communication_per_batch_per_xpu": {
             "total_time": fmt_t(get_val(plotting.comm_time_label)),
+            "total_time_seconds": get_val(plotting.comm_time_label),
+            "startup_latency": fmt_t(get_val(f"{plotting.comm_time_label}_Startup_Latency")),
+            "startup_latency_seconds": get_val(f"{plotting.comm_time_label}_Startup_Latency"),
+            "data_transfer_time": fmt_t(get_val(f"{plotting.comm_time_label}_Data_Transfer")),
+            "data_transfer_time_seconds": get_val(f"{plotting.comm_time_label}_Data_Transfer"),
+            "startup_phase_count": get_val("Startup_Phase_Count_Total_Comm_Per_Batch"),
             "forward": {
                 "total_time": fmt_t(get_val(plotting.comm_time_forward_pass_label)),
+                "total_time_seconds": get_val(plotting.comm_time_forward_pass_label),
+                "startup_latency": fmt_t(
+                    get_val(f"{plotting.comm_time_forward_pass_label}_Startup_Latency")
+                ),
+                "startup_latency_seconds": get_val(
+                    f"{plotting.comm_time_forward_pass_label}_Startup_Latency"
+                ),
+                "data_transfer_time": fmt_t(
+                    get_val(f"{plotting.comm_time_forward_pass_label}_Data_Transfer")
+                ),
+                "data_transfer_time_seconds": get_val(
+                    f"{plotting.comm_time_forward_pass_label}_Data_Transfer"
+                ),
                 "total_volume_bytes": fmt_b(get_val(plotting.comm_vol_forward_pass_label)),
                 "unembedding_all_gather": {
                     "time": fmt_t(get_val(plotting.comm_time_unembedding_ag_label)),
+                    "time_seconds": get_val(plotting.comm_time_unembedding_ag_label),
                     "volume_bytes": fmt_b(get_val(plotting.comm_vol_unembedding_ag_label)),
                 },
                 "tensor_parallel_attn": {
+                    "timing_per_layer": comm_triplet_per_layer(
+                        plotting.comm_time_tp_attn_fwd_label
+                    ),
+                    "timing_per_pp_stage": comm_triplet(plotting.comm_time_tp_attn_fwd_label),
                     "time_per_layer": fmt_t(
                         (get_val(plotting.comm_time_tp_attn_fwd_label) or 0.0)
                         / num_layers_per_stage
                     ),
+                    "time_per_pp_stage_seconds": get_val(plotting.comm_time_tp_attn_fwd_label),
                     "time_per_pp_stage": fmt_t(get_val(plotting.comm_time_tp_attn_fwd_label)),
                     "volume_bytes_per_layer": fmt_b(
                         (get_val(plotting.comm_vol_tp_attn_fwd_label) or 0) / num_layers_per_stage
@@ -2206,11 +3812,170 @@ def structure_run_results(row, human_readable=False):
                     "volume_bytes_per_pp_stage": fmt_b(
                         get_val(plotting.comm_vol_tp_attn_fwd_label)
                     ),
+                    "phase1_input_proj": {
+                        "timing_per_layer": comm_triplet_per_layer(
+                            plotting.comm_time_tp_attn_fwd_phase1_label
+                        ),
+                        "timing_per_pp_stage": comm_triplet(
+                            plotting.comm_time_tp_attn_fwd_phase1_label
+                        ),
+                        "time_per_layer": fmt_t(
+                            (get_val(plotting.comm_time_tp_attn_fwd_phase1_label) or 0.0)
+                            / num_layers_per_stage
+                        ),
+                        "time_per_pp_stage_seconds": get_val(
+                            plotting.comm_time_tp_attn_fwd_phase1_label
+                        ),
+                        "time_per_pp_stage": fmt_t(
+                            get_val(plotting.comm_time_tp_attn_fwd_phase1_label)
+                        ),
+                        "volume_bytes_per_layer": fmt_b(
+                            (get_val(plotting.comm_vol_tp_attn_fwd_phase1_label) or 0)
+                            / num_layers_per_stage
+                        ),
+                        "volume_bytes_per_pp_stage": fmt_b(
+                            get_val(plotting.comm_vol_tp_attn_fwd_phase1_label)
+                        ),
+                    },
+                    "phase2_attn_core": {
+                        "timing_per_layer": comm_triplet_per_layer(
+                            plotting.comm_time_tp_attn_fwd_phase2_label
+                        ),
+                        "timing_per_pp_stage": comm_triplet(
+                            plotting.comm_time_tp_attn_fwd_phase2_label
+                        ),
+                        "time_per_layer": fmt_t(
+                            (get_val(plotting.comm_time_tp_attn_fwd_phase2_label) or 0.0)
+                            / num_layers_per_stage
+                        ),
+                        "time_per_pp_stage_seconds": get_val(
+                            plotting.comm_time_tp_attn_fwd_phase2_label
+                        ),
+                        "time_per_pp_stage": fmt_t(
+                            get_val(plotting.comm_time_tp_attn_fwd_phase2_label)
+                        ),
+                        "volume_bytes_per_layer": fmt_b(
+                            (get_val(plotting.comm_vol_tp_attn_fwd_phase2_label) or 0)
+                            / num_layers_per_stage
+                        ),
+                        "volume_bytes_per_pp_stage": fmt_b(
+                            get_val(plotting.comm_vol_tp_attn_fwd_phase2_label)
+                        ),
+                    },
+                    "phase3_output_proj": {
+                        "timing_per_layer": comm_triplet_per_layer(
+                            plotting.comm_time_tp_attn_fwd_phase3_label
+                        ),
+                        "timing_per_pp_stage": comm_triplet(
+                            plotting.comm_time_tp_attn_fwd_phase3_label
+                        ),
+                        "time_per_layer": fmt_t(
+                            (get_val(plotting.comm_time_tp_attn_fwd_phase3_label) or 0.0)
+                            / num_layers_per_stage
+                        ),
+                        "time_per_pp_stage_seconds": get_val(
+                            plotting.comm_time_tp_attn_fwd_phase3_label
+                        ),
+                        "time_per_pp_stage": fmt_t(
+                            get_val(plotting.comm_time_tp_attn_fwd_phase3_label)
+                        ),
+                        "volume_bytes_per_layer": fmt_b(
+                            (get_val(plotting.comm_vol_tp_attn_fwd_phase3_label) or 0)
+                            / num_layers_per_stage
+                        ),
+                        "volume_bytes_per_pp_stage": fmt_b(
+                            get_val(plotting.comm_vol_tp_attn_fwd_phase3_label)
+                        ),
+                    },
+                    "projection_total": {
+                        "timing_per_pp_stage": {
+                            "total_time": fmt_t(
+                                (get_val(plotting.comm_time_tp_attn_fwd_phase1_label) or 0.0)
+                                + (get_val(plotting.comm_time_tp_attn_fwd_phase3_label) or 0.0)
+                            ),
+                            "total_time_seconds": (
+                                (get_val(plotting.comm_time_tp_attn_fwd_phase1_label) or 0.0)
+                                + (get_val(plotting.comm_time_tp_attn_fwd_phase3_label) or 0.0)
+                            ),
+                            "startup_latency": fmt_t(
+                                (
+                                    get_val(
+                                        f"{plotting.comm_time_tp_attn_fwd_phase1_label}_Startup_Latency"
+                                    )
+                                    or 0.0
+                                )
+                                + (
+                                    get_val(
+                                        f"{plotting.comm_time_tp_attn_fwd_phase3_label}_Startup_Latency"
+                                    )
+                                    or 0.0
+                                )
+                            ),
+                            "startup_latency_seconds": (
+                                (
+                                    get_val(
+                                        f"{plotting.comm_time_tp_attn_fwd_phase1_label}_Startup_Latency"
+                                    )
+                                    or 0.0
+                                )
+                                + (
+                                    get_val(
+                                        f"{plotting.comm_time_tp_attn_fwd_phase3_label}_Startup_Latency"
+                                    )
+                                    or 0.0
+                                )
+                            ),
+                            "data_transfer_time": fmt_t(
+                                (
+                                    get_val(
+                                        f"{plotting.comm_time_tp_attn_fwd_phase1_label}_Data_Transfer"
+                                    )
+                                    or 0.0
+                                )
+                                + (
+                                    get_val(
+                                        f"{plotting.comm_time_tp_attn_fwd_phase3_label}_Data_Transfer"
+                                    )
+                                    or 0.0
+                                )
+                            ),
+                            "data_transfer_time_seconds": (
+                                (
+                                    get_val(
+                                        f"{plotting.comm_time_tp_attn_fwd_phase1_label}_Data_Transfer"
+                                    )
+                                    or 0.0
+                                )
+                                + (
+                                    get_val(
+                                        f"{plotting.comm_time_tp_attn_fwd_phase3_label}_Data_Transfer"
+                                    )
+                                    or 0.0
+                                )
+                            ),
+                        },
+                        "time_per_pp_stage_seconds": (
+                            (get_val(plotting.comm_time_tp_attn_fwd_phase1_label) or 0.0)
+                            + (get_val(plotting.comm_time_tp_attn_fwd_phase3_label) or 0.0)
+                        ),
+                        "time_per_pp_stage": fmt_t(
+                            (get_val(plotting.comm_time_tp_attn_fwd_phase1_label) or 0.0)
+                            + (get_val(plotting.comm_time_tp_attn_fwd_phase3_label) or 0.0)
+                        ),
+                        "volume_bytes_per_pp_stage": fmt_b(
+                            (get_val(plotting.comm_vol_tp_attn_fwd_phase1_label) or 0)
+                            + (get_val(plotting.comm_vol_tp_attn_fwd_phase3_label) or 0)
+                        ),
+                    },
                 },
                 "tensor_parallel_moe": {
+                    "startup_phase_count_per_pp_stage": get_val("Startup_Phase_Count_TP_MoE_Fwd"),
+                    "timing_per_layer": comm_triplet_per_layer(plotting.comm_time_tp_moe_fwd_label),
+                    "timing_per_pp_stage": comm_triplet(plotting.comm_time_tp_moe_fwd_label),
                     "time_per_layer": fmt_t(
                         (get_val(plotting.comm_time_tp_moe_fwd_label) or 0.0) / num_layers_per_stage
                     ),
+                    "time_per_pp_stage_seconds": get_val(plotting.comm_time_tp_moe_fwd_label),
                     "time_per_pp_stage": fmt_t(get_val(plotting.comm_time_tp_moe_fwd_label)),
                     "volume_bytes_per_layer": fmt_b(
                         (get_val(plotting.comm_vol_tp_moe_fwd_label) or 0) / num_layers_per_stage
@@ -2218,10 +3983,15 @@ def structure_run_results(row, human_readable=False):
                     "volume_bytes_per_pp_stage": fmt_b(get_val(plotting.comm_vol_tp_moe_fwd_label)),
                 },
                 "data_parallel_attn": {
+                    "timing_per_layer": comm_triplet_per_layer(
+                        plotting.comm_time_dp_attn_fwd_label
+                    ),
+                    "timing_per_pp_stage": comm_triplet(plotting.comm_time_dp_attn_fwd_label),
                     "time_per_layer": fmt_t(
                         (get_val(plotting.comm_time_dp_attn_fwd_label) or 0.0)
                         / num_layers_per_stage
                     ),
+                    "time_per_pp_stage_seconds": get_val(plotting.comm_time_dp_attn_fwd_label),
                     "time_per_pp_stage": fmt_t(get_val(plotting.comm_time_dp_attn_fwd_label)),
                     "volume_bytes_per_layer": fmt_b(
                         (get_val(plotting.comm_vol_dp_attn_fwd_label) or 0) / num_layers_per_stage
@@ -2231,9 +4001,12 @@ def structure_run_results(row, human_readable=False):
                     ),
                 },
                 "data_parallel_moe": {
+                    "timing_per_layer": comm_triplet_per_layer(plotting.comm_time_dp_moe_fwd_label),
+                    "timing_per_pp_stage": comm_triplet(plotting.comm_time_dp_moe_fwd_label),
                     "time_per_layer": fmt_t(
                         (get_val(plotting.comm_time_dp_moe_fwd_label) or 0.0) / num_layers_per_stage
                     ),
+                    "time_per_pp_stage_seconds": get_val(plotting.comm_time_dp_moe_fwd_label),
                     "time_per_pp_stage": fmt_t(get_val(plotting.comm_time_dp_moe_fwd_label)),
                     "volume_bytes_per_layer": fmt_b(
                         (get_val(plotting.comm_vol_dp_moe_fwd_label) or 0) / num_layers_per_stage
@@ -2241,6 +4014,15 @@ def structure_run_results(row, human_readable=False):
                     "volume_bytes_per_pp_stage": fmt_b(get_val(plotting.comm_vol_dp_moe_fwd_label)),
                 },
                 "moe_all_to_all": {
+                    "to_experts_startup_phase_count_per_pp_stage": get_val(
+                        "Startup_Phase_Count_MoE_A2A_To_Fwd"
+                    ),
+                    "to_experts_timing_per_layer": comm_triplet_per_layer(
+                        plotting.moe_to_experts_time_label
+                    ),
+                    "to_experts_timing_per_pp_stage": comm_triplet(
+                        plotting.moe_to_experts_time_label
+                    ),
                     "to_experts_time_per_layer": fmt_t(
                         (get_val(plotting.moe_to_experts_time_label) or 0.0) / num_layers_per_stage
                     ),
@@ -2252,6 +4034,15 @@ def structure_run_results(row, human_readable=False):
                     ),
                     "to_experts_volume_bytes_per_pp_stage": fmt_b(
                         get_val(plotting.moe_to_experts_vol_label)
+                    ),
+                    "from_experts_startup_phase_count_per_pp_stage": get_val(
+                        "Startup_Phase_Count_MoE_A2A_From_Fwd"
+                    ),
+                    "from_experts_timing_per_layer": comm_triplet_per_layer(
+                        plotting.moe_from_experts_time_label
+                    ),
+                    "from_experts_timing_per_pp_stage": comm_triplet(
+                        plotting.moe_from_experts_time_label
                     ),
                     "from_experts_time_per_layer": fmt_t(
                         (get_val(plotting.moe_from_experts_time_label) or 0.0)
@@ -2270,12 +4061,30 @@ def structure_run_results(row, human_readable=False):
             },
             "backward": {
                 "total_time": fmt_t(get_val(plotting.comm_time_backward_pass_label)),
+                "total_time_seconds": get_val(plotting.comm_time_backward_pass_label),
+                "startup_latency": fmt_t(
+                    get_val(f"{plotting.comm_time_backward_pass_label}_Startup_Latency")
+                ),
+                "startup_latency_seconds": get_val(
+                    f"{plotting.comm_time_backward_pass_label}_Startup_Latency"
+                ),
+                "data_transfer_time": fmt_t(
+                    get_val(f"{plotting.comm_time_backward_pass_label}_Data_Transfer")
+                ),
+                "data_transfer_time_seconds": get_val(
+                    f"{plotting.comm_time_backward_pass_label}_Data_Transfer"
+                ),
                 "total_volume_bytes": fmt_b(get_val(plotting.comm_vol_backward_pass_label)),
                 "tensor_parallel_attn": {
+                    "timing_per_layer": comm_triplet_per_layer(
+                        plotting.comm_time_tp_attn_bwd_label
+                    ),
+                    "timing_per_pp_stage": comm_triplet(plotting.comm_time_tp_attn_bwd_label),
                     "time_per_layer": fmt_t(
                         (get_val(plotting.comm_time_tp_attn_bwd_label) or 0.0)
                         / num_layers_per_stage
                     ),
+                    "time_per_pp_stage_seconds": get_val(plotting.comm_time_tp_attn_bwd_label),
                     "time_per_pp_stage": fmt_t(get_val(plotting.comm_time_tp_attn_bwd_label)),
                     "volume_bytes_per_layer": fmt_b(
                         (get_val(plotting.comm_vol_tp_attn_bwd_label) or 0) / num_layers_per_stage
@@ -2285,9 +4094,12 @@ def structure_run_results(row, human_readable=False):
                     ),
                 },
                 "tensor_parallel_moe": {
+                    "timing_per_layer": comm_triplet_per_layer(plotting.comm_time_tp_moe_bwd_label),
+                    "timing_per_pp_stage": comm_triplet(plotting.comm_time_tp_moe_bwd_label),
                     "time_per_layer": fmt_t(
                         (get_val(plotting.comm_time_tp_moe_bwd_label) or 0.0) / num_layers_per_stage
                     ),
+                    "time_per_pp_stage_seconds": get_val(plotting.comm_time_tp_moe_bwd_label),
                     "time_per_pp_stage": fmt_t(get_val(plotting.comm_time_tp_moe_bwd_label)),
                     "volume_bytes_per_layer": fmt_b(
                         (get_val(plotting.comm_vol_tp_moe_bwd_label) or 0) / num_layers_per_stage
@@ -2295,10 +4107,15 @@ def structure_run_results(row, human_readable=False):
                     "volume_bytes_per_pp_stage": fmt_b(get_val(plotting.comm_vol_tp_moe_bwd_label)),
                 },
                 "data_parallel_attn": {
+                    "timing_per_layer": comm_triplet_per_layer(
+                        plotting.comm_time_dp_attn_bwd_label
+                    ),
+                    "timing_per_pp_stage": comm_triplet(plotting.comm_time_dp_attn_bwd_label),
                     "time_per_layer": fmt_t(
                         (get_val(plotting.comm_time_dp_attn_bwd_label) or 0.0)
                         / num_layers_per_stage
                     ),
+                    "time_per_pp_stage_seconds": get_val(plotting.comm_time_dp_attn_bwd_label),
                     "time_per_pp_stage": fmt_t(get_val(plotting.comm_time_dp_attn_bwd_label)),
                     "volume_bytes_per_layer": fmt_b(
                         (get_val(plotting.comm_vol_dp_attn_bwd_label) or 0) / num_layers_per_stage
@@ -2308,9 +4125,12 @@ def structure_run_results(row, human_readable=False):
                     ),
                 },
                 "data_parallel_moe": {
+                    "timing_per_layer": comm_triplet_per_layer(plotting.comm_time_dp_moe_bwd_label),
+                    "timing_per_pp_stage": comm_triplet(plotting.comm_time_dp_moe_bwd_label),
                     "time_per_layer": fmt_t(
                         (get_val(plotting.comm_time_dp_moe_bwd_label) or 0.0) / num_layers_per_stage
                     ),
+                    "time_per_pp_stage_seconds": get_val(plotting.comm_time_dp_moe_bwd_label),
                     "time_per_pp_stage": fmt_t(get_val(plotting.comm_time_dp_moe_bwd_label)),
                     "volume_bytes_per_layer": fmt_b(
                         (get_val(plotting.comm_vol_dp_moe_bwd_label) or 0) / num_layers_per_stage
@@ -2318,6 +4138,7 @@ def structure_run_results(row, human_readable=False):
                     "volume_bytes_per_pp_stage": fmt_b(get_val(plotting.comm_vol_dp_moe_bwd_label)),
                 },
                 "moe_all_to_all": {
+                    "timing_per_pp_stage": comm_triplet(plotting.moe_alltoall_bwd_time_label),
                     "time_per_pp_stage": fmt_t(get_val(plotting.moe_alltoall_bwd_time_label)),
                 },
             },

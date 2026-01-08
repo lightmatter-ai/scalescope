@@ -67,6 +67,20 @@ comm_time_dp_moe_fwd_label = "Comm_Time_DP_MoE_Fwd"
 comm_time_dp_attn_bwd_label = "Comm_Time_DP_Attn_Bwd"
 comm_time_dp_moe_bwd_label = "Comm_Time_DP_MoE_Bwd"
 
+# TP-attention forward phase breakdown (projection vs core attention)
+comm_time_tp_attn_fwd_phase1_label = "Comm_Time_TP_Attn_Fwd_Phase1"
+comm_time_tp_attn_fwd_phase2_label = "Comm_Time_TP_Attn_Fwd_Phase2"
+comm_time_tp_attn_fwd_phase3_label = "Comm_Time_TP_Attn_Fwd_Phase3"
+comm_vol_tp_attn_fwd_phase1_label = "Comm_Volume_TP_Attn_Fwd_Phase1"
+comm_vol_tp_attn_fwd_phase2_label = "Comm_Volume_TP_Attn_Fwd_Phase2"
+comm_vol_tp_attn_fwd_phase3_label = "Comm_Volume_TP_Attn_Fwd_Phase3"
+
+# Pipeline-parallel (PP) boundary transfers (activation / activation-grad) across stages.
+comm_vol_pp_fwd_label = "Comm_Volume_PP_Fwd"
+comm_vol_pp_bwd_label = "Comm_Volume_PP_Bwd"
+comm_time_pp_fwd_label = "Comm_Time_PP_Fwd"
+comm_time_pp_bwd_label = "Comm_Time_PP_Bwd"
+
 moe_to_experts_vol_label = "MoE_To_Experts_Volume"
 moe_from_experts_vol_label = "MoE_From_Experts_Volume"
 moe_to_experts_time_label = "MoE_To_Experts_Time"
@@ -81,6 +95,12 @@ time_to_train_sec_label = "Time_To_Train_Sec"
 time_to_train_day_label = "Time_To_Train_Day"
 tokens_per_second_label = "Tokens_Per_Sec"
 tokens_per_second_per_xpu_label = "Tokens_Per_Sec_Per_XPU"
+# Decode-only TPOT variants:
+# - System TPOT: wall-time per *system-level* output token (across the whole batch).
+# - User TPOT: wall-time per *user-visible* output token (per sequence). This is typically
+#   `TPOT_System_Sec * global_batch_size` and therefore depends on batch size.
+tpot_system_sec_label = "TPOT_System_Sec"
+tpot_user_sec_label = "TPOT_User_Sec"
 ttft_forward_sec_label = "TTFT_Forward_Sec"
 
 compute_time_label = "Compute_Time"

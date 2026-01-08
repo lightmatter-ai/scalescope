@@ -33,6 +33,33 @@ except ImportError:
 T_TransformerConfig = TypeVar("T_TransformerConfig", bound="TransformerConfig")
 
 
+def resolve_kv_heads_per_partition(*, num_kv_heads: int, tp_x: int) -> tuple[int, int]:
+    """Resolve per-rank KV heads and replication factor for head-sharded TP.
+
+    Semantics:
+    - If tp_x <= num_kv_heads: shard KV heads across TP ranks (requires divisibility).
+    - If tp_x > num_kv_heads: duplicate KV heads across TP ranks (requires tp_x % num_kv_heads == 0),
+      so each rank holds one KV head and replication factor is tp_x / num_kv_heads.
+    """
+    if tp_x <= 0:
+        raise ValueError(f"tp_x must be positive, got {tp_x}")
+    if num_kv_heads <= 0:
+        raise ValueError(f"num_kv_heads must be positive, got {num_kv_heads}")
+
+    if tp_x <= num_kv_heads:
+        if num_kv_heads % tp_x != 0:
+            raise ValueError(
+                f"num_kv_heads ({num_kv_heads}) must be divisible by TP-X size ({tp_x})"
+            )
+        return num_kv_heads // tp_x, 1
+
+    if tp_x % num_kv_heads != 0:
+        raise ValueError(
+            f"TP-X size ({tp_x}) must be divisible by num_kv_heads ({num_kv_heads}) for KV duplication"
+        )
+    return 1, tp_x // num_kv_heads
+
+
 class TransformerConfig(BaseModel):
     """Pydantic model for Transformer configuration."""
 
@@ -61,7 +88,7 @@ class TransformerConfig(BaseModel):
         default=0, ge=0, description="Number of experts selected per token (0=dense)"
     )
     num_shared_experts: int = Field(
-        default=1, ge=0, description="Number of shared experts per layer"
+        default=0, ge=0, description="Number of shared experts per layer"
     )
 
     # Validators
@@ -191,17 +218,19 @@ def attn_params_per_xpu(transformer_config: TransformerConfig, tp_topology) -> i
     num_kv_heads = transformer_config.num_kv_heads
     head_dim = d_model // num_heads
 
-    # Q, K, V, Out with GQA accounted for in K and V
-    q_weights = d_model * d_model
-    k_weights = d_model * (num_kv_heads * head_dim)
-    v_weights = d_model * (num_kv_heads * head_dim)
-    o_weights = d_model * d_model
-    attn_weights_total = q_weights + k_weights + v_weights + o_weights
-
     tp_size = tp_topology.num_chips
     if tp_size <= 0:
         raise ValueError("TP topology must have num_chips >= 1")
-    attn_weights_per_xpu = attn_weights_total / tp_size
+
+    # Q and output projection remain TP-sharded by total TP size in this 1D-oriented helper.
+    q_weights_per_xpu = (d_model * d_model) / tp_size
+    o_weights_per_xpu = (d_model * d_model) / tp_size
+    # K/V use GQA-aware head sharding with duplication fallback.
+    kv_heads_per_rank, _kv_rep = resolve_kv_heads_per_partition(
+        num_kv_heads=num_kv_heads, tp_x=tp_size
+    )
+    kv_weights_per_xpu = d_model * (kv_heads_per_rank * head_dim)
+    attn_weights_per_xpu = q_weights_per_xpu + 2 * kv_weights_per_xpu + o_weights_per_xpu
 
     # LayerNorm parameters are replicated
     layernorm_params = 2 * (2 * d_model)  # Two LNs per layer, each with gamma/beta of size d_model

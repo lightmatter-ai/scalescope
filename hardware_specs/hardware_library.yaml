@@ -50,6 +50,20 @@ components:
       bandwidth_nominal: 4032e9 # 2 * 36 * 112 * 1e9 / 2 = 4032e9 (approx 4 TB/s outgoing)
       latency_sec: 150e-9
       efficiency: 0.8
+    PASSAGE_INTERCONNECT_8TB_HALF:
+      name: "Passage_8TB/s_Interconnect_Half"
+      type: "Passage"
+      num_links: 1
+      bandwidth_nominal: 2016e9 # 4032e9 / 2
+      latency_sec: 150e-9
+      efficiency: 0.8
+    PASSAGE_INTERCONNECT_8TB_THIRD:
+      name: "Passage_8TB/s_Interconnect_Third"
+      type: "Passage"
+      num_links: 1
+      bandwidth_nominal: 1344e9 # 4032e9 / 3
+      latency_sec: 150e-9
+      efficiency: 0.8
 
     # Chip-Specific Interconnects
     H100_INTERCONNECT:
@@ -119,4 +133,8 @@ nodes:
       remote_memory: "ALTERNATIVE_MEMORY_REMOTE"
     device_interconnects:
       "fast_fabric": "PASSAGE_INTERCONNECT_8TB"
+      "fast_fabric_x": "PASSAGE_INTERCONNECT_8TB_HALF"
+      "fast_fabric_y": "PASSAGE_INTERCONNECT_8TB_HALF"
+      "fast_fabric_y0": "PASSAGE_INTERCONNECT_8TB_THIRD"
+      "fast_fabric_y1": "PASSAGE_INTERCONNECT_8TB_THIRD"
       "cluster_fabric": "DP_INTERCONNECT_INFINIBAND"
