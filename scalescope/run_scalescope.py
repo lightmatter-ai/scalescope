@@ -1272,11 +1272,24 @@ def get_model_stats(
     # pipeline parallelism bubble
     if pass_mode == PassMode.TRAINING:
         pp_strategy = get_pp_strategy(workload_spec.pp_spec.variant)
+        effective_micro_batch_size = batch_sizes.effective_micro_batch_size
+        if effective_micro_batch_size <= 0:
+            raise ValueError(
+                f"effective_micro_batch_size must be > 0, got {effective_micro_batch_size}"
+            )
+        if batch_size_per_dp % effective_micro_batch_size != 0:
+            raise ValueError(
+                "batch_size_per_dp must be divisible by effective_micro_batch_size for GPipe. "
+                f"Got batch_size_per_dp={batch_size_per_dp}, "
+                f"effective_micro_batch_size={effective_micro_batch_size}."
+            )
+        num_microbatches = batch_size_per_dp // effective_micro_batch_size
 
-        # In a simple bubble model, the overhead is a function of the non-overlapped
-        # time of a single stage. Here, we approximate it with the total batch time.
-        # A more detailed model would compute this based on the critical path of one stage.
-        bubble_kwargs = {"num_stages": pp_stages, "batch_time": batch_time_to_train_sec}
+        bubble_kwargs = {
+            "num_stages": pp_stages,
+            "num_microbatches": num_microbatches,
+            "batch_time": batch_time_to_train_sec,
+        }
         pp_overhead_stats = pp_strategy.backward_comm(**bubble_kwargs)
         batch_time_pp_overhead = pp_overhead_stats.total_comm_time
     else:
