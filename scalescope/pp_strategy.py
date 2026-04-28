@@ -33,15 +33,22 @@ class GPipePipelineStrategy(PipelineParallelStrategy):
 
     def backward_comm(self, **kwargs) -> CommStats:
         num_stages = kwargs["num_stages"]
+        num_microbatches = kwargs["num_microbatches"]
         batch_time = kwargs["batch_time"]
+
+        if num_microbatches <= 0:
+            raise ValueError("num_microbatches must be > 0")
 
         if num_stages <= 1:
             return CommStats(0, 0, 0, 0)
 
-        # The bubble overhead is the time for (num_stages - 1) stages to complete
-        # their forward and backward passes. In this simple model, we approximate
-        # this as a fraction of the total non-overlapped batch time.
-        bubble_time = (num_stages - 1) / num_stages * batch_time
+        # Basic GPipe fill-drain bubble:
+        #   bubble = (p - 1) * t_micro_stage
+        # with batch_time interpreted as stage time over all microbatches:
+        #   batch_time = m * t_micro_stage
+        # so:
+        #   bubble = ((p - 1) / m) * batch_time
+        bubble_time = (num_stages - 1) / num_microbatches * batch_time
 
         # The bubble is a time overhead, not a volume of data transferred.
         # We model it as a communication stat for consistency.
