@@ -212,7 +212,7 @@ class LogicalTopology(BaseModel):
     def get_hockney_model_params(
         self,
         tag_in_view: Union[LogicalDimensionTag, str],
-        float_size_bytes: int,
+        float_size_bytes: float,
         context: str = "concurrent_baseline",
     ) -> Tuple[int, float, float, float]:
         mapping = self.get_mapping_for_tag(tag_in_view)

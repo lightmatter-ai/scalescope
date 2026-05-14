@@ -2,6 +2,7 @@ d_model: 12288
 n_layers: 120
 num_heads: 128
 mlp_ratio: 2.0
+mlp_kind: dense_2matrix
 max_sequence_length: 131072
 vocab_size: 50432
 num_regular_experts: 64

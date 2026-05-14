@@ -317,12 +317,7 @@ def calculate_ffn_moe_weights_memory_footprint(
     dp_variant: str,
     float_size: int,
 ) -> int:
-    d_model = transformer_config.d_model
-    d_ff = transformer_config.mlp_hidden_size
-
-    ffn1_weights = d_model * d_ff
-    ffn2_weights = d_ff * d_model
-    total_ffn_weights = ffn1_weights + ffn2_weights
+    total_ffn_weights = transformer_config.expert_params_per_expert
 
     # Account for colocated experts per XPU
     num_colocated = int(getattr(moe_config, "num_colocated_experts", 1) or 1)
@@ -375,12 +370,7 @@ def calculate_ffn_moe_optimizer_states_memory_footprint(
     dp_variant: str,
     float_size: int,
 ) -> int:
-    d_model = transformer_config.d_model
-    d_ff = transformer_config.mlp_hidden_size
-
-    ffn1_weights = d_model * d_ff
-    ffn2_weights = d_ff * d_model
-    total_ffn_weights = ffn1_weights + ffn2_weights
+    total_ffn_weights = transformer_config.expert_params_per_expert
 
     # Weights are always sharded by Tensor Parallelism and scaled by colocated experts
     num_colocated = int(getattr(moe_config, "num_colocated_experts", 1) or 1)
@@ -993,7 +983,6 @@ def _forward_pass_prefill_moe_ffn_tp_1d_memory_traffic(
     """
     d_model = transformer_config.d_model
     mlp_ratio = transformer_config.mlp_ratio
-    d_ff = d_model * mlp_ratio
 
     # Infer sizes from workload spec
     batch_size_per_dp = workload_spec.get_resolved_batches().batch_size_per_dp
@@ -1002,9 +991,10 @@ def _forward_pass_prefill_moe_ffn_tp_1d_memory_traffic(
     # Weights read
     # Colocated experts share the same XPU; scale weights read by the number of colocated experts hosted.
     num_colocated = moe_config.num_colocated_experts
-    ffn1_weight_size = num_colocated * (d_model * d_ff * float_size) / moe_tp_size
-    ffn2_weight_size = num_colocated * (d_ff * d_model * float_size) / moe_tp_size
-    traffic.weights.bytes_read += ffn1_weight_size + ffn2_weight_size
+    total_w_bytes = (
+        num_colocated * transformer_config.expert_params_per_expert * float_size / moe_tp_size
+    )
+    traffic.weights.bytes_read += total_w_bytes
 
     # Activations
     # The input to the MoE block (from the attention block's residual stream) is read.
@@ -1412,13 +1402,13 @@ def _forward_pass_prefill_moe_ffn_tp_2d_memory_traffic(
     # by (X * YZ), so per-XPU weight volume scales as num_colocated_experts / (X * YZ).
     # This keeps parity with the TP-1D path and avoids undercounting when colocation increases.
     num_colocated = int(getattr(moe_config, "num_colocated_experts", 1) or 1)
-    ffn1_weight_size = (
-        num_colocated * (d_model * d_ff * float_size) // (moe_tp_size_x * moe_tp_size_yz)
+    total_w_bytes = (
+        num_colocated
+        * transformer_config.expert_params_per_expert
+        * float_size
+        // (moe_tp_size_x * moe_tp_size_yz)
     )
-    ffn2_weight_size = (
-        num_colocated * (d_ff * d_model * float_size) // (moe_tp_size_x * moe_tp_size_yz)
-    )
-    traffic.weights.bytes_read += ffn1_weight_size + ffn2_weight_size
+    traffic.weights.bytes_read += total_w_bytes
 
     step_seq = n_seq
 
@@ -1777,7 +1767,6 @@ def _backward_moe_tp_1d_memory_traffic(
     traffic = LayerMemoryTraffic(name=name, device_for=device_for, node=node)
     d_model = transformer_config.d_model
     mlp_ratio = transformer_config.mlp_ratio
-    d_ff = d_model * mlp_ratio
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     n_seq = workload_spec.seq_length
     float_size = workload_spec.float_size_bytes
@@ -1788,10 +1777,7 @@ def _backward_moe_tp_1d_memory_traffic(
     moe_tp_size = moe_tp_topology.num_chips if moe_tp_topology else 1
 
     num_colocated = moe_config.num_colocated_experts
-    ffn1_weight_size = num_colocated * (d_model * d_ff * float_size) / moe_tp_size
-    ffn2_weight_size = num_colocated * (d_ff * d_model * float_size) / moe_tp_size
-
-    total_w = ffn1_weight_size + ffn2_weight_size
+    total_w = num_colocated * transformer_config.expert_params_per_expert * float_size / moe_tp_size
     traffic.weights.bytes_read += total_w
     traffic.gradients.bytes_written += total_w
     if not activation_checkpointing:
@@ -1845,10 +1831,12 @@ def _backward_moe_tp_2d_memory_traffic(
     if getattr(moe_config, "num_shared_experts_per_dp_rank", 0) > 0:
         raise NotImplementedError("Shared experts are not supported in 2D TP MoE backward traffic")
 
-    # Weights sharded across 2D TP (FFN only here)
-    ffn1_w = (d_model * mlp_ratio * d_model * float_size) // (moe_tp_size_x * moe_tp_size_yz)
-    ffn2_w = (mlp_ratio * d_model * d_model * float_size) // (moe_tp_size_x * moe_tp_size_yz)
-    total_w = ffn1_w + ffn2_w
+    # Weights sharded across 2D TP (FFN only here).
+    # Per-expert FFN weight bytes scale with mlp_num_weight_matrices (2 for
+    # DENSE_2MATRIX, 3 for GATED_3MATRIX), routed via expert_params_per_expert.
+    total_w = (transformer_config.expert_params_per_expert * float_size) // (
+        moe_tp_size_x * moe_tp_size_yz
+    )
     traffic.weights.bytes_read += total_w
     traffic.gradients.bytes_written += total_w
 
@@ -2550,8 +2538,8 @@ def _parameter_update_attention_memory_traffic(
             params_per_xpu /= attn_dp_size
 
     # Use full precision for weights (TrainSpec), compute precision for gradients
-    weights_fs = int(workload_spec.full_precision_param_float_size)
-    grads_fs = int(workload_spec.float_size_bytes)
+    weights_fs = workload_spec.full_precision_param_float_size
+    grads_fs = workload_spec.float_size_bytes
     weights_bytes = params_per_xpu * weights_fs
     grads_bytes = params_per_xpu * grads_fs
 
@@ -2564,7 +2552,7 @@ def _parameter_update_attention_memory_traffic(
         raise ValueError(
             f"Unsupported optimizer for parameter update traffic: {workload_spec.optimizer}. Only 'adam' is supported."
         )
-    opt_states_fs = int(workload_spec.full_precision_param_float_size)
+    opt_states_fs = workload_spec.full_precision_param_float_size
     opt_states_read = 2 * params_per_xpu * opt_states_fs
     opt_states_write = 2 * params_per_xpu * opt_states_fs
     traffic.weights.bytes_read += int(opt_states_read)
@@ -2604,8 +2592,8 @@ def _parameter_update_moe_memory_traffic(
             params_per_xpu /= moe_dp_size
 
     # Use full precision for weights (TrainSpec), compute precision for gradients
-    weights_fs = int(workload_spec.full_precision_param_float_size)
-    grads_fs = int(workload_spec.float_size_bytes)
+    weights_fs = workload_spec.full_precision_param_float_size
+    grads_fs = workload_spec.float_size_bytes
     weights_bytes = params_per_xpu * weights_fs
     grads_bytes = params_per_xpu * grads_fs
 
@@ -2618,7 +2606,7 @@ def _parameter_update_moe_memory_traffic(
         raise ValueError(
             f"Unsupported optimizer for parameter update traffic: {workload_spec.optimizer}. Only 'adam' is supported."
         )
-    opt_states_fs = int(workload_spec.full_precision_param_float_size)
+    opt_states_fs = workload_spec.full_precision_param_float_size
     opt_states_read = 2 * params_per_xpu * opt_states_fs
     opt_states_write = 2 * params_per_xpu * opt_states_fs
     traffic.weights.bytes_read += int(opt_states_read)

@@ -184,9 +184,14 @@ def _calculate_prefill_moe_compute(
         traffic_mult = moe_config.regular_expert_traffic_multiplier
         tokens_per_routed_expert = tokens_per_set / num_routed_experts
         effective_tokens = tokens_per_routed_expert * traffic_mult
-        per_expert_ffn_flops = matmul_flops(
-            effective_tokens, d_model, d_model, d_ff
-        ) + matmul_flops(effective_tokens, d_ff, d_ff, d_model)
+        n_up = transformer_config.mlp_num_up_projections
+        n_down = transformer_config.mlp_num_down_projections
+        n_elem = transformer_config.mlp_num_elementwise_passes
+        per_expert_ffn_flops = (
+            n_up * matmul_flops(effective_tokens, d_model, d_model, d_ff)
+            + n_down * matmul_flops(effective_tokens, d_ff, d_ff, d_model)
+            + n_elem * effective_tokens * d_ff
+        )
         # Multiply by colocated experts per chip
         per_expert_ffn_flops *= moe_config.num_colocated_experts
 
@@ -604,10 +609,14 @@ def _calculate_backward_moe_compute(
     # Expert gradients (normalized by TP_MoE chips)
     traffic_mult = moe_config.regular_expert_traffic_multiplier
     routed_tokens_per_expert = tokens_per_set / num_routed_experts * traffic_mult
-    ffn2_flops = _calculate_backward_linear_layer_flops(routed_tokens_per_expert, d_ff, d_model)
-    activation_grad_flops = routed_tokens_per_expert * d_ff
-    ffn1_flops = _calculate_backward_linear_layer_flops(routed_tokens_per_expert, d_model, d_ff)
-    expert_grad_total_flops = ffn2_flops + activation_grad_flops + ffn1_flops
+    n_up = transformer_config.mlp_num_up_projections
+    n_down = transformer_config.mlp_num_down_projections
+    n_elem = transformer_config.mlp_num_elementwise_passes
+    expert_grad_total_flops = (
+        n_up * _calculate_backward_linear_layer_flops(routed_tokens_per_expert, d_model, d_ff)
+        + n_down * _calculate_backward_linear_layer_flops(routed_tokens_per_expert, d_ff, d_model)
+        + n_elem * routed_tokens_per_expert * d_ff
+    )
     # Scale per-chip expert grads by number of colocated experts on an XPU
     expert_grad_total_flops *= moe_config.num_colocated_experts
     moe_tp_size = moe_tp_topology.num_chips if moe_tp_topology is not None else 1

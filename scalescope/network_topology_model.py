@@ -304,7 +304,7 @@ def aux_fully_connected_gather_nd(
 
 
 def hockney_model_reduce_on_nd_topology(
-    view: LogicalTopology, P_total_bytes: float, float_size_bytes: int
+    view: LogicalTopology, P_total_bytes: float, float_size_bytes: float
 ) -> CommStats:
     """Calculates Reduce (to a single root) time on an N-D topology.
 
@@ -332,7 +332,7 @@ def hockney_model_reduce_on_nd_topology(
 
 
 def hockney_model_reduce_scatter_on_nd_topology(
-    view: LogicalTopology, P_total_bytes_before_rs: float, float_size_bytes: int
+    view: LogicalTopology, P_total_bytes_before_rs: float, float_size_bytes: float
 ) -> CommStats:
     """
     Calculates ReduceScatter time on an N-D topology by modeling all possible
@@ -402,7 +402,7 @@ def hockney_model_reduce_scatter_on_nd_topology(
 
 
 def hockney_model_all_gather_on_nd_topology(
-    view: LogicalTopology, P_total_bytes_after_ag: float, float_size_bytes: int
+    view: LogicalTopology, P_total_bytes_after_ag: float, float_size_bytes: float
 ) -> CommStats:
     """
     Calculates AllGather time on an N-D topology by modeling all possible
@@ -479,7 +479,7 @@ def hockney_model_all_gather_on_nd_topology(
 
 
 def hockney_model_gather_on_nd_topology(
-    view: LogicalTopology, P_total_bytes_after_gather: float, float_size_bytes: int
+    view: LogicalTopology, P_total_bytes_after_gather: float, float_size_bytes: float
 ) -> CommStats:
     """Calculates Gather (to a single root) time on an N-D topology.
 
@@ -558,7 +558,7 @@ def hockney_model_gather_on_nd_topology(
 
 
 def hockney_model_all_reduce_on_nd_topology(
-    view: LogicalTopology, P_total_bytes: float, float_size_bytes: int
+    view: LogicalTopology, P_total_bytes: float, float_size_bytes: float
 ) -> CommStats:
     """
     Calculates All-Reduce time by composing the full, pipeline-aware Reduce-Scatter
@@ -622,7 +622,7 @@ def aux_fully_connected_total_exchange_nd(
 
 
 def hockney_model_total_exchange_on_nd_topology(
-    view: LogicalTopology, P_total_send_bytes_per_node: float, float_size_bytes: int
+    view: LogicalTopology, P_total_send_bytes_per_node: float, float_size_bytes: float
 ) -> CommStats:
     """
     Calculate time for total exchange (All-to-All) by modeling all possible
@@ -723,7 +723,7 @@ def hockney_model_total_exchange_on_nd_topology(
 
 
 def hockney_model_send_recv_on_nd_topology(
-    topology: LogicalTopology, bytes_per_sender: float, float_size_bytes: int
+    topology: LogicalTopology, bytes_per_sender: float, float_size_bytes: float
 ) -> CommStats:
     """Estimate a simple point-to-point send/recv on a (typically 1D) topology view.
 

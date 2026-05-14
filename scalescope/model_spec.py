@@ -7,6 +7,7 @@ and parallelization policy, which are defined in other specs.
 """
 
 import os
+from enum import Enum
 from typing import Optional, Type, TypeVar
 
 import yaml
@@ -21,6 +22,28 @@ from pydantic import (
     PositiveInt,
     ValidationError,
 )
+
+
+class MlpKind(str, Enum):
+    """MLP block topology.
+
+    Applied uniformly to dense FFN (when ``num_regular_experts == 0``) and
+    to every expert in an MoE configuration.
+
+    Variants:
+        DENSE_2MATRIX:
+            Classic FFN — ``y = down(act(up(x)))``. Two weight matrices:
+            ``W_up: [d_model, d_ff]`` and ``W_down: [d_ff, d_model]``.
+
+        GATED_3MATRIX:
+            SwiGLU/GeGLU — ``y = down(silu(gate(x)) ⊙ up(x))``. Three
+            weight matrices: ``W_gate: [d_model, d_ff]``,
+            ``W_up: [d_model, d_ff]``, ``W_down: [d_ff, d_model]``.
+    """
+
+    DENSE_2MATRIX = "dense_2matrix"
+    GATED_3MATRIX = "gated_3matrix"
+
 
 try:
     from typing import Self
@@ -77,6 +100,13 @@ class TransformerConfig(BaseModel):
         description="Number of key/value heads for Grouped Query Attention. If None, defaults to num_heads.",
     )
     mlp_ratio: float = Field(..., gt=0, description="Ratio of mlp hidden dim to embedding dim")
+    mlp_kind: MlpKind = Field(
+        ...,
+        description=(
+            "MLP topology applied to dense FFN and every MoE expert. "
+            "Required: every model spec must declare this explicitly."
+        ),
+    )
     max_sequence_length: PositiveInt = Field(..., description="Maximum sequence length")
     vocab_size: PositiveInt = Field(..., description="Vocabulary size")
 
@@ -143,8 +173,63 @@ class TransformerConfig(BaseModel):
 
     @computed_field(repr=False)
     @property
+    def mlp_num_up_projections(self) -> int:
+        """Number of ``[d_model, d_ff]`` matrices in one MLP block.
+
+        DENSE_2MATRIX has 1 (the up-projection ``W_up``).
+        GATED_3MATRIX has 2 (the gate ``W_gate`` and the up ``W_up``,
+        which have identical shape and are run in parallel before the
+        element-wise gate-multiply).
+        """
+        if self.mlp_kind is MlpKind.DENSE_2MATRIX:
+            return 1
+        if self.mlp_kind is MlpKind.GATED_3MATRIX:
+            return 2
+        raise ValueError(f"Unhandled MlpKind: {self.mlp_kind!r}")
+
+    @computed_field(repr=False)
+    @property
+    def mlp_num_down_projections(self) -> int:
+        """Number of ``[d_ff, d_model]`` matrices in one MLP block."""
+        if self.mlp_kind is MlpKind.DENSE_2MATRIX:
+            return 1
+        if self.mlp_kind is MlpKind.GATED_3MATRIX:
+            return 1
+        raise ValueError(f"Unhandled MlpKind: {self.mlp_kind!r}")
+
+    @computed_field(repr=False)
+    @property
+    def mlp_num_elementwise_passes(self) -> int:
+        """Number of elementwise passes over a ``[tokens, d_ff]`` tensor
+        in one MLP block.
+
+        DENSE_2MATRIX has 1: the activation function (silu / gelu /
+        relu) applied once between up and down.
+        GATED_3MATRIX has 2: the silu on the gate output, plus the
+        element-wise multiply ``silu(gate) ⊙ up`` that fuses gate with
+        up before the down-projection.
+
+        Used symmetrically on forward and backward FFN compute (one
+        gradient-pass per forward elementwise op). The cost is small
+        relative to the matmuls but is modelled explicitly on both
+        sides — no asymmetric backward-only term.
+        """
+        if self.mlp_kind is MlpKind.DENSE_2MATRIX:
+            return 1
+        if self.mlp_kind is MlpKind.GATED_3MATRIX:
+            return 2
+        raise ValueError(f"Unhandled MlpKind: {self.mlp_kind!r}")
+
+    @computed_field(repr=False)
+    @property
+    def mlp_num_weight_matrices(self) -> int:
+        """Total weight-matrix count = up + down."""
+        return self.mlp_num_up_projections + self.mlp_num_down_projections
+
+    @computed_field(repr=False)
+    @property
     def expert_params_per_expert(self) -> int:
-        return 2 * self.d_model * self.mlp_hidden_size
+        return self.mlp_num_weight_matrices * self.d_model * self.mlp_hidden_size
 
     @computed_field(repr=False)
     @property
@@ -179,6 +264,7 @@ class TransformerConfig(BaseModel):
             f" n_layers={self.n_layers},"
             f" n_heads={self.num_heads}{gqa_str},"
             f" mlp_ratio={self.mlp_ratio:.2f},"
+            f" mlp_kind={self.mlp_kind.value},"
             f" seq_len={self.max_sequence_length},"
             f" vocab={self.vocab_size}{moe_str})"
         )
@@ -243,8 +329,6 @@ def expert_params_per_xpu(transformer_config: TransformerConfig, placement) -> i
     - total_distinct_experts_per_set: number of distinct experts in a complete expert set
     - full_expert_set_xpu_count: XPUs required to host one complete expert set
     """
-    d_model = transformer_config.d_model
-    d_ff = transformer_config.mlp_hidden_size
-    params_per_expert = d_model * d_ff + d_ff * d_model  # FFN1 + FFN2
+    params_per_expert = transformer_config.expert_params_per_expert
     total_params_in_set = params_per_expert * placement.total_distinct_experts_per_set
     return int(total_params_in_set / placement.full_expert_set_xpu_count)

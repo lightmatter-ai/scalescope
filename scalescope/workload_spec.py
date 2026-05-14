@@ -197,8 +197,10 @@ class WorkloadSpec(BaseModel):
     pp_spec: PipelineParallelSpec = Field(default_factory=PipelineParallelSpec)
     # Required: global batch size per training/inference step for the whole cluster
     global_batch_size: int = Field(..., gt=0)
-    # Floating-point size in bytes (e.g., 2 for BF16/FP16, 4 for FP32)
-    float_size_bytes: int = Field(..., ge=1)
+    # Floating-point size in bytes (e.g., 0.5 for FP4, 1 for FP8,
+    # 2 for BF16/FP16, 4 for FP32). Float-typed to allow sub-byte
+    # precisions; constrained to be strictly positive.
+    float_size_bytes: float = Field(..., gt=0)
     # Memory device mappings (required):
     # - traffic components (LayerMemoryTraffic)
     memory_device_map_traffic: Dict[str, str] = Field(

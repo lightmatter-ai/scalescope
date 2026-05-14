@@ -2168,7 +2168,6 @@ def get_model_stats(
         # Additional FFN/MoE backward per-layer breakdown
         d_model = model_spec.d_model
         mlp_ratio = model_spec.mlp_ratio
-        d_ff = d_model * mlp_ratio
         n_batch_dp = batch_size_per_dp
         n_seq_val = seq_length
         float_size = workload_spec.float_size_bytes
@@ -2197,9 +2196,9 @@ def get_model_stats(
         ffn_bwd_reads_ff1_out_sharded = num_colocated * ff1_out_sharded_per_expert
         ffn_bwd_reads_expert_input = num_colocated * token_vol_per_expert
         # Weight reads per layer (both FFN matrices), sharded by TP and scaled by colocated experts
-        ffn1_weight_size = num_colocated * (d_model * d_ff * float_size) / moe_tp_size_val
-        ffn2_weight_size = num_colocated * (d_ff * d_model * float_size) / moe_tp_size_val
-        ffn_bwd_reads_weights = ffn1_weight_size + ffn2_weight_size
+        ffn_bwd_reads_weights = (
+            num_colocated * model_spec.expert_params_per_expert * float_size / moe_tp_size_val
+        )
         # Gradient writes per layer
         ffn_bwd_grad_writes_expert_input = num_colocated * token_vol_per_expert
         ffn_bwd_grad_writes_ff1_out_sharded = num_colocated * ff1_out_sharded_per_expert
@@ -2441,6 +2440,7 @@ def get_model_stats(
         plotting.optimizer_label: getattr(workload_spec, "optimizer", "N/A"),
         plotting.float_size_label: workload_spec.float_size_bytes,
         plotting.mlp_ratio_label: model_spec.mlp_ratio,
+        plotting.mlp_kind_label: model_spec.mlp_kind.value,
         plotting.topology_dims_label: attn_tp_topology_view.shape,
         # Backward-compatible single label; encode attn/moe variants explicitly.
         plotting.tensor_parallel_variant_label: f"{attn_tp_variant.name}|{moe_tp_variant.name}",
@@ -3162,6 +3162,7 @@ def structure_run_results(row, human_readable=False):
             "regular_expert_count": get_val(plotting.regular_expert_count_label),
             "selected_experts": get_val(plotting.num_selected_experts_label),
             "mlp_ratio": get_val(plotting.mlp_ratio_label),
+            "mlp_kind": get_val(plotting.mlp_kind_label),
         },
         "expert_placement": {
             "shared_experts_per_dp_rank": get_val(plotting.shared_experts_per_dp_rank_label),

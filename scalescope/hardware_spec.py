@@ -26,6 +26,9 @@ class Compute(BaseModel):
     """Defines the computational capabilities of a device."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
+    fp4_nominal: Optional[float] = Field(
+        default=None, description="Nominal FP4 performance (FLOPS) — Blackwell-class only", gt=0
+    )
     fp8_nominal: Optional[float] = Field(
         default=None, description="Nominal FP8 performance (FLOPS)", gt=0
     )
@@ -36,6 +39,12 @@ class Compute(BaseModel):
         default=None, description="Nominal FP32 performance (FLOPS)", gt=0
     )
     efficiency: float = Field(..., description="Operational efficiency (0.0 to 1.0)", gt=0, le=1.0)
+
+    @computed_field(repr=False)
+    @property
+    def fp4(self) -> Optional[float]:
+        """Effective FP4 performance (FLOPS)"""
+        return self.fp4_nominal * self.efficiency if self.fp4_nominal else None
 
     @computed_field(repr=False)
     @property
@@ -162,13 +171,16 @@ class NetworkNode(BaseModel):
                 f"Interconnect '{name}' not found on node type '{self.node_name}'. Available: {list(self.device_interconnects.keys())}"
             )
 
-    def get_time_per_flop(self, dtype_size: int) -> Optional[float]:
+    def get_time_per_flop(self, dtype_size: float) -> Optional[float]:
         """
         Calculates compute time per byte based on FLOPs (example calculation).
-        Result is in seconds per Byte.
+        Result is in seconds per Byte. `dtype_size` is the per-element size
+        in bytes (0.5 for FP4, 1 for FP8, 2 for BF16/FP16, 4 for FP32).
         """
         compute_flops: Optional[float] = None  # Effective FLOPS
         match dtype_size:
+            case 0.5:
+                compute_flops = self.device_compute.fp4
             case 1:
                 compute_flops = self.device_compute.fp8
             case 2:

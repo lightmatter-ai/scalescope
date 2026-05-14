@@ -105,7 +105,7 @@ def resolve_tp2d_split(
 
 
 def _tp2d_attn_comm_phase1_input_proj(
-    *, tp_topology: LogicalTopology, volume_bytes: float, tp_x: int, float_size_bytes: int
+    *, tp_topology: LogicalTopology, volume_bytes: float, tp_x: int, float_size_bytes: float
 ) -> CommStats:
     """Phase 1: input projection comm proxy (keep formula unchanged)."""
     return hockney_model_all_reduce_on_nd_topology(
@@ -120,7 +120,7 @@ def _tp2d_attn_comm_phase3_output_proj(
     volume_bytes: float,
     tp_x: int,
     tp_yz: int,
-    float_size_bytes: int,
+    float_size_bytes: float,
     layout_trace=NULL_LAYOUT_TRACE,
 ) -> CommStats:
     """Phase 3: output projection comm for 2D TP (matches explicit algorithm).
@@ -179,7 +179,7 @@ def _tp2d_attn_comm_phase2_decode_yz_reductions(
     transformer_config: TransformerConfig,
     workload_spec,
     tp_x: int,
-    float_size_bytes: int,
+    float_size_bytes: float,
     layout_trace=NULL_LAYOUT_TRACE,
 ) -> CommStats:
     """Phase 2 (decode only): online-softmax YZ collectives for sequence/KV sharding.
@@ -231,7 +231,7 @@ def _tp2d_attn_comm_phase2_prefill_ring_kv_exchange(
     workload_spec,
     n_seq: int,
     tp_x: int,
-    float_size_bytes: int,
+    float_size_bytes: float,
 ) -> CommStats:
     """Phase 2 (prefill): approximate RingAttention KV circulation on the YZ axis.
 
@@ -289,7 +289,7 @@ def _tp2d_attn_comm_phase1_qkv_proj_decode(
     workload_spec,
     tp_x: int,
     tp_yz: int,
-    float_size_bytes: int,
+    float_size_bytes: float,
     layout_trace=NULL_LAYOUT_TRACE,
 ) -> CommStats:
     """Phase 1 (decode): QKV projection comm for 2D TP with YZ sharding of E.
@@ -1810,7 +1810,10 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             # an extra setup collective, while routed exchange bytes are handled by EP A2A.
             tokens_processed = routed_tokens_per_chip
 
-            up_out_bytes = float_size * tokens_processed * (d_ff / tp_x)
+            # Fused gate||up (one packed AR on [tokens, n_up * d_ff]):
+            # one collective, payload scales by mlp_num_up_projections.
+            n_up = transformer_config.mlp_num_up_projections
+            up_out_bytes = n_up * float_size * tokens_processed * (d_ff / tp_x)
             comm_tp_up_reduce = hockney_model_all_reduce_on_nd_topology(
                 yz_topology, up_out_bytes, float_size_bytes=float_size
             )
