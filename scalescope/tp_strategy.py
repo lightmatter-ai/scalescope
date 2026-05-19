@@ -117,7 +117,8 @@ def _tp2d_attn_comm_phase3_output_proj(
     *,
     x_topology: LogicalTopology,
     yz_topology: LogicalTopology,
-    volume_bytes: float,
+    input_volume_bytes: float,
+    output_volume_bytes: float,
     tp_x: int,
     tp_yz: int,
     float_size_bytes: float,
@@ -126,21 +127,31 @@ def _tp2d_attn_comm_phase3_output_proj(
     """Phase 3: output projection comm for 2D TP (matches explicit algorithm).
 
     Assumed 2D sharding:
-    - Input activation arrives from attention as [B, n_seq, E/(tp_x*tp_yz)] per GPU
-      (equivalently [B, Hq/tp_x, n_seq, d_h/tp_yz]).
+    - Input activation arrives from attention as [B, n_seq, E_in/(tp_x*tp_yz)] per GPU
+      where E_in = num_heads * head_dim = q_proj_out_dim — the attention-output
+      dim, distinct from d_model under "wide-Q" attention layouts (e.g.
+      MiniMax-M2.5, gpt_oss_120b, qwen3 series).
 
     Procedure modeled:
-    1) All-gather along YZ to reconstruct `d_h` (equivalently the full E/tp_x slice).
-    2) Local matmul with W_O shard (modeled in compute/memory, not here).
-    3) Reduce-scatter along X to sum across head shards and keep output sharded as E/(tp_x*tp_yz).
+    1) All-gather along YZ to reconstruct `d_h` (equivalently the full E_in/tp_x slice).
+       Payload volume scales with E_in = q_proj_out_dim.
+    2) Local matmul with W_O shard maps E_in → d_model (modeled in compute/memory, not here).
+    3) Reduce-scatter along X to sum across head shards and keep output sharded as
+       d_model/(tp_x*tp_yz). Payload volume scales with d_model (the matmul output).
+
+    Caller must supply both `input_volume_bytes` (= B·n_seq·q_proj_out_dim·float_size)
+    and `output_volume_bytes` (= B·n_seq·d_model·float_size) explicitly so the
+    two distinct collectives are priced on their actual payloads. The two are
+    equal whenever num_heads · head_dim == d_model (i.e. non-wide-Q), so this
+    collapses to the legacy single-volume pricing in the MHA / non-wide-Q case.
     """
     if x_topology.num_chips <= 1 and yz_topology.num_chips <= 1:
         return CommStats()
 
     comm = CommStats()
 
-    # Step 1: all-gather along YZ.
-    yz_after_ag_bytes = volume_bytes / tp_x
+    # Step 1: all-gather along YZ — payload volume is the attention-output activation (q_proj_out_dim).
+    yz_after_ag_bytes = input_volume_bytes / tp_x
     ag_yz_stats = hockney_model_all_gather_on_nd_topology(
         yz_topology, yz_after_ag_bytes, float_size_bytes=float_size_bytes
     )
@@ -155,8 +166,8 @@ def _tp2d_attn_comm_phase3_output_proj(
         note="output proj: gather d_h along YZ",
     )
 
-    # Step 3: reduce-scatter along X.
-    x_before_rs_bytes = volume_bytes / tp_yz
+    # Step 3: reduce-scatter along X — payload volume is the post-output-proj activation (d_model).
+    x_before_rs_bytes = output_volume_bytes / tp_yz
     rs_x_stats = hockney_model_reduce_scatter_on_nd_topology(
         x_topology, x_before_rs_bytes, float_size_bytes=float_size_bytes
     )
@@ -201,10 +212,9 @@ def _tp2d_attn_comm_phase2_decode_yz_reductions(
         return CommStats()
 
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
-    d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
     heads_per_x = num_heads // tp_x
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
 
     comm = CommStats()
     payload_bytes = float_size_bytes * n_batch * heads_per_x * (head_dim + 2)
@@ -269,10 +279,8 @@ def _tp2d_attn_comm_phase2_prefill_ring_kv_exchange(
         return CommStats()
 
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
-    d_model = transformer_config.d_model
-    num_heads = transformer_config.num_heads
     num_kv_heads = transformer_config.num_kv_heads
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
 
     kv_heads_per_x, _kv_rep = resolve_kv_heads_per_partition(num_kv_heads=num_kv_heads, tp_x=tp_x)
     kv_full_bytes = float_size_bytes * (2 * n_batch * n_seq * (kv_heads_per_x * head_dim))
@@ -311,11 +319,13 @@ def _tp2d_attn_comm_phase1_qkv_proj_decode(
     d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
     num_kv_heads = transformer_config.num_kv_heads
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
     comm = CommStats()
 
-    # Step 1: all-gather input along X.
+    # Step 1: all-gather the layer input along X. The layer input is the
+    # residual stream (dim = d_model), not the Q-output activation.
     x_after_ag_bytes = float_size_bytes * n_batch * (d_model / tp_yz)
     ag_x_stats = hockney_model_all_gather_on_nd_topology(
         x_topology, x_after_ag_bytes, float_size_bytes=float_size_bytes
@@ -332,7 +342,9 @@ def _tp2d_attn_comm_phase1_qkv_proj_decode(
     )
 
     # Step 3: all-reduce Q along YZ (needed replicated within the YZ column).
-    q_bytes = float_size_bytes * n_batch * (d_model / tp_x)
+    # Q's activation dim is num_heads * head_dim = q_proj_out_dim, NOT
+    # d_model — they only coincide for non-wide-Q layouts.
+    q_bytes = float_size_bytes * n_batch * (q_proj_out_dim / tp_x)
     kv_heads_per_x, _kv_rep = resolve_kv_heads_per_partition(num_kv_heads=num_kv_heads, tp_x=tp_x)
     kv_bytes = float_size_bytes * n_batch * (kv_heads_per_x * head_dim)
 
@@ -414,11 +426,21 @@ def _tp2d_attn_comm_prefill_train(
 ) -> CommStats:
     """TP2D attention comm for training/prefill (no decode-only YZ reductions)."""
     d_model = transformer_config.d_model
+    num_heads = transformer_config.num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
     float_size = workload_spec.float_size_bytes
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
-    volume = float_size * n_batch * n_seq * d_model
+    # Two distinct volumes for the output-projection collectives: AG_YZ
+    # ships the attention-output activation (q_proj_out_dim), RS_X ships
+    # the post-output-proj residual stream (d_model). Equal under non-wide-Q.
+    output_volume_bytes = float_size * n_batch * n_seq * d_model
+    input_volume_bytes = float_size * n_batch * n_seq * q_proj_out_dim
     comm1 = _tp2d_attn_comm_phase1_input_proj(
-        tp_topology=attn_tp_topology, volume_bytes=volume, tp_x=tp_x, float_size_bytes=float_size
+        tp_topology=attn_tp_topology,
+        volume_bytes=output_volume_bytes,
+        tp_x=tp_x,
+        float_size_bytes=float_size,
     )
     comm2 = _tp2d_attn_comm_phase2_prefill_ring_kv_exchange(
         yz_topology=yz_topology,
@@ -431,7 +453,8 @@ def _tp2d_attn_comm_prefill_train(
     comm3 = _tp2d_attn_comm_phase3_output_proj(
         x_topology=x_topology,
         yz_topology=yz_topology,
-        volume_bytes=volume,
+        input_volume_bytes=input_volume_bytes,
+        output_volume_bytes=output_volume_bytes,
         tp_x=tp_x,
         tp_yz=tp_yz,
         float_size_bytes=float_size,
@@ -452,9 +475,13 @@ def _tp2d_attn_comm_decode(
 ) -> CommStats:
     """TP2D attention comm for decode (includes decode-only YZ reductions)."""
     d_model = transformer_config.d_model
+    num_heads = transformer_config.num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
     float_size = workload_spec.float_size_bytes
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
-    volume = float_size * n_batch * n_seq * d_model
+    output_volume_bytes = float_size * n_batch * n_seq * d_model
+    input_volume_bytes = float_size * n_batch * n_seq * q_proj_out_dim
     comm1 = _tp2d_attn_comm_phase1_qkv_proj_decode(
         x_topology=x_topology,
         yz_topology=yz_topology,
@@ -474,7 +501,8 @@ def _tp2d_attn_comm_decode(
     comm3 = _tp2d_attn_comm_phase3_output_proj(
         x_topology=x_topology,
         yz_topology=yz_topology,
-        volume_bytes=volume,
+        input_volume_bytes=input_volume_bytes,
+        output_volume_bytes=output_volume_bytes,
         tp_x=tp_x,
         tp_yz=tp_yz,
         float_size_bytes=float_size,
@@ -960,9 +988,18 @@ class TP2DAttnStrategy(TensorParallelStrategy):
         **kwargs,
     ) -> AttnForwardCommPhases:
         d_model = transformer_config.d_model
+        num_heads = transformer_config.num_heads
+        head_dim = transformer_config.head_dim
+        q_proj_out_dim = num_heads * head_dim
         float_size = workload_spec.float_size_bytes
         n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
-        volume = float_size * n_batch * n_seq * d_model
+        # `output_volume` is the residual-stream volume (d_model-based) used
+        # by the input projection and the output-proj reduce-scatter.
+        # `input_volume` is the attention-output activation volume
+        # (q_proj_out_dim-based) shipped by the output-proj all-gather.
+        # They coincide for non-wide-Q layouts.
+        output_volume = float_size * n_batch * n_seq * d_model
+        input_volume = float_size * n_batch * n_seq * q_proj_out_dim
 
         # Attention TP sizes
         shape_attn = getattr(attn_tp_topology, "shape", [])
@@ -981,7 +1018,7 @@ class TP2DAttnStrategy(TensorParallelStrategy):
 
         phase1 = _tp2d_attn_comm_phase1_input_proj(
             tp_topology=proj_tp_topology,
-            volume_bytes=volume,
+            volume_bytes=output_volume,
             tp_x=tp_x_proj,
             float_size_bytes=float_size,
         )
@@ -996,7 +1033,8 @@ class TP2DAttnStrategy(TensorParallelStrategy):
         phase3 = _tp2d_attn_comm_phase3_output_proj(
             x_topology=proj_x_topology,
             yz_topology=proj_yz_topology,
-            volume_bytes=volume,
+            input_volume_bytes=input_volume,
+            output_volume_bytes=output_volume,
             tp_x=tp_x_proj,
             tp_yz=tp_yz_proj,
             float_size_bytes=float_size,
@@ -1079,7 +1117,7 @@ class TP2DAttnStrategy(TensorParallelStrategy):
         n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
         n_heads = transformer_config.num_heads
         n_kv_heads = transformer_config.num_kv_heads
-        d_head = d_model // n_heads
+        d_head = transformer_config.head_dim
         s = n_batch * n_seq
 
         from scalescope.decode_layout_trace import P, TensorRecord
@@ -1282,9 +1320,13 @@ class TP2DAttnStrategy(TensorParallelStrategy):
     ) -> CommStats:
         # All topology inputs are required (explicit; no None-default behavior).
         d_model = transformer_config.d_model
+        num_heads = transformer_config.num_heads
+        head_dim = transformer_config.head_dim
+        q_proj_out_dim = num_heads * head_dim
         float_size = workload_spec.float_size_bytes
         n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
-        volume = float_size * n_batch * n_seq * d_model
+        output_volume = float_size * n_batch * n_seq * d_model
+        input_volume = float_size * n_batch * n_seq * q_proj_out_dim
 
         # Compute TP sizes separately for attention vs projection domains.
         shape_attn = getattr(attn_tp_topology, "shape", [])
@@ -1306,7 +1348,7 @@ class TP2DAttnStrategy(TensorParallelStrategy):
         # Phase 1 (projection domain): keep proxy formula unchanged, but price on projection TP.
         comm1 = _tp2d_attn_comm_phase1_input_proj(
             tp_topology=proj_tp_topology,
-            volume_bytes=volume,
+            volume_bytes=output_volume,
             tp_x=tp_x_proj,
             float_size_bytes=float_size,
         )
@@ -1325,7 +1367,8 @@ class TP2DAttnStrategy(TensorParallelStrategy):
         comm3 = _tp2d_attn_comm_phase3_output_proj(
             x_topology=proj_x_topology,
             yz_topology=proj_yz_topology,
-            volume_bytes=volume,
+            input_volume_bytes=input_volume,
+            output_volume_bytes=output_volume,
             tp_x=tp_x_proj,
             tp_yz=tp_yz_proj,
             float_size_bytes=float_size,
@@ -1437,12 +1480,20 @@ class TP2DAttnStrategy(TensorParallelStrategy):
             float_size_bytes=float_size,
         )
 
-        # Phase 3 (projection domain): output projection comm
-        volume_bytes = float_size * n_batch * n_seq * d_model
+        # Phase 3 (projection domain): output projection comm. Two distinct
+        # volumes: the AG step ships the q_proj_out_dim-based attention output,
+        # the RS step ships the d_model-based residual output. Equal for
+        # non-wide-Q layouts; differ only when num_heads · head_dim ≠ d_model.
+        num_heads = transformer_config.num_heads
+        head_dim = transformer_config.head_dim
+        q_proj_out_dim = num_heads * head_dim
+        output_volume_bytes = float_size * n_batch * n_seq * d_model
+        input_volume_bytes = float_size * n_batch * n_seq * q_proj_out_dim
         comm3 = _tp2d_attn_comm_phase3_output_proj(
             x_topology=proj_x_topology,
             yz_topology=proj_yz_topology_eff,
-            volume_bytes=volume_bytes,
+            input_volume_bytes=input_volume_bytes,
+            output_volume_bytes=output_volume_bytes,
             tp_x=tp_x_proj,
             tp_yz=tp_yz_proj_eff,
             float_size_bytes=float_size,

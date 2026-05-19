@@ -820,6 +820,7 @@ def _emit_decode_layout_trace(
             d_ff=model_spec.mlp_hidden_size,
             n_heads=model_spec.num_heads,
             n_kv_heads=model_spec.num_kv_heads,
+            head_dim=model_spec.head_dim,
             n_experts=params["n_experts"],
             top_k=params["top_k"],
             tp_x=params["tp_x"],
@@ -1746,11 +1747,8 @@ def get_model_stats(
 
     # KV cache footprint (inference modes)
     if pass_mode == PassMode.INFERENCE_PREFILL or pass_mode == PassMode.INFERENCE_DECODE:
-        d_model = model_spec.d_model
-        num_heads = model_spec.num_heads
         num_kv_heads = model_spec.num_kv_heads
-        head_dim = d_model // num_heads
-        batch_size_per_dp = batch_size_per_dp
+        head_dim = model_spec.head_dim
         if pass_mode == PassMode.INFERENCE_PREFILL:
             kv_len = workload_spec.seq_length
         else:

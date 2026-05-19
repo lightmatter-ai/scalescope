@@ -94,6 +94,17 @@ class TransformerConfig(BaseModel):
         ..., alias="n_layers", description="Total number of transformer layers"
     )
     num_heads: PositiveInt = Field(..., description="Number of attention heads")
+    head_dim: PositiveInt = Field(
+        ...,
+        description=(
+            "Per-head attention dimension. Required. The Q projection "
+            "outputs `num_heads × head_dim` activations (which need NOT "
+            "equal `d_model` — modern 'wide-Q' layouts like MiniMax-M2.5, "
+            "gpt-oss-120b, Qwen3 have `num_heads × head_dim > d_model`). "
+            "KV projections output `num_kv_heads × head_dim`. Always pass "
+            "the value from the model's HuggingFace config verbatim."
+        ),
+    )
     num_kv_heads: Optional[int] = Field(
         default=None,
         ge=0,
@@ -136,9 +147,21 @@ class TransformerConfig(BaseModel):
 
     @model_validator(mode="after")
     def check_model_consistency(self) -> Self:
-        if self.d_model % self.num_heads != 0:
-            raise ValueError(
-                f"d_model ({self.d_model}) must be divisible by num_heads ({self.num_heads})"
+        # `d_model` and `num_heads × head_dim` are independent: the Q
+        # projection maps `d_model -> num_heads × head_dim` and the O
+        # projection maps `num_heads × head_dim -> d_model`. These need
+        # not be equal. We surface "wide-Q" layouts (where the two
+        # differ) as a one-line note at config load so the choice is
+        # visible in run logs, but do not reject the config — wide-Q is
+        # an explicit modern architectural choice (MiniMax-M2.5,
+        # gpt-oss-120b, Qwen3, DeepSeek-V4 all use it).
+        q_proj_out_dim = self.num_heads * self.head_dim
+        if q_proj_out_dim != self.d_model:
+            print(
+                f"note: wide-Q attention layout in {self.__class__.__name__}: "
+                f"num_heads × head_dim = {self.num_heads} × {self.head_dim} = "
+                f"{q_proj_out_dim} ≠ d_model = {self.d_model} "
+                f"(ratio {q_proj_out_dim / self.d_model:.2f}x)"
             )
         is_moe = self.num_regular_experts > 0
         if is_moe:
@@ -155,11 +178,6 @@ class TransformerConfig(BaseModel):
                 )
                 # object.__setattr__(self, 'num_selected_experts', 0) # Optional: Auto-correct (use with caution on frozen models)
         return self
-
-    @computed_field
-    @property
-    def head_dim(self) -> int:
-        return self.d_model // self.num_heads
 
     @computed_field
     @property
@@ -302,15 +320,18 @@ def attn_params_per_xpu(transformer_config: TransformerConfig, tp_topology) -> i
     d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
     num_kv_heads = transformer_config.num_kv_heads
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
     tp_size = tp_topology.num_chips
     if tp_size <= 0:
         raise ValueError("TP topology must have num_chips >= 1")
 
-    # Q and output projection remain TP-sharded by total TP size in this 1D-oriented helper.
-    q_weights_per_xpu = (d_model * d_model) / tp_size
-    o_weights_per_xpu = (d_model * d_model) / tp_size
+    # Q maps d_model -> (num_heads × head_dim); O maps the inverse.
+    # Asymmetric under wide-Q layouts (num_heads × head_dim ≠ d_model,
+    # e.g. MiniMax-M2.5, gpt-oss-120b, qwen3 series).
+    q_weights_per_xpu = (d_model * q_proj_out_dim) / tp_size
+    o_weights_per_xpu = (q_proj_out_dim * d_model) / tp_size
     # K/V use GQA-aware head sharding with duplication fallback.
     kv_heads_per_rank, _kv_rep = resolve_kv_heads_per_partition(
         num_kv_heads=num_kv_heads, tp_x=tp_size

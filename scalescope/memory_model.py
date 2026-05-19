@@ -295,11 +295,12 @@ def calculate_attn_weights_memory_footprint(
     d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
     num_kv_heads = transformer_config.num_kv_heads
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
-    q_weight_size = d_model * d_model
+    q_weight_size = d_model * q_proj_out_dim
     kv_weight_size = 2 * (d_model * num_kv_heads * head_dim)
-    out_weight_size = d_model * d_model
+    out_weight_size = q_proj_out_dim * d_model
     total_attn_weights = q_weight_size + kv_weight_size + out_weight_size
 
     sharded_weights = total_attn_weights / tp_size
@@ -345,11 +346,12 @@ def calculate_attn_optimizer_states_memory_footprint(
     d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
     num_kv_heads = transformer_config.num_kv_heads
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
-    q_weight_size = d_model * d_model
+    q_weight_size = d_model * q_proj_out_dim
     kv_weight_size = 2 * (d_model * num_kv_heads * head_dim)
-    out_weight_size = d_model * d_model
+    out_weight_size = q_proj_out_dim * d_model
     total_attn_weights = q_weight_size + kv_weight_size + out_weight_size
 
     # Weights are always sharded by Tensor Parallelism
@@ -498,7 +500,8 @@ def calculate_attn_forward_transient_peak_memory_footprint_tp2d(
     d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
     num_kv_heads = transformer_config.num_kv_heads
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
     float_size = workload_spec.float_size_bytes
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
 
@@ -517,15 +520,19 @@ def calculate_attn_forward_transient_peak_memory_footprint_tp2d(
         case _:
             raise ValueError(f"Unsupported pass_mode for TP-2D transient peak: {pass_mode}")
 
-    # Phase 1: QKV projection output (GQA-aware: K/V use num_kv_heads)
-    qkv_out_elems = d_model + 2 * (num_kv_heads * head_dim)
+    # Phase 1: QKV projection output (GQA-aware: K/V use num_kv_heads, Q uses num_heads × head_dim).
+    qkv_out_elems = q_proj_out_dim + 2 * (num_kv_heads * head_dim)
     qkv_proj_out = n_batch * step_seq * qkv_out_elems / shard * float_size
 
     # Phase 2: attention scores for local KV segment (non-fused, explicit buffer)
     attn_scores = n_batch * heads_per_x * step_seq * kv_len_local * float_size
 
     # Phase 3: output projection staging
-    gathered_for_out_proj = n_batch * step_seq * d_model / attn_tp_size_x * float_size  # ~E/X
+    # `gathered_for_out_proj` is the attention output (input to output proj),
+    # which has shape (B, S, num_heads * head_dim) = q_proj_out_dim. Under
+    # "wide-Q" layouts this is larger than d_model. `partial_out` is the
+    # post-output-proj activation (B, S, d_model) sharded along YZ.
+    gathered_for_out_proj = n_batch * step_seq * q_proj_out_dim / attn_tp_size_x * float_size
     partial_out = n_batch * step_seq * d_model / attn_tp_size_yz * float_size  # ~E/YZ
 
     return int(max(qkv_proj_out, attn_scores, gathered_for_out_proj, partial_out))
@@ -712,15 +719,16 @@ def _forward_pass_prefill_attention_projection_tp_1d_memory_traffic(
     d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
     num_kv_heads = transformer_config.num_kv_heads
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     float_size = workload_spec.float_size_bytes
 
     # Weights for Q, K/V, and output projection (sharded by projection TP).
-    q_weight_size = d_model * d_model
+    q_weight_size = d_model * q_proj_out_dim
     kv_weight_size = 2 * (d_model * num_kv_heads * head_dim)
-    out_weight_size = d_model * d_model
+    out_weight_size = q_proj_out_dim * d_model
     traffic.weights.bytes_read += (
         (q_weight_size + kv_weight_size + out_weight_size) * float_size
     ) / proj_tp_size
@@ -732,7 +740,7 @@ def _forward_pass_prefill_attention_projection_tp_1d_memory_traffic(
     kv_heads_proj, _kv_rep_proj = resolve_kv_heads_per_partition(
         num_kv_heads=num_kv_heads, tp_x=proj_tp_size
     )
-    q_out_sharded = n_batch * n_seq * d_model * float_size / proj_tp_size
+    q_out_sharded = n_batch * n_seq * q_proj_out_dim * float_size / proj_tp_size
     kv_out_sharded = 2 * n_batch * n_seq * (kv_heads_proj * head_dim) * float_size
     traffic.activations.bytes_written += q_out_sharded + kv_out_sharded
 
@@ -751,10 +759,10 @@ def _forward_pass_prefill_attention_attn_tp_1d_memory_traffic(
     workload_spec,
 ):
     """Prefill/training attention core traffic (scores + context + optional KV-cache write) under NONE/TP-1D."""
-    d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
     num_kv_heads = transformer_config.num_kv_heads
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     float_size = workload_spec.float_size_bytes
@@ -768,7 +776,7 @@ def _forward_pass_prefill_attention_attn_tp_1d_memory_traffic(
     )
 
     # Read QKV outputs produced by projections.
-    q_out_sharded = n_batch * n_seq * d_model * float_size / proj_tp_size
+    q_out_sharded = n_batch * n_seq * q_proj_out_dim * float_size / proj_tp_size
     kv_out_sharded = 2 * n_batch * n_seq * (num_kv_heads_proj * head_dim) * float_size
     traffic.activations.bytes_read += q_out_sharded + kv_out_sharded
 
@@ -809,7 +817,7 @@ def _decode_attention_projection_tp_1d_memory_traffic(
     d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
     num_kv_heads = transformer_config.num_kv_heads
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
 
     # Calculate sharded dimensions
     num_q_heads_sharded = num_heads // proj_tp_size
@@ -822,9 +830,10 @@ def _decode_attention_projection_tp_1d_memory_traffic(
     float_size = workload_spec.float_size_bytes
 
     # Weights
-    q_weight_size = d_model * d_model
+    q_proj_out_dim = num_heads * head_dim
+    q_weight_size = d_model * q_proj_out_dim
     kv_weight_size = 2 * (d_model * num_kv_heads * head_dim)
-    out_weight_size = d_model * d_model
+    out_weight_size = q_proj_out_dim * d_model
     traffic.weights.bytes_read += (
         (q_weight_size + kv_weight_size + out_weight_size) * float_size
     ) / proj_tp_size
@@ -860,10 +869,9 @@ def _decode_attention_attn_tp_1d_memory_traffic(
     - Attention score write/read and context write (layout follows attn TP)
     - Read context for output projection (consumed by projections)
     """
-    d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
     num_kv_heads = transformer_config.num_kv_heads
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
 
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     float_size = workload_spec.float_size_bytes
@@ -1108,13 +1116,14 @@ def _forward_pass_prefill_attention_projection_tp_2d_memory_traffic(
     num_kv_heads = transformer_config.num_kv_heads
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     float_size = workload_spec.float_size_bytes
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
     # Weights: read once per forward pass, sharded in 2D.
-    # GQA-aware: Q proj is (d_model -> d_model), K/V proj are (d_model -> num_kv_heads*head_dim).
-    q_weight_bytes = d_model * d_model * float_size
+    # GQA-aware: Q proj is (d_model -> num_heads * head_dim), K/V proj are (d_model -> num_kv_heads*head_dim).
+    q_weight_bytes = d_model * q_proj_out_dim * float_size
     kv_weight_bytes = 2 * (d_model * num_kv_heads * head_dim) * float_size
-    out_weight_bytes = d_model * d_model * float_size
+    out_weight_bytes = q_proj_out_dim * d_model * float_size
     shard_proj = proj_tp_size_x * proj_tp_size_yz
     traffic.weights.bytes_read += (
         q_weight_bytes + kv_weight_bytes + out_weight_bytes
@@ -1130,8 +1139,8 @@ def _forward_pass_prefill_attention_projection_tp_2d_memory_traffic(
     traffic.activations.bytes_read += int(n_batch * step_seq * d_model / shard_proj * float_size)
 
     # QKV projection output (sharded on X*YZ).
-    # GQA-aware: Q output is d_model; K/V output is num_kv_heads*head_dim.
-    qkv_out_elems = d_model + 2 * (num_kv_heads * head_dim)
+    # GQA-aware: Q output is num_heads * head_dim; K/V output is num_kv_heads*head_dim.
+    qkv_out_elems = q_proj_out_dim + 2 * (num_kv_heads * head_dim)
     qkv_output_sharded_size = n_batch * step_seq * qkv_out_elems / shard_proj * float_size
     traffic.activations.bytes_written += int(qkv_output_sharded_size)
 
@@ -1139,20 +1148,25 @@ def _forward_pass_prefill_attention_projection_tp_2d_memory_traffic(
     # Phase 3: output projection
     # --------------------------
     # Explicit (non-fused) output projection model (matches 2D TP algorithm):
-    # - Input is A^{i,j} of size [B, step_seq, E/(X*YZ)].
-    # - All-gather on YZ reconstructs A^i of size [B, step_seq, E/X] (not modeled as HBM traffic here).
-    # - Local matmul produces partial output O_partial of size [B, step_seq, E/YZ].
-    # - Reduce-scatter on X produces final output shard O^{i,j} of size [B, step_seq, E/(X*YZ)]
+    # - Input is A^{i,j} of size [B, step_seq, E_in/(X*YZ)] where E_in =
+    #   num_heads * head_dim = q_proj_out_dim (the attention output dim, NOT
+    #   d_model — they differ under wide-Q layouts).
+    # - All-gather on YZ reconstructs A^i of size [B, step_seq, E_in/X]
+    #   (not modeled as HBM traffic here).
+    # - Local matmul produces partial output O_partial of size [B, step_seq,
+    #   d_model/YZ] in the projection TP domain.
+    # - Reduce-scatter on X produces final output shard O^{i,j} of size
+    #   [B, step_seq, d_model/(X*YZ)].
     #
     # We account for the key activation buffers involved in the matmul + reduction staging.
     shard_attn = attn_tp_size_x * attn_tp_size_yz
-    attn_out_in_shard = n_batch * step_seq * d_model / shard_attn * float_size
+    attn_out_in_shard = n_batch * step_seq * q_proj_out_dim / shard_attn * float_size
     traffic.activations.bytes_read += int(attn_out_in_shard)
     # Activation read for matmul after the YZ all-gather (A^i) in the projection TP domain.
     traffic.activations.bytes_read += int(
-        n_batch * step_seq * d_model / proj_tp_size_x * float_size
+        n_batch * step_seq * q_proj_out_dim / proj_tp_size_x * float_size
     )
-    # Partial output written (and read for reduce-scatter) in the projection TP domain.
+    # Partial output (post-output-proj) written and read for reduce-scatter in the projection TP domain.
     partial_out = n_batch * step_seq * d_model / proj_tp_size_yz * float_size
     traffic.activations.bytes_written += int(partial_out)
     traffic.activations.bytes_read += int(partial_out)
@@ -1173,12 +1187,12 @@ def _forward_pass_prefill_attention_attn_tp_2d_memory_traffic(
     workload_spec,
 ):
     """TP-2D prefill/training attention-core traffic: phase 2 + optional KV-cache write."""
-    d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
     num_kv_heads = transformer_config.num_kv_heads
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     float_size = workload_spec.float_size_bytes
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
     shard_proj = proj_tp_size_x * proj_tp_size_yz
     shard_attn = attn_tp_size_x * attn_tp_size_yz
@@ -1204,7 +1218,7 @@ def _forward_pass_prefill_attention_attn_tp_2d_memory_traffic(
     heads_per_x = num_heads // attn_tp_size_x if attn_tp_size_x else num_heads
 
     # Read QKV for attention (produced by projections).
-    qkv_out_elems = d_model + 2 * (num_kv_heads * head_dim)
+    qkv_out_elems = q_proj_out_dim + 2 * (num_kv_heads * head_dim)
     qkv_output_sharded_size = n_batch * step_seq * qkv_out_elems / shard_proj * float_size
     traffic.activations.bytes_read += int(qkv_output_sharded_size)
 
@@ -1220,8 +1234,12 @@ def _forward_pass_prefill_attention_attn_tp_2d_memory_traffic(
     traffic.activations.bytes_written += int(attn_score_sharded_size)
     traffic.activations.bytes_read += int(attn_score_sharded_size)
 
-    # Write context/output (still sharded on X*YZ in the attention TP domain).
-    traffic.activations.bytes_written += int(n_batch * step_seq * d_model / shard_attn * float_size)
+    # Write context/output (the post-attention activation, shape
+    # (B, S, num_heads * head_dim) = q_proj_out_dim, sharded on X*YZ in the
+    # attention TP domain). Differs from d_model under wide-Q layouts.
+    traffic.activations.bytes_written += int(
+        n_batch * step_seq * q_proj_out_dim / shard_attn * float_size
+    )
 
 
 def _decode_attention_projection_tp_2d_memory_traffic(
@@ -1245,12 +1263,13 @@ def _decode_attention_projection_tp_2d_memory_traffic(
     num_kv_heads = transformer_config.num_kv_heads
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     float_size = workload_spec.float_size_bytes
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
     # Weights (Q, K/V, Out) read, sharded in 2D (GQA-aware).
-    q_weight_bytes = d_model * d_model * float_size
+    q_weight_bytes = d_model * q_proj_out_dim * float_size
     kv_weight_bytes = 2 * (d_model * num_kv_heads * head_dim) * float_size
-    out_weight_bytes = d_model * d_model * float_size
+    out_weight_bytes = q_proj_out_dim * d_model * float_size
     shard = proj_tp_size_x * proj_tp_size_yz
     traffic.weights.bytes_read += (q_weight_bytes + kv_weight_bytes + out_weight_bytes) // shard
 
@@ -1259,17 +1278,20 @@ def _decode_attention_projection_tp_2d_memory_traffic(
 
     # Phase 1: input projection (activation read + QKV out write)
     traffic.activations.bytes_read += int(n_batch * step_seq * d_model / shard * float_size)
-    qkv_out_elems = d_model + 2 * (num_kv_heads * head_dim)
+    qkv_out_elems = q_proj_out_dim + 2 * (num_kv_heads * head_dim)
     qkv_output_sharded_size = n_batch * step_seq * qkv_out_elems / shard * float_size
     traffic.activations.bytes_written += int(qkv_output_sharded_size)
 
     # Phase 3: output projection staging (explicit, non-fused; matches 2D TP algorithm).
     # Reads of the attention output shard and gathered activation are accounted here, but
     # note that the attention output shard itself is written in the attention-core helper.
-    attn_out_sharded = n_batch * step_seq * d_model / shard * float_size
+    # `attn_out_sharded` is the post-attention activation = q_proj_out_dim
+    # (NOT d_model — they differ under wide-Q layouts); `partial_out` is
+    # the post-output-proj activation = d_model.
+    attn_out_sharded = n_batch * step_seq * q_proj_out_dim / shard * float_size
     traffic.activations.bytes_read += int(attn_out_sharded)
     traffic.activations.bytes_read += int(
-        n_batch * step_seq * d_model / proj_tp_size_x * float_size
+        n_batch * step_seq * q_proj_out_dim / proj_tp_size_x * float_size
     )
     partial_out = n_batch * step_seq * d_model / proj_tp_size_yz * float_size
     traffic.activations.bytes_written += int(partial_out)
@@ -1293,18 +1315,18 @@ def _decode_attention_attn_tp_2d_memory_traffic(
     - Read QKV outputs produced by projections (layout follows proj TP)
     - Phase 2: attention score buffer write/read + attention output write (layout follows attn TP)
     """
-    d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
     num_kv_heads = transformer_config.num_kv_heads
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     float_size = workload_spec.float_size_bytes
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
     step_seq = 1
 
     # QKV outputs (produced by projections).
     shard_proj = proj_tp_size_x * proj_tp_size_yz
-    qkv_out_elems = d_model + 2 * (num_kv_heads * head_dim)
+    qkv_out_elems = q_proj_out_dim + 2 * (num_kv_heads * head_dim)
     qkv_output_sharded_size = n_batch * step_seq * qkv_out_elems / shard_proj * float_size
 
     # KV cache sharding follows attention TP.
@@ -1342,7 +1364,11 @@ def _decode_attention_attn_tp_2d_memory_traffic(
     traffic.activations.bytes_read += int(attn_score_sharded_size)
 
     shard_attn = attn_tp_size_x * attn_tp_size_yz
-    traffic.activations.bytes_written += int(n_batch * step_seq * d_model / shard_attn * float_size)
+    # Attention output write (post-attention activation, dim = q_proj_out_dim
+    # = num_heads * head_dim; NOT d_model under wide-Q).
+    traffic.activations.bytes_written += int(
+        n_batch * step_seq * q_proj_out_dim / shard_attn * float_size
+    )
 
 
 def _decode_attention_tp_2d_memory_traffic(
@@ -1637,14 +1663,17 @@ def _backward_attn_tp_1d_memory_traffic(
     Compute backward-pass memory traffic for the attention sub-block under NONE/1D TP.
 
     Notes
-    - The computation preserves byte-for-byte parity with the previous unified (non-split)
-      implementation. It only factors the attention portion out for clarity.
+    - Factored out of the previously-unified backward TP-1D traffic for clarity. K/V weight
+      and activation terms are GQA-aware (d_model x (num_kv_heads * head_dim)); Q/O terms are
+      wide-Q-aware (d_model x q_proj_out_dim). For MHA models (num_kv_heads == num_heads,
+      q_proj_out_dim == d_model) totals collapse to the legacy d_model x d_model form.
     - Sizes are derived from `transformer_config` and `workload_spec` to avoid duplicating
       arguments upstream.
 
     Args:
         name: A descriptive name for the traffic accumulator instance.
-        transformer_config: Model transformer configuration (provides `d_model`, `num_heads`).
+        transformer_config: Model transformer configuration (provides `d_model`, `num_heads`,
+            `num_kv_heads`, `head_dim`).
         workload_spec: Workload spec used to infer `batch_size_per_dp`, `seq_length`, `float_size_bytes`.
         tp_size: Size of the tensor-parallel attention domain (1 for NONE, >1 for 1D shard).
         activation_checkpointing: Whether activation checkpointing is enabled.
@@ -1657,22 +1686,44 @@ def _backward_attn_tp_1d_memory_traffic(
     traffic = LayerMemoryTraffic(name=name, device_for=device_for, node=node)
     d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
+    num_kv_heads = transformer_config.num_kv_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
     d_model_per_tp = d_model // tp_size if tp_size > 1 else d_model
+    q_proj_out_dim_per_tp = q_proj_out_dim // tp_size if tp_size > 1 else q_proj_out_dim
     heads_per_tp = num_heads // tp_size if tp_size > 1 else num_heads
+    # K/V heads per TP rank: handles the KV-replication regime (tp_size > num_kv_heads)
+    # the same way the forward 1D projection path does.
+    num_kv_heads_per_tp, _kv_rep = resolve_kv_heads_per_partition(
+        num_kv_heads=num_kv_heads, tp_x=tp_size
+    )
     # Resolve batch/sequence and dtype size from workload config
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     n_seq = workload_spec.seq_length
     float_size = workload_spec.float_size_bytes
-    # Read attention weights (QKV, Out) and write corresponding gradients (sharded by TP)
-    qkv_weight_size = (3 * d_model * d_model * float_size) / tp_size
-    attn_out_weight_size = (d_model * d_model * float_size) / tp_size
-    total_w = qkv_weight_size + attn_out_weight_size
+    # Read attention weights (Q, K/V, Out) and write corresponding gradients (sharded by TP).
+    # GQA-aware K/V sizing matches the forward 1D path
+    # (`_forward_pass_prefill_attention_projection_tp_1d_memory_traffic`) and the
+    # 2D backward path (`_backward_attn_tp_2d_memory_traffic`). Q uses
+    # q_proj_out_dim = num_heads · head_dim to support wide-Q layouts
+    # (MiniMax-M2.5, gpt-oss-120b, qwen3 series); reduces to d_model when
+    # num_heads · head_dim == d_model.
+    q_weight_size = d_model * q_proj_out_dim
+    kv_weight_size = 2 * (d_model * num_kv_heads * head_dim)
+    attn_out_weight_size = q_proj_out_dim * d_model
+    total_w = ((q_weight_size + kv_weight_size + attn_out_weight_size) * float_size) / tp_size
     traffic.weights.bytes_read += total_w
     traffic.gradients.bytes_written += total_w
     if not activation_checkpointing:
-        traffic.activations.bytes_read += 3 * n_batch * n_seq * d_model_per_tp * float_size
+        # Read QKV projection outputs (GQA-aware; mirrors q_out_sharded + kv_out_sharded
+        # in the forward 1D path).
+        q_proj_output_per_tp = q_proj_out_dim_per_tp * n_batch * n_seq * float_size
+        kv_proj_output_per_tp = 2 * (num_kv_heads_per_tp * head_dim) * n_batch * n_seq * float_size
+        traffic.activations.bytes_read += q_proj_output_per_tp + kv_proj_output_per_tp
         traffic.activations.bytes_read += n_batch * heads_per_tp * n_seq * n_seq * float_size
-        traffic.activations.bytes_read += n_batch * n_seq * d_model_per_tp * float_size
+        # Read context (input to output proj): dim = q_proj_out_dim/tp.
+        traffic.activations.bytes_read += n_batch * n_seq * q_proj_out_dim_per_tp * float_size
+    # Gradient write for the post-output-proj activation: dim = d_model/tp.
     traffic.gradients.bytes_written += n_batch * n_seq * d_model_per_tp * float_size
     return traffic
 
@@ -1696,10 +1747,11 @@ def _backward_attn_tp_2d_memory_traffic(
     float_size = workload_spec.float_size_bytes
 
     # Weights (QKV + Out), sharded in 2D. GQA-aware sizing.
-    head_dim = d_model // num_heads
-    q_w = d_model * d_model * float_size
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
+    q_w = d_model * q_proj_out_dim * float_size
     kv_w = 2 * (d_model * transformer_config.num_kv_heads * head_dim) * float_size
-    out_w = d_model * d_model * float_size
+    out_w = q_proj_out_dim * d_model * float_size
     shard = attn_tp_size_x * attn_tp_size_yz
     total_w = (q_w + kv_w + out_w) // shard
     traffic.weights.bytes_read += total_w
@@ -1708,15 +1760,20 @@ def _backward_attn_tp_2d_memory_traffic(
     if not activation_checkpointing:
         heads_per_x = num_heads // attn_tp_size_x if attn_tp_size_x else num_heads
         # Read QKV proj output, attention scores, and context/output intermediates (GQA-aware QKV size).
-        qkv_out_elems = d_model + 2 * (transformer_config.num_kv_heads * head_dim)
+        qkv_out_elems = q_proj_out_dim + 2 * (transformer_config.num_kv_heads * head_dim)
         qkv_proj_output = (
             n_batch * n_seq * qkv_out_elems / (attn_tp_size_x * attn_tp_size_yz) * float_size
         )
         attn_scores = n_batch * heads_per_x * n_seq * n_seq * float_size
-        final_proj_in = n_batch * n_seq * d_model / (attn_tp_size_x * attn_tp_size_yz) * float_size
+        # `final_proj_in` is the input to the output projection — the
+        # post-attention activation, dim = q_proj_out_dim (NOT d_model
+        # under wide-Q layouts).
+        final_proj_in = (
+            n_batch * n_seq * q_proj_out_dim / (attn_tp_size_x * attn_tp_size_yz) * float_size
+        )
         traffic.activations.bytes_read += int(qkv_proj_output + attn_scores + final_proj_in)
 
-    # Gradient write for final output (d_model sharded across X*YZ)
+    # Gradient write for final output (post-output-proj activation, dim = d_model, sharded across X*YZ).
     traffic.gradients.bytes_written += (
         n_batch * n_seq * d_model / (attn_tp_size_x * attn_tp_size_yz) * float_size
     )

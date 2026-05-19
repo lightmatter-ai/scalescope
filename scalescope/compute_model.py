@@ -56,16 +56,20 @@ def _calculate_prefill_attention_projection_compute(
     d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
     num_kv_heads = transformer_config.num_kv_heads
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
-    # Q, K, V projections with GQA
-    q_proj_flops = matmul_flops(n_batch * n_seq, d_model, d_model, d_model)
+    # Q, K, V projections with GQA. Q maps d_model -> num_heads * head_dim
+    # (which differs from d_model under "wide-Q" layouts such as MiniMax-M2.5,
+    # gpt_oss_120b, qwen3_30b_a3b, qwen3_235b_a22b). K/V map d_model ->
+    # num_kv_heads * head_dim.
+    q_proj_flops = matmul_flops(n_batch * n_seq, d_model, d_model, q_proj_out_dim)
     k_proj_flops = matmul_flops(n_batch * n_seq, d_model, d_model, num_kv_heads * head_dim)
     v_proj_flops = matmul_flops(n_batch * n_seq, d_model, d_model, num_kv_heads * head_dim)
     kvq_proj_flops = q_proj_flops + k_proj_flops + v_proj_flops
 
-    # Output projection
-    out_proj_flops = matmul_flops(n_batch * n_seq, d_model, d_model, d_model)
+    # Output projection: num_heads * head_dim -> d_model.
+    out_proj_flops = matmul_flops(n_batch * n_seq, q_proj_out_dim, q_proj_out_dim, d_model)
 
     total_flops = kvq_proj_flops + out_proj_flops
     n_chips = proj_tp_topology.num_chips
@@ -86,11 +90,17 @@ def _calculate_prefill_attention_attn_compute(
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     n_seq = workload_spec.seq_length
     float_size = workload_spec.float_size_bytes
-    d_model = transformer_config.d_model
+    num_heads = transformer_config.num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
-    # Attention score (Q @ K.T) and attention–V multiplication.
-    kqv_flops = n_batch * matmul_flops(n_seq, d_model, d_model, n_seq)  # Q @ K.T
-    kqv_flops += n_batch * matmul_flops(n_seq, n_seq, n_seq, d_model)  # Attn @ V
+    # Attention score (Q @ K.T) and attention–V multiplication. Compute is
+    # `num_heads` parallel head-local matmuls of inner dim `head_dim`; for
+    # GQA, K/V are broadcast back to `num_heads` so the FLOPS count is the
+    # same as MHA at q_proj_out_dim = num_heads * head_dim. This is the
+    # post-Q-projection activation dim, NOT d_model (they differ for wide-Q).
+    kqv_flops = n_batch * matmul_flops(n_seq, q_proj_out_dim, q_proj_out_dim, n_seq)  # Q @ K.T
+    kqv_flops += n_batch * matmul_flops(n_seq, n_seq, n_seq, q_proj_out_dim)  # Attn @ V
 
     total_flops = kqv_flops
     n_chips = tp_attn_topology.num_chips
@@ -350,16 +360,18 @@ def _calculate_decode_attention_projection_compute(
     d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
     num_kv_heads = transformer_config.num_kv_heads
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
-    # Q, K, V projections are for the single new token, with GQA
-    q_proj_flops = matmul_flops(n_batch * 1, d_model, d_model, d_model)
+    # Q, K, V projections for the single new token, with GQA. Q maps
+    # d_model -> num_heads * head_dim (differs from d_model under wide-Q).
+    q_proj_flops = matmul_flops(n_batch * 1, d_model, d_model, q_proj_out_dim)
     k_proj_flops = matmul_flops(n_batch * 1, d_model, d_model, num_kv_heads * head_dim)
     v_proj_flops = matmul_flops(n_batch * 1, d_model, d_model, num_kv_heads * head_dim)
     kvq_proj_flops = q_proj_flops + k_proj_flops + v_proj_flops
 
-    # Output projection is for the single new token
-    out_proj_flops = matmul_flops(n_batch * 1, d_model, d_model, d_model)
+    # Output projection for the single new token: num_heads * head_dim -> d_model.
+    out_proj_flops = matmul_flops(n_batch * 1, q_proj_out_dim, q_proj_out_dim, d_model)
 
     total_flops = kvq_proj_flops + out_proj_flops
     n_chips = proj_tp_topology.num_chips
@@ -380,15 +392,21 @@ def _calculate_decode_attention_attn_compute(
     """
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     float_size = workload_spec.float_size_bytes
-    d_model = transformer_config.d_model
+    num_heads = transformer_config.num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
-    #  KV cache : Q (new) attends to *K_cache* (history)
-    # Q @ K.T -> (B, 1, D) @ (B, D, S_cache) = (B, 1, S_cache)
-    qkt_flops = matmul_flops(n_batch * 1, d_model, d_model, n_seq_so_far)
+    #  KV cache : Q (new) attends to *K_cache* (history). The Q-side
+    # activation dim is num_heads * head_dim (= q_proj_out_dim), NOT d_model
+    # — they only coincide for non-wide-Q layouts. The matmul is per-head
+    # (B, 1, head_dim) @ (B, head_dim, S_cache) replicated across num_heads
+    # heads; for GQA the cached K is broadcast back to num_heads so the
+    # FLOPS count is q_proj_out_dim across the reduction.
+    qkt_flops = matmul_flops(n_batch * 1, q_proj_out_dim, q_proj_out_dim, n_seq_so_far)
 
     # KV cache: Attends to V cache
-    # Attention-V multiplication: (Attn @ V) -> (B, 1, S_cache) @ (B, S_cache, D)
-    att_v_flops = matmul_flops(n_batch * 1, n_seq_so_far, n_seq_so_far, d_model)
+    # Attention-V multiplication: (Attn @ V) -> (B, 1, S_cache) @ (B, S_cache, q_proj_out_dim).
+    att_v_flops = matmul_flops(n_batch * 1, n_seq_so_far, n_seq_so_far, q_proj_out_dim)
 
     total_flops = qkt_flops + att_v_flops
     n_chips = attn_tp_topology.num_chips
@@ -508,13 +526,19 @@ def _calculate_backward_attention_projection_compute(
     d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
     num_kv_heads = transformer_config.num_kv_heads
-    head_dim = d_model // num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
-    # Gradients for W_o
-    w_o_grad_flops = _calculate_backward_linear_layer_flops(n_batch * n_seq, d_model, d_model)
+    # Gradients for W_o (q_proj_out_dim -> d_model).
+    w_o_grad_flops = _calculate_backward_linear_layer_flops(
+        n_batch * n_seq, q_proj_out_dim, d_model
+    )
 
-    # Gradients for W_q, W_k, W_v
-    w_q_grad_flops = _calculate_backward_linear_layer_flops(n_batch * n_seq, d_model, d_model)
+    # Gradients for W_q (d_model -> q_proj_out_dim) and W_k / W_v
+    # (d_model -> num_kv_heads * head_dim).
+    w_q_grad_flops = _calculate_backward_linear_layer_flops(
+        n_batch * n_seq, d_model, q_proj_out_dim
+    )
     w_kv_grad_flops = 2 * _calculate_backward_linear_layer_flops(
         n_batch * n_seq, d_model, num_kv_heads * head_dim
     )
@@ -537,17 +561,25 @@ def _calculate_backward_attention_attn_compute(
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     n_seq = workload_spec.seq_length
     float_size = workload_spec.float_size_bytes
-    d_model = transformer_config.d_model
+    num_heads = transformer_config.num_heads
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = num_heads * head_dim
 
-    # Gradients for the core attention mechanism
-    # dL/dK = (Q * V^T) * dL/dAttn etc.
+    # Gradients for the core attention mechanism. All compute is at the
+    # post-Q-projection dim (q_proj_out_dim = num_heads * head_dim): for GQA
+    # the K/V activations are broadcast back to num_heads during the
+    # attention compute, so the backward FLOPS — including dK and dV — are
+    # at that broadcast level (gradient reduction back to num_kv_heads is
+    # an O(1) sum, not in the matmul FLOPS count).
     K_grad_flops = n_batch * (
-        matmul_flops(n_seq, d_model, d_model, n_seq) + matmul_flops(n_seq, n_seq, n_seq, d_model)
+        matmul_flops(n_seq, q_proj_out_dim, q_proj_out_dim, n_seq)
+        + matmul_flops(n_seq, n_seq, n_seq, q_proj_out_dim)
     )
     Q_grad_flops = n_batch * (
-        matmul_flops(n_seq, d_model, d_model, n_seq) + matmul_flops(n_seq, n_seq, n_seq, d_model)
+        matmul_flops(n_seq, q_proj_out_dim, q_proj_out_dim, n_seq)
+        + matmul_flops(n_seq, n_seq, n_seq, q_proj_out_dim)
     )
-    V_grad_flops = n_batch * matmul_flops(n_seq, n_seq, n_seq, d_model)
+    V_grad_flops = n_batch * matmul_flops(n_seq, n_seq, n_seq, q_proj_out_dim)
     core_attn_grads = K_grad_flops + Q_grad_flops + V_grad_flops
 
     total_flops = core_attn_grads

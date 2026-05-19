@@ -7,7 +7,7 @@ separate step.  This module is for shape correctness checking.
 Usage
 -----
     trace = build_decode_2dtp_trace(
-        d_model=12288, d_ff=4096, n_heads=96, n_kv_heads=8,
+        d_model=12288, d_ff=4096, n_heads=96, n_kv_heads=8, head_dim=128,
         n_experts=128, top_k=2, tp_x=32, tp_y=32, g=8, c=16,
         router_mode="sharded",
     )
@@ -556,6 +556,7 @@ def _trace_attention_stages(
     d_model: int,
     n_heads: int,
     n_kv_heads: int,
+    head_dim: int,
     tp_x: int,
     tp_y: int,
     g: int,
@@ -563,8 +564,13 @@ def _trace_attention_stages(
     dtype_bytes: int,
     context_len: int = 1,
 ) -> None:
+    # `d_head` is the per-head attention dimension straight from the model spec
+    # (NOT d_model // n_heads — those are unequal under wide-Q layouts such as
+    # MiniMax-M2.5, gpt-oss-120b, qwen3, where num_heads * head_dim != d_model).
+    if head_dim <= 0:
+        raise ValueError(f"head_dim must be > 0, got {head_dim}")
     y_eff = tp_y // g
-    d_head = d_model // n_heads
+    d_head = head_dim
 
     # Stage 0: layer_input — residual + LayerNorm output
     trace.record(
@@ -1026,6 +1032,7 @@ def build_decode_2dtp_trace(
     d_ff: int,
     n_heads: int,
     n_kv_heads: int,
+    head_dim: int,
     n_experts: int,
     top_k: int,
     tp_x: int,
@@ -1047,6 +1054,8 @@ def build_decode_2dtp_trace(
     d_ff : MoE FFN hidden dimension
     n_heads : number of attention heads
     n_kv_heads : number of KV heads (GQA)
+    head_dim : per-head attention dimension (independent of d_model under wide-Q;
+        always pass `TransformerConfig.head_dim` verbatim)
     n_experts : total number of experts (E)
     top_k : experts selected per token
     tp_x : X-axis TP degree (head parallelism)
@@ -1062,8 +1071,6 @@ def build_decode_2dtp_trace(
     """
     if tp_y % g != 0:
         raise ValueError(f"tp_y ({tp_y}) must be divisible by g ({g})")
-    if d_model % n_heads != 0:
-        raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
 
     mesh = build_decode_2dtp_mesh(tp_x, tp_y, g, n_experts, c)
     trace = LayoutTrace(mesh=mesh)
@@ -1073,6 +1080,7 @@ def build_decode_2dtp_trace(
         d_model=d_model,
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
+        head_dim=head_dim,
         tp_x=tp_x,
         tp_y=tp_y,
         g=g,
