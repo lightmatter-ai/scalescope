@@ -245,15 +245,34 @@ class MemoryFootprint:
 
     def verify(self):
         """
-        Simplified capacity check: sum bytes per device across all components
-        (weights, optimizer, saved activations, forward/backward peaks) and
-        verify the total does not exceed the device capacity.
-        Raises ValueError listing any violating tiers.
+        Single-layer capacity smoke test.
+
+        Sums this footprint's persistent per-component bytes (weights,
+        optimizer_states, saved_activations, gradient_buffers, kv_cache) by
+        memory tier, adds the **maximum** of `transient_forward_peak` and
+        `transient_backward_peak` per tier (since only one is live at any
+        instant), and checks each tier's total against the device's capacity
+        for that tier. Raises ValueError listing any violating tiers.
+
+        Important caveat — what this does NOT check:
+        - This is a **per-layer** sum. It does not multiply persistent
+          components by `num_layers_per_pp_stage`, so it cannot detect cases
+          where a single layer fits but the full per-chip total (all layers
+          hosted on this chip) does not. The realistic HBM-fit metric is
+          `total_peak_memory_per_chip_bytes` in `run_scalescope.py`, which
+          downstream feasibility checks should compare against device HBM.
+          See modeling_improvements_todo §9 for the planned upgrade.
+
+        Treat this as an early sanity check that catches gross
+        per-component-tier misconfigurations, not as the authoritative
+        HBM-feasibility check.
         """
         if self.node is None:
             raise ValueError("MemoryFootprint.node is not set; cannot verify capacities.")
         tiers = self.node.device_memory_tiers
         usage_by_tier: Dict[str, int] = {}
+        fwd_by_tier: Dict[str, int] = {}
+        bwd_by_tier: Dict[str, int] = {}
 
         def add_bytes(tier: str, amount: int):
             usage_by_tier[tier] = usage_by_tier.get(tier, 0) + int(amount)
@@ -264,8 +283,19 @@ class MemoryFootprint:
                     f"MemoryFootprint.device_for missing mapping for '{component_name}'"
                 )
             tier = self.device_for[component_name]
-            bytes_val = getattr(self, component_name)
-            add_bytes(tier, bytes_val)
+            bytes_val = int(getattr(self, component_name))
+            if component_name == "transient_forward_peak":
+                fwd_by_tier[tier] = fwd_by_tier.get(tier, 0) + bytes_val
+            elif component_name == "transient_backward_peak":
+                bwd_by_tier[tier] = bwd_by_tier.get(tier, 0) + bytes_val
+            else:
+                add_bytes(tier, bytes_val)
+
+        # Forward and backward transient peaks are mutually exclusive in
+        # time — only one is live at any instant. Charge each tier the
+        # larger of the two so we don't double-count.
+        for tier in set(fwd_by_tier) | set(bwd_by_tier):
+            add_bytes(tier, max(fwd_by_tier.get(tier, 0), bwd_by_tier.get(tier, 0)))
 
         violations = []
         for tier_name, used in usage_by_tier.items():
