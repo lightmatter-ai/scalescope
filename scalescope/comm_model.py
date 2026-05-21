@@ -272,8 +272,25 @@ def get_transformer_comm_stats(
     # EP / MoE A2A: strategy functions return per-layer stats (same convention
     # as TP strategies above); multiply by num_layers_per_pp_stage here.
     if pass_mode == PassMode.INFERENCE_DECODE:
+        # Fail-fast on multi-attention-domain decode EP. The current decode comm
+        # model assumes attn_domains_per_full_expert_set == 1 (one attention
+        # domain per expert set → dispatch is zero, tokens already local). With
+        # attn_domains_per_full_expert_set > 1 the expert set is larger than the
+        # attention TP domain and dispatch must traverse scale-up (and possibly
+        # scale-out) fabric.
+        if moe_config.attn_domains_per_full_expert_set > 1:
+            raise NotImplementedError(
+                f"EP decode with attn_domains_per_full_expert_set="
+                f"{moe_config.attn_domains_per_full_expert_set} is not supported yet "
+                f"(full_expert_set_xpu_count={moe_config.full_expert_set_xpu_count}, "
+                f"attn_tp_size={attn_tp_topology.num_chips}). "
+                f"Multi-attention-domain decode requires explicit dispatch + "
+                f"combine modeling across scale-up (and possibly scale-out) "
+                f"fabric, which is not implemented yet. For now, choose a "
+                f"topology where the expert set fits within one attention TP "
+                f"domain (full_expert_set_xpu_count <= attn_tp_size)."
+            )
         # D=1 decode: dispatch is zero (tokens already local at every group).
-        # Combine is an inter-group all-reduce (§9.6 of router_a2a_integration_note).
         moe_stats_1 = CommStats()
         decode_tp2d_qkv_groups = workload_spec.decode_tp2d_qkv_groups
         moe_stats_2 = num_layers_per_pp_stage * calculate_moe_combine_decode(

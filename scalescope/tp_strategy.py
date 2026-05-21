@@ -29,15 +29,17 @@ def _tag_to_str(tag) -> str:
 
 
 def _moe_remote_fraction(moe_config) -> float:
-    """Smooth routed-token remote fraction across DP feeders and colocated groups.
+    """Smooth routed-token remote fraction across attention domains and colocated groups.
 
     Remote fraction = 1 - 1/(D*G), where:
-    - D: num_dp_ranks_per_complete_expert_set
+    - D: attn_domains_per_full_expert_set
     - G: num_colocated_groups_per_set
     This is the same independence-based locality factor used by EP MoE A2A.
     """
-    d = max(1, int(getattr(moe_config, "num_dp_ranks_per_complete_expert_set", 1) or 1))
+    d = int(moe_config.attn_domains_per_full_expert_set)
     g = max(1, int(getattr(moe_config, "num_colocated_groups_per_set", 1) or 1))
+    if d <= 0:
+        raise ValueError(f"attn_domains_per_full_expert_set must be > 0, got {d}.")
     return max(0.0, 1.0 - (1.0 / float(d * g)))
 
 

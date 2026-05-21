@@ -25,7 +25,6 @@ class ExpertXPUPlacement:
     num_all_experts_per_dp_rank: int = 0
     total_distinct_experts_per_set: int = 0
     regular_expert_traffic_multiplier: float = 0.0
-    num_dp_ranks_per_complete_expert_set: int = 1
     num_complete_expert_sets: int = 1
     # EP/placement-wide fields needed by comm/compute
     full_expert_set_xpu_count: int = 1
@@ -36,6 +35,20 @@ class ExpertXPUPlacement:
     # Chips per colocated expert group (TP degree inside one group).
     xpus_per_colocated_group: int = 1
     ep_chips_per_pp_stage: int = 0
+    # Size relationship between the attention TP domain and the expert
+    # set's chip footprint. At most one of these is > 1 at any time:
+    #   - attn_domains_per_full_expert_set > 1 ↔ expert set is larger than
+    #     one attention domain → multiple attention domains feed into one
+    #     expert set ("centralized pool", currently unsupported for decode).
+    #   - full_expert_sets_per_attn_domain > 1 ↔ one attention domain
+    #     hosts multiple full expert sets ("small experts per attention
+    #     domain", supported).
+    #   - both == 1 ↔ expert set fills exactly one attention domain.
+    # Defaults are None so missing assignment by a constructor surfaces
+    # as a TypeError at the first comparison, instead of silently being
+    # treated as 1.
+    attn_domains_per_full_expert_set: int | None = None
+    full_expert_sets_per_attn_domain: int | None = None
     # Decode router shard factor (resolved by orchestration).
     router_shard_factor: int = 1
     # Router synchronization policy consumed by TP comm strategies.
@@ -47,6 +60,52 @@ class ExpertXPUPlacement:
     # - ON: send tokens (or token shards) to an expert shard first, then run all-gather
     #   so that shard is available across the expert TP shards.
     tp_moe_a2a_replication_optimization_enabled: bool = True
+
+
+def _resolve_attn_expert_size_ratio(
+    *, full_expert_set_xpu_count: int, attn_tp_size: int
+) -> tuple[int, int]:
+    """Resolve the size-ratio pair between the expert set and one attention TP domain.
+
+    Returns ``(attn_domains_per_full_expert_set, full_expert_sets_per_attn_domain)``.
+
+    The two returned values capture how the expert set's chip footprint
+    relates to one attention TP domain's chip footprint. They are
+    mutually exclusive (at most one is > 1):
+      - ``attn_domains_per_full_expert_set > 1`` ↔ the expert set spans
+        multiple attention TP domains (centralized pool).
+      - ``full_expert_sets_per_attn_domain > 1`` ↔ a single attention TP
+        domain hosts multiple full expert sets.
+
+    Invariants enforced:
+      - Both values are positive integers.
+      - The larger of ``full_expert_set_xpu_count`` and ``attn_tp_size``
+        must be an exact multiple of the smaller; otherwise we raise
+        ``ValueError`` rather than silently rounding (per the
+        explicit-only rule).
+    """
+    if full_expert_set_xpu_count <= 0:
+        raise ValueError(f"full_expert_set_xpu_count must be > 0, got {full_expert_set_xpu_count}")
+    if attn_tp_size <= 0:
+        raise ValueError(f"attn_tp_size must be > 0, got {attn_tp_size}")
+
+    if full_expert_set_xpu_count == attn_tp_size:
+        return 1, 1
+    if full_expert_set_xpu_count > attn_tp_size:
+        if full_expert_set_xpu_count % attn_tp_size != 0:
+            raise ValueError(
+                f"full_expert_set_xpu_count ({full_expert_set_xpu_count}) must be a "
+                f"multiple of attn_tp_size ({attn_tp_size}) when the expert set is "
+                f"larger than the attention TP domain."
+            )
+        return full_expert_set_xpu_count // attn_tp_size, 1
+    if attn_tp_size % full_expert_set_xpu_count != 0:
+        raise ValueError(
+            f"attn_tp_size ({attn_tp_size}) must be a multiple of "
+            f"full_expert_set_xpu_count ({full_expert_set_xpu_count}) when the "
+            f"attention TP domain is larger than the expert set."
+        )
+    return 1, attn_tp_size // full_expert_set_xpu_count
 
 
 def damp_expert_imbalance(
@@ -146,13 +205,14 @@ def infer_expert_placement_per_xpu(
             num_all_experts_per_dp_rank=0,
             total_distinct_experts_per_set=0,
             regular_expert_traffic_multiplier=0.0,
-            num_dp_ranks_per_complete_expert_set=1,
             num_complete_expert_sets=1,
             full_expert_set_xpu_count=1,
             num_colocated_experts=num_colocated_experts,
             num_colocated_groups_per_set=0,
             xpus_per_colocated_group=normalized_xpus_per_colocated_group,
             ep_chips_per_pp_stage=int(ep_chips_per_pp_stage),
+            attn_domains_per_full_expert_set=1,
+            full_expert_sets_per_attn_domain=1,
             router_shard_factor=router_shard_factor,
             router_sync_mode=router_sync_mode,
             tp_moe_a2a_replication_optimization_enabled=tp_moe_a2a_replication_optimization_enabled,
@@ -163,10 +223,15 @@ def infer_expert_placement_per_xpu(
         (total_distinct_experts * normalized_xpus_per_colocated_group) / num_colocated_experts
     )
     num_colocated_groups_per_set = ceil(total_distinct_experts / num_colocated_experts)
-    num_dp_ranks_per_expert_group = max(full_expert_set_xpu_count // attn_tp_size, 1)
-    num_routed_experts_per_dp_rank = num_regular // num_dp_ranks_per_expert_group
+    attn_domains_per_full_expert_set, full_expert_sets_per_attn_domain = (
+        _resolve_attn_expert_size_ratio(
+            full_expert_set_xpu_count=full_expert_set_xpu_count,
+            attn_tp_size=attn_tp_size,
+        )
+    )
+    num_routed_experts_per_dp_rank = num_regular // attn_domains_per_full_expert_set
     num_shared_experts_per_dp_rank = (
-        num_shared * (moe_v2.shared_expert_copies or 1) // num_dp_ranks_per_expert_group
+        num_shared * (moe_v2.shared_expert_copies or 1) // attn_domains_per_full_expert_set
     )
     num_of_all_experts_per_dp_rank = num_routed_experts_per_dp_rank + num_shared_experts_per_dp_rank
 
@@ -191,7 +256,6 @@ def infer_expert_placement_per_xpu(
         num_all_experts_per_dp_rank=num_of_all_experts_per_dp_rank,
         total_distinct_experts_per_set=int(total_distinct_experts),
         regular_expert_traffic_multiplier=regular_expert_traffic_multiplier,
-        num_dp_ranks_per_complete_expert_set=num_dp_ranks_per_expert_group,
         num_complete_expert_sets=int(num_complete_expert_sets),
         # EP/placement-wide fields
         full_expert_set_xpu_count=int(full_expert_set_xpu_count),
@@ -199,6 +263,8 @@ def infer_expert_placement_per_xpu(
         num_colocated_groups_per_set=int(num_colocated_groups_per_set),
         xpus_per_colocated_group=normalized_xpus_per_colocated_group,
         ep_chips_per_pp_stage=int(ep_chips_per_pp_stage),
+        attn_domains_per_full_expert_set=attn_domains_per_full_expert_set,
+        full_expert_sets_per_attn_domain=full_expert_sets_per_attn_domain,
         router_shard_factor=router_shard_factor,
         router_sync_mode=router_sync_mode,
         tp_moe_a2a_replication_optimization_enabled=tp_moe_a2a_replication_optimization_enabled,
@@ -644,23 +710,23 @@ def calculate_moe_comm_hierarchical_total_exchange(
         full_expert_set_xpu_count = int(moe_config.full_expert_set_xpu_count)
         xpus_per_colocated_group = int(moe_config.xpus_per_colocated_group)
         num_colocated_groups_per_set = int(moe_config.num_colocated_groups_per_set)
-        num_dp_ranks_per_complete_expert_set = int(moe_config.num_dp_ranks_per_complete_expert_set)
+        attn_domains_per_full_expert_set = int(moe_config.attn_domains_per_full_expert_set)
     except AttributeError as e:
         raise ValueError(
             "moe_config must be produced by infer_expert_placement_per_xpu and include "
-            "`full_expert_set_xpu_count`, `xpus_per_colocated_group`, and "
-            "`num_colocated_groups_per_set`, `num_dp_ranks_per_complete_expert_set`."
+            "`full_expert_set_xpu_count`, `xpus_per_colocated_group`, "
+            "`num_colocated_groups_per_set`, `attn_domains_per_full_expert_set`."
         ) from e
     if (
         full_expert_set_xpu_count <= 0
         or xpus_per_colocated_group <= 0
         or num_colocated_groups_per_set < 0
-        or num_dp_ranks_per_complete_expert_set <= 0
+        or attn_domains_per_full_expert_set <= 0
     ):
         raise ValueError(
             "Invalid expert placement fields: expected full_expert_set_xpu_count>0, "
             "xpus_per_colocated_group>0, num_colocated_groups_per_set>=0, "
-            "num_dp_ranks_per_complete_expert_set>0."
+            "attn_domains_per_full_expert_set>0."
         )
     routed_expert_traffic_multiplier = float(
         getattr(moe_config, "regular_expert_traffic_multiplier")
@@ -682,7 +748,7 @@ def calculate_moe_comm_hierarchical_total_exchange(
 
     tokens_per_set = num_global_batch_tokens / max(1, num_full_sets)
     # Smooth locality model (independence assumption):
-    # - D = num_dp_ranks_per_complete_expert_set (feeder groups per expert set)
+    # - D = attn_domains_per_full_expert_set (feeder attention domains per expert set)
     # - G = num_colocated_groups_per_set (destination expert groups)
     # - remote_fraction = 1 - 1/(D*G)
     #
@@ -690,7 +756,7 @@ def calculate_moe_comm_hierarchical_total_exchange(
     # - D=1 and G=1 -> remote_fraction=0 (fully local, no MoE exchange volume)
     # - larger D/G -> remote_fraction approaches 1 (more exchange required)
     source_partitions = max(
-        1, num_dp_ranks_per_complete_expert_set * max(1, num_colocated_groups_per_set)
+        1, attn_domains_per_full_expert_set * max(1, num_colocated_groups_per_set)
     )
     remote_fraction = max(0.0, 1.0 - (1.0 / float(source_partitions)))
     # Model routed exchange at expert-group granularity, then map to per-XPU payload

@@ -394,6 +394,15 @@ def test_alternative_prefill_256_experts(tmp_output_dir):
 # Decode tests - Passage
 
 
+@pytest.mark.skip(
+    reason=(
+        "Multi-attention-domain decode: this config has "
+        "full_expert_set_xpu_count=512 > attn_tp_size=16 (attn_domains_per_full_expert_set=32). "
+        "Decode dispatch + combine modeling for this regime is not implemented yet; "
+        "see conf26_followup/modeling_improvements_todo.md §5 for the recovery plan. "
+        "Previous numerical answer was produced by a comm model that silently zeroed dispatch."
+    )
+)
 def test_passage_decode_32_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
@@ -410,6 +419,12 @@ def test_passage_decode_32_experts(tmp_output_dir):
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
+@pytest.mark.skip(
+    reason=(
+        "Multi-attention-domain decode: full_expert_set_xpu_count > attn_tp_size "
+        "(attn_domains_per_full_expert_set > 1). See conf26_followup/modeling_improvements_todo.md §5."
+    )
+)
 def test_passage_decode_64_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,

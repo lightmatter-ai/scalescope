@@ -2422,9 +2422,9 @@ def get_model_stats(
         plotting.tp_xpu_count_label: attn_tp_topology_view.num_chips,
         plotting.dp_ranks_label: attn_dp_topology_view.num_chips,
         plotting.high_bandwidth_xpu_count_label: attn_tp_topology_view.num_chips
-        * moe_config.num_dp_ranks_per_complete_expert_set,
+        * moe_config.attn_domains_per_full_expert_set,
         plotting.low_bandwidth_ranks_label: attn_dp_topology_view.num_chips
-        // moe_config.num_dp_ranks_per_complete_expert_set,
+        // moe_config.attn_domains_per_full_expert_set,
         plotting.total_xpu_count_label: total_xpus_val,
         plotting.batch_size_per_dp_label: batch_size_per_dp,
         plotting.shared_expert_count_label: model_spec.num_shared_experts,
@@ -2433,7 +2433,7 @@ def get_model_stats(
         plotting.regular_experts_per_dp_rank_label: moe_config.num_regular_experts_per_dp_rank,
         plotting.num_selected_experts_label: model_spec.num_selected_experts,
         plotting.num_experts_per_dp_rank_label: moe_config.num_all_experts_per_dp_rank,
-        plotting.num_dp_ranks_per_complete_expert_set_label: moe_config.num_dp_ranks_per_complete_expert_set,
+        plotting.attn_domains_per_full_expert_set_label: moe_config.attn_domains_per_full_expert_set,
         plotting.num_complete_expert_sets_label: moe_config.num_complete_expert_sets,
         plotting.optimizer_label: getattr(workload_spec, "optimizer", "N/A"),
         plotting.float_size_label: workload_spec.float_size_bytes,
@@ -3166,8 +3166,8 @@ def structure_run_results(row, human_readable=False):
             "shared_experts_per_dp_rank": get_val(plotting.shared_experts_per_dp_rank_label),
             "regular_experts_per_dp_rank": get_val(plotting.regular_experts_per_dp_rank_label),
             "experts_per_dp_rank": get_val(plotting.num_experts_per_dp_rank_label),
-            "dp_ranks_per_complete_expert_set": get_val(
-                plotting.num_dp_ranks_per_complete_expert_set_label
+            "attn_domains_per_full_expert_set": get_val(
+                plotting.attn_domains_per_full_expert_set_label
             ),
             "num_complete_expert_sets": get_val(plotting.num_complete_expert_sets_label),
         },

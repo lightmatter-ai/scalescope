@@ -261,7 +261,6 @@ class MemoryFootprint:
           hosted on this chip) does not. The realistic HBM-fit metric is
           `total_peak_memory_per_chip_bytes` in `run_scalescope.py`, which
           downstream feasibility checks should compare against device HBM.
-          See modeling_improvements_todo §9 for the planned upgrade.
 
         Treat this as an early sanity check that catches gross
         per-component-tier misconfigurations, not as the authoritative

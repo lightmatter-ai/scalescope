@@ -18,7 +18,7 @@ regular_experts_per_dp_rank_label = "Routed_Experts_Per_DP_Rank"
 num_selected_experts_label = "Num_Selected_Experts_Per_Token"
 num_experts_per_dp_rank_label = "Num_Experts_Per_DP_Rank"
 
-num_dp_ranks_per_complete_expert_set_label = "Num_DP_Ranks_Per_Complete_Expert_Set"
+attn_domains_per_full_expert_set_label = "Attn_Domains_Per_Full_Expert_Set"
 num_complete_expert_sets_label = "Num_Complete_Expert_Sets"
 num_dp_ranks_per_expert_group_label = "Num_DP_Ranks_Per_Expert_Group"
 
