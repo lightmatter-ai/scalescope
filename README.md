@@ -267,7 +267,7 @@ The sweep DSL supports these generator names:
 ### Built-in verifiers
 
 - `pydantic_valid`: keeps only cases that can be applied to the base specs without Pydantic validation errors.
-- `decode_tp2d_qkv_groups_divides_proj_yz`: for decode TP2D sweeps, keeps only cases where `workload_spec.decode_tp2d_qkv_groups`
+- `projection_groups_divides_proj_yz`: for decode TP2D sweeps, keeps only cases where `workload_spec.projection_groups`
   divides the resolved projection TP2D YZ size (from `workload_spec.tp_proj_spec.split_2d.yz_tags` and `logical_topology` tag sizes).
 
 ### Example sweeps (report + BEST markers)

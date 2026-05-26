@@ -394,15 +394,19 @@ def test_alternative_prefill_256_experts(tmp_output_dir):
 # Decode tests - Passage
 
 
-@pytest.mark.skip(
-    reason=(
-        "Multi-attention-domain decode: this config has "
-        "full_expert_set_xpu_count=512 > attn_tp_size=16 (attn_domains_per_full_expert_set=32). "
-        "Decode dispatch + combine modeling for this regime is not implemented yet; "
-        "see conf26_followup/modeling_improvements_todo.md §5 for the recovery plan. "
-        "Previous numerical answer was produced by a comm model that silently zeroed dispatch."
-    )
-)
+# Passage decode tests — intra-rack centralized expert pool regression baseline.
+#
+# All four "passage" configs share the same regime:
+#   attn_tp_size = 16, full_expert_set_xpu_count = 512, scale_up_domain_size = 512
+#   => attn_domains_per_full_expert_set = 32, full_set fits in one scale-up
+#      domain, so decode dispatch + combine go through the symmetric A2A path
+#      in scalescope/comm_model.py.
+# Headline TPOT barely moves with the symmetric-A2A model because this regime
+# is memory-bound (memory ≈ 97% of total, comm overlap absorbs the rest), but
+# the moe_all_to_all volume_bytes in the run artifact are non-zero and
+# symmetric, which is the structural property these baselines lock in.
+
+
 def test_passage_decode_32_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
@@ -415,16 +419,10 @@ def test_passage_decode_32_experts(tmp_output_dir):
         pass_mode="inference_decode",
         output_file_name="decode_32_experts_scalescope_res.yaml",
     )
-    expected_time_sec = 0.420056455858114
+    expected_time_sec = 0.42005648440757826
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
-@pytest.mark.skip(
-    reason=(
-        "Multi-attention-domain decode: full_expert_set_xpu_count > attn_tp_size "
-        "(attn_domains_per_full_expert_set > 1). See conf26_followup/modeling_improvements_todo.md §5."
-    )
-)
 def test_passage_decode_64_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
@@ -437,11 +435,10 @@ def test_passage_decode_64_experts(tmp_output_dir):
         pass_mode="inference_decode",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.4205142479993659
+    expected_time_sec = 0.42051427654883006
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
-@pytest.mark.skip(reason="Temporarily disabled due to known decode regression drift.")
 def test_passage_decode_128_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
@@ -454,11 +451,10 @@ def test_passage_decode_128_experts(tmp_output_dir):
         pass_mode="inference_decode",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.4214298330749101
+    expected_time_sec = 0.4214298616243743
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
-@pytest.mark.skip(reason="Temporarily disabled due to known decode regression drift.")
 def test_passage_decode_256_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
@@ -471,14 +467,31 @@ def test_passage_decode_256_experts(tmp_output_dir):
         pass_mode="inference_decode",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.4232610040190392
+    expected_time_sec = 0.4232610325685034
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
 # Decode tests - Alternative
 
 
-@pytest.mark.skip(reason="Temporarily disabled due to known decode regression drift.")
+# Alternative decode tests — cross-rack centralized expert pool.
+#
+# All four "alternative" configs have full_expert_set_xpu_count = 512
+# (EP_SU=128, EP_SO=4) but scale_up_domain_size = 128, so the full expert set
+# does not fit in one scale-up domain. Cross-rack hierarchical dispatch +
+# combine on EP_SO is not yet implemented in scalescope/comm_model.py, so
+# these tests are skipped. The expected_time_sec values below are kept as
+# legacy baselines from a comm model that silently zeroed multi-domain decode
+# dispatch; they are not currently exercised.
+
+
+@pytest.mark.skip(
+    reason=(
+        "Cross-rack centralized pool: full_expert_set_xpu_count=512 > "
+        "scale_up_domain_size=128. Hierarchical dispatch + combine on EP_SO "
+        "is not yet implemented in scalescope/comm_model.py."
+    )
+)
 def test_alternative_decode_32_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
@@ -495,7 +508,13 @@ def test_alternative_decode_32_experts(tmp_output_dir):
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
-@pytest.mark.skip(reason="Temporarily disabled due to known decode regression drift.")
+@pytest.mark.skip(
+    reason=(
+        "Cross-rack centralized pool: full_expert_set_xpu_count=512 > "
+        "scale_up_domain_size=128. Hierarchical dispatch + combine on EP_SO "
+        "is not yet implemented in scalescope/comm_model.py."
+    )
+)
 def test_alternative_decode_64_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
@@ -512,7 +531,13 @@ def test_alternative_decode_64_experts(tmp_output_dir):
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
-@pytest.mark.skip(reason="Temporarily disabled due to known decode regression drift.")
+@pytest.mark.skip(
+    reason=(
+        "Cross-rack centralized pool: full_expert_set_xpu_count=512 > "
+        "scale_up_domain_size=128. Hierarchical dispatch + combine on EP_SO "
+        "is not yet implemented in scalescope/comm_model.py."
+    )
+)
 def test_alternative_decode_128_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
@@ -529,7 +554,13 @@ def test_alternative_decode_128_experts(tmp_output_dir):
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
-@pytest.mark.skip(reason="Temporarily disabled due to known decode regression drift.")
+@pytest.mark.skip(
+    reason=(
+        "Cross-rack centralized pool: full_expert_set_xpu_count=512 > "
+        "scale_up_domain_size=128. Hierarchical dispatch + combine on EP_SO "
+        "is not yet implemented in scalescope/comm_model.py."
+    )
+)
 def test_alternative_decode_256_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,

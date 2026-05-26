@@ -272,39 +272,85 @@ def get_transformer_comm_stats(
     # EP / MoE A2A: strategy functions return per-layer stats (same convention
     # as TP strategies above); multiply by num_layers_per_pp_stage here.
     if pass_mode == PassMode.INFERENCE_DECODE:
-        # Fail-fast on multi-attention-domain decode EP. The current decode comm
-        # model assumes attn_domains_per_full_expert_set == 1 (one attention
-        # domain per expert set → dispatch is zero, tokens already local). With
-        # attn_domains_per_full_expert_set > 1 the expert set is larger than the
-        # attention TP domain and dispatch must traverse scale-up (and possibly
-        # scale-out) fabric.
-        if moe_config.attn_domains_per_full_expert_set > 1:
-            raise NotImplementedError(
-                f"EP decode with attn_domains_per_full_expert_set="
-                f"{moe_config.attn_domains_per_full_expert_set} is not supported yet "
-                f"(full_expert_set_xpu_count={moe_config.full_expert_set_xpu_count}, "
-                f"attn_tp_size={attn_tp_topology.num_chips}). "
-                f"Multi-attention-domain decode requires explicit dispatch + "
-                f"combine modeling across scale-up (and possibly scale-out) "
-                f"fabric, which is not implemented yet. For now, choose a "
-                f"topology where the expert set fits within one attention TP "
-                f"domain (full_expert_set_xpu_count <= attn_tp_size)."
+        attn_domains_per_set = moe_config.attn_domains_per_full_expert_set
+        full_set_xpus = moe_config.full_expert_set_xpu_count
+        projection_groups = workload_spec.projection_groups
+        if attn_domains_per_set > 1:
+            # Multi-attention-domain decode: the expert set is larger than one
+            # attention TP domain, so dispatch is no longer free.  Two sub-cases:
+            #   - intra-rack centralized pool: full_set_xpus <= scale_up_domain
+            #     size → all feeders + experts inside one scale-up fabric.
+            #     Single-fabric A2A on EP_SU for both dispatch and combine.
+            #   - cross-rack centralized pool: full_set_xpus > scale_up_domain
+            #     size → pool spans scale-out fabric; needs per-feeder
+            #     hierarchical accounting (deferred).
+            try:
+                scale_up_domain_size = ep_topology.get_mapping_for_tag("EP_SU").size
+            except Exception as e:
+                raise ValueError(
+                    "EP topology must include tag `EP_SU` to evaluate "
+                    "multi-attention-domain decode feasibility."
+                ) from e
+            if full_set_xpus > scale_up_domain_size:
+                raise NotImplementedError(
+                    f"EP decode with full_expert_set_xpu_count={full_set_xpus} > "
+                    f"scale_up_domain_size={scale_up_domain_size} (and "
+                    f"attn_domains_per_full_expert_set={attn_domains_per_set}) "
+                    f"is not supported yet. Cross-rack centralized expert pools "
+                    f"require per-feeder hierarchical dispatch + combine "
+                    f"accounting on scale-out fabric, which is not implemented. "
+                    f"For now, choose a topology where the expert set fits in "
+                    f"one scale-up domain (full_expert_set_xpu_count <= "
+                    f"scale_up_domain_size)."
+                )
+            # Intra-rack centralized pool: reuse the prefill A2A primitive for
+            # both dispatch and combine.  When full_set_xpus <= scale_up_domain
+            # the primitive's hierarchical-split path collapses to single-fabric
+            # (scale-up only): the second-fastest tag carries 0 bytes because
+            # the pool fits in one scale-up domain.
+            #
+            # The dense RS-across-expert-groups combine model used in the
+            # single-attention-domain regime is bypassed here because the
+            # cross-domain A2A already covers all routed-token redistribution.
+            moe_stats_1 = num_layers_per_pp_stage * calculate_moe_comm_first_total_exchange(
+                ep_topology,
+                model_spec,
+                moe_config,
+                num_global_batch_tokens,
+                float_size=workload_spec.float_size_bytes,
+                workload_spec=workload_spec,
+                tp_moe_y_shards=tp_moe_y_shards,
+                layout_trace=layout_trace,
             )
-        # D=1 decode: dispatch is zero (tokens already local at every group).
-        moe_stats_1 = CommStats()
-        decode_tp2d_qkv_groups = workload_spec.decode_tp2d_qkv_groups
-        moe_stats_2 = num_layers_per_pp_stage * calculate_moe_combine_decode(
-            ep_topology_view=ep_topology,
-            transformer_config=model_spec,
-            moe_config=moe_config,
-            num_global_batch_tokens=num_global_batch_tokens,
-            attn_tp_xpus=attn_tp_topology.num_chips,
-            float_size=workload_spec.float_size_bytes,
-            tp_moe_x_shards=tp_moe_x_shards,
-            tp_moe_y_shards=tp_moe_y_shards,
-            decode_tp2d_qkv_groups=decode_tp2d_qkv_groups,
-            layout_trace=layout_trace,
-        )
+            moe_stats_2 = num_layers_per_pp_stage * calculate_moe_comm_second_total_exchange(
+                ep_topology_view=ep_topology,
+                transformer_config=model_spec,
+                moe_config=moe_config,
+                num_global_batch_tokens=num_global_batch_tokens,
+                float_size=workload_spec.float_size_bytes,
+                workload_spec=workload_spec,
+                tp_moe_y_shards=tp_moe_y_shards,
+                layout_trace=layout_trace,
+            )
+        else:
+            # Single attention domain per expert set (attn_domains_per_full_expert_set == 1):
+            # dispatch is zero (tokens already local at every colocated expert
+            # group); combine is the dense RS-across-expert-groups + optional
+            # cross-set AG + optional projection-group AG + optional NxM remap
+            # model.
+            moe_stats_1 = CommStats()
+            moe_stats_2 = num_layers_per_pp_stage * calculate_moe_combine_decode(
+                ep_topology_view=ep_topology,
+                transformer_config=model_spec,
+                moe_config=moe_config,
+                num_global_batch_tokens=num_global_batch_tokens,
+                attn_tp_xpus=attn_tp_topology.num_chips,
+                float_size=workload_spec.float_size_bytes,
+                tp_moe_x_shards=tp_moe_x_shards,
+                tp_moe_y_shards=tp_moe_y_shards,
+                projection_groups=projection_groups,
+                layout_trace=layout_trace,
+            )
     else:
         # Training / prefill: symmetric A2A dispatch + combine.
         moe_stats_1 = num_layers_per_pp_stage * calculate_moe_comm_first_total_exchange(

@@ -142,21 +142,21 @@ sweep:
     assert len(cases) == 2
 
 
-def test_where_decode_tp2d_qkv_groups_divides_proj_yz(tmp_path):
-    # Ensure verifier filters cases where decode_tp2d_qkv_groups does not divide proj YZ size.
+def test_where_projection_groups_divides_proj_yz(tmp_path):
+    # Ensure verifier filters cases where projection_groups does not divide proj YZ size.
     sweep_yaml = """
 leaves:
   yz:
     paths: [logical_topology.tag_size.TP_Proj_Y]
     cases: [[4], [8]]
   g:
-    paths: [workload_spec.decode_tp2d_qkv_groups]
+    paths: [workload_spec.projection_groups]
     cases: [[1], [2], [3], [4]]
 sweep:
   cartesian:
     - ref: yz
     - ref: g
-  where: ["decode_tp2d_qkv_groups_divides_proj_yz"]
+  where: ["projection_groups_divides_proj_yz"]
   on_fail: skip
 """
     p = tmp_path / "sweep.yaml"
@@ -189,14 +189,14 @@ sweep:
 
     class _WS(BaseModel):
         model_config = ConfigDict(frozen=True)
-        decode_tp2d_qkv_groups: int = 1
+        projection_groups: int = 1
         tp_proj_spec: _TPSpec
 
-    # Base specs: logical_topology must support get_mapping_for_tag, workload_spec must have decode_tp2d_qkv_groups and tp_proj_spec.split_2d.yz_tags.
+    # Base specs: logical_topology must support get_mapping_for_tag, workload_spec must have projection_groups and tp_proj_spec.split_2d.yz_tags.
     base_specs = {
         "model_spec": _Dummy(x=0),
         "workload_spec": _WS(
-            decode_tp2d_qkv_groups=1,
+            projection_groups=1,
             tp_proj_spec=_TPSpec(split_2d=_Split2D(yz_tags=["TP_Proj_Y"])),
         ),
         "logical_topology": _Topo(dimensions=[_Dim(logical_tag="TP_Proj_Y", size=4)]),

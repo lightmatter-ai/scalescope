@@ -203,7 +203,7 @@ leaves:
   router_g_mode:
     paths:
     - workload_spec.decode_moe_router_sync_mode
-    - workload_spec.decode_tp2d_qkv_groups
+    - workload_spec.projection_groups
     cases:
     - - replicated_router
       - 1
@@ -284,7 +284,7 @@ sweep:
   - ref: colocated_with_tp_moe_pairs_main
   where:
   - pydantic_valid
-  - decode_tp2d_qkv_groups_divides_proj_yz
+  - projection_groups_divides_proj_yz
   - decode_sharded_router_proj_y_eff_matches_moe_y_all_shapes
   on_fail: skip
 

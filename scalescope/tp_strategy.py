@@ -28,21 +28,6 @@ def _tag_to_str(tag) -> str:
     return tag.value if hasattr(tag, "value") else str(tag)
 
 
-def _moe_remote_fraction(moe_config) -> float:
-    """Smooth routed-token remote fraction across attention domains and colocated groups.
-
-    Remote fraction = 1 - 1/(D*G), where:
-    - D: attn_domains_per_full_expert_set
-    - G: num_colocated_groups_per_set
-    This is the same independence-based locality factor used by EP MoE A2A.
-    """
-    d = int(moe_config.attn_domains_per_full_expert_set)
-    g = max(1, int(getattr(moe_config, "num_colocated_groups_per_set", 1) or 1))
-    if d <= 0:
-        raise ValueError(f"attn_domains_per_full_expert_set must be > 0, got {d}.")
-    return max(0.0, 1.0 - (1.0 / float(d * g)))
-
-
 @dataclass(frozen=True)
 class Resolved2DSplit:
     x_dims: list[int]
@@ -1454,7 +1439,7 @@ class TP2DAttnStrategy(TensorParallelStrategy):
         float_size = workload_spec.float_size_bytes
         n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
 
-        # NOTE: decode_tp2d_qkv_groups is implemented as a *global* policy by creating derived
+        # NOTE: projection_groups is implemented as a *global* policy by creating derived
         # TP views with smaller effective YZ degrees. That way, comm/compute/memory/KV-cache are
         # all affected consistently. Therefore, the TP strategy itself should not special-case it
         # here; it should simply consume the provided (possibly-derived) topologies.
@@ -1699,7 +1684,9 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             # Build A1 payload from the same routed-token basis as TP1D/C-phases:
             # - traffic_mult captures selected-expert fanout + imbalance amplification,
             # - num_colocated_experts maps per-expert routed traffic to per-chip load,
-            # - remote_fraction applies placement locality (D,G) consistently.
+            # - remote_fraction (locality across `num_colocated_groups_per_set` groups,
+            #   under the no-spill invariant) is applied in the EP A2A path itself, not
+            #   here; TP core collectives carry the per-rank routed volume.
             #
             # This keeps 1D/2D parity in the degenerate YZ=1 case by avoiding a mixed
             # payload basis (raw tokens for A1 vs routed tokens for C-phases).

@@ -9,6 +9,7 @@ Usage
     trace = build_decode_2dtp_trace(
         d_model=12288, d_ff=4096, n_heads=96, n_kv_heads=8, head_dim=128,
         n_experts=128, top_k=2, tp_x=32, tp_y=32, g=8, c=16,
+        attn_domains_per_full_expert_set=1, full_expert_sets_per_attn_domain=1,
         router_mode="sharded",
     )
     print(trace.format_table())
@@ -751,6 +752,8 @@ def _trace_moe_stages(
     router_mode: str,
     s: int,
     dtype_bytes: int,
+    attn_domains_per_full_expert_set: int,
+    full_expert_sets_per_attn_domain: int,
     moe_tp_x: int | None = None,
     moe_tp_yz: int | None = None,
 ) -> None:
@@ -835,6 +838,42 @@ def _trace_moe_stages(
             ),
         )
 
+    # Cross-attention-domain dispatch A2A.
+    # When attn_domains_per_full_expert_set > 1, the expert set spans multiple
+    # attention TP domains, so each token's hidden state must be shipped to the
+    # chip hosting its routed expert.  At full_expert_set_xpu_count <=
+    # scale_up_domain_size this is a single-fabric A2A on EP_SU
+    # (intra-rack centralized pool).  When attn_domains_per_full_expert_set == 1
+    # the dispatch is free (tokens already colocated with their expert) and this
+    # stage is suppressed.
+    if attn_domains_per_full_expert_set > 1:
+        _dispatch_d_partitions = {"D": P("sharded", ("Y_eff",))} if _moe_tp_yz > 1 else {}
+        trace.record(
+            "decode_dispatch",
+            "Cross-attention-domain dispatch A2A on EP_SU "
+            "(attn_domains_per_full_expert_set > 1)",
+            TensorRecord(
+                name="x_dispatched",
+                global_shape={"B": s, "D": d_model},
+                partitions={
+                    **_dispatch_d_partitions,
+                    "B": P("replicated", ("Y",)),
+                },
+                dtype_bytes=dtype_bytes,
+            ),
+            note=(
+                f"comm: A2A across attn_domains_per_full_expert_set="
+                f"{attn_domains_per_full_expert_set} feeder domains. "
+                f"Per-token payload = d_model/Y_eff = {d_model // _moe_tp_yz} bytes/elem. "
+                "Single-fabric on EP_SU when full_expert_set_xpu_count <= scale_up_domain_size; "
+                "spills to EP_SO otherwise (cross-rack, not yet modeled)."
+            ),
+            flags=(
+                "OPEN: smooth routing_nonlocal_fraction = 1 - 1/(attn_domains_per_full_expert_set "
+                "* num_colocated_groups_per_set) abstraction; per-feeder routing is not modeled.",
+            ),
+        )
+
     # Stage 7: expert input
     if _replicated_1d_y:
         # §11.3: After AG(attn_X) + AG(YZ), full D is available for expert matmul.
@@ -863,9 +902,19 @@ def _trace_moe_stages(
                 "extra bandwidth wasted? See §9.5.8"
             )
         _expert_d_partitions = {"D": P("sharded", ("Y_eff",))} if _moe_tp_yz > 1 else {}
+        if attn_domains_per_full_expert_set > 1:
+            expert_input_desc = (
+                "Expert input (post-dispatch: tokens arrived from "
+                f"{attn_domains_per_full_expert_set} feeder attention domains)"
+            )
+        else:
+            expert_input_desc = (
+                "Expert input (single attention domain per expert set: "
+                "tokens already local, dispatch = 0)"
+            )
         trace.record(
             "expert_input",
-            "Expert input (D=1: tokens already local, dispatch = 0)",
+            expert_input_desc,
             TensorRecord(
                 name="x_expert",
                 global_shape={"B": s, "D": d_model},
@@ -1000,6 +1049,38 @@ def _trace_moe_stages(
         flags=combine_flags,
     )
 
+    # Cross-attention-domain combine A2A (return leg of decode_dispatch).
+    # Symmetric counterpart to decode_dispatch: ships expert outputs back to
+    # their origin attention domain.  Only present when
+    # attn_domains_per_full_expert_set > 1; same fabric as the dispatch leg
+    # (EP_SU intra-rack centralized pool; cross-rack pools spilling onto EP_SO
+    # are not yet supported).  Per-rank tensor layout is the same as
+    # `after_combine`: the A2A redistributes whose tokens live where but does
+    # not change per-rank shape.
+    if attn_domains_per_full_expert_set > 1:
+        trace.record(
+            "decode_combine_a2a",
+            "Cross-attention-domain combine A2A on EP_SU " "(return leg of decode_dispatch)",
+            TensorRecord(
+                name="moe_out_returned",
+                global_shape={"B": s, "D": d_model},
+                partitions={
+                    **({"D": P("sharded", _post_combine_d_dims)} if _post_combine_d_dims else {}),
+                    "B": P("replicated", ("Y",)),
+                },
+                dtype_bytes=dtype_bytes,
+            ),
+            note=(
+                f"comm: A2A return across attn_domains_per_full_expert_set="
+                f"{attn_domains_per_full_expert_set} feeder domains. "
+                "Symmetric to decode_dispatch; same fabric (EP_SU intra-rack)."
+            ),
+            flags=(
+                "OPEN: combine return modeled as symmetric to dispatch; "
+                "per-token weighted-sum combine cost not separately tracked.",
+            ),
+        )
+
     # Stage 11: layer output — residual add → next layer
     trace.record(
         "layer_output",
@@ -1039,6 +1120,8 @@ def build_decode_2dtp_trace(
     tp_y: int,
     g: int,
     c: int,
+    attn_domains_per_full_expert_set: int,
+    full_expert_sets_per_attn_domain: int,
     router_mode: str = "sharded",
     s: int = 1,
     dtype_bytes: int = 2,
@@ -1062,6 +1145,13 @@ def build_decode_2dtp_trace(
     tp_y : full Y-axis TP degree
     g : number of projection groups
     c : experts colocated per group
+    attn_domains_per_full_expert_set : how many attention TP domains share one
+        expert set. Equal to 1 means single-attention-domain (decode dispatch
+        is free); > 1 emits the decode_dispatch / decode_combine_a2a stages.
+    full_expert_sets_per_attn_domain : how many expert sets live inside one
+        attention TP domain. Equal to 1 means one set per attention domain;
+        > 1 keeps the cross-set AG path (the existing "S_attn > 1" regime).
+        At most one of these two ratios is > 1 at a time.
     router_mode : "replicated" or "sharded"
     s : sequence length (1 for decode)
     dtype_bytes : bytes per element (default 2 for bf16/fp16)
@@ -1101,6 +1191,8 @@ def build_decode_2dtp_trace(
         router_mode=router_mode,
         s=s,
         dtype_bytes=dtype_bytes,
+        attn_domains_per_full_expert_set=attn_domains_per_full_expert_set,
+        full_expert_sets_per_attn_domain=full_expert_sets_per_attn_domain,
         moe_tp_x=moe_tp_x,
         moe_tp_yz=moe_tp_yz,
     )

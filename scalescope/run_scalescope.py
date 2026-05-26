@@ -749,6 +749,8 @@ def _resolve_decode_trace_params(
         n_experts=n_experts,
         top_k=top_k,
         router_mode=router_mode,
+        attn_domains_per_full_expert_set=int(moe_config.attn_domains_per_full_expert_set),
+        full_expert_sets_per_attn_domain=int(moe_config.full_expert_sets_per_attn_domain),
     )
 
 
@@ -805,6 +807,8 @@ def _emit_decode_layout_trace(
         params["g"],
         params["c"],
         params["router_mode"],
+        params["attn_domains_per_full_expert_set"],
+        params["full_expert_sets_per_attn_domain"],
         model_spec.d_model,
         model_spec.mlp_hidden_size,
         n_batch,
@@ -827,6 +831,8 @@ def _emit_decode_layout_trace(
             tp_y=params["tp_y"],
             g=params["g"],
             c=params["c"],
+            attn_domains_per_full_expert_set=(params["attn_domains_per_full_expert_set"]),
+            full_expert_sets_per_attn_domain=(params["full_expert_sets_per_attn_domain"]),
             router_mode=params["router_mode"],
             s=1,
             dtype_bytes=workload_spec.float_size_bytes,
@@ -1015,14 +1021,18 @@ def get_model_stats(
     batch_size_per_dp = batch_sizes.batch_size_per_dp
 
     # ------------------------------------------------------------------------------------------
-    # Decode-only TP2D policy: decode_tp2d_qkv_groups
+    # Decode-only policy: projection_groups (current implementation: TP-2D only)
     #
     # Semantics (global, not comm-only):
-    # - We reduce the *effective* TP2D YZ degree for attention/projection by a factor of g.
-    # - This models "replicating" work across g independent YZ groups: comm collectives run on a
-    #   smaller group, but compute + memory + KV-cache footprint per chip increase accordingly
-    #   because sharding is reduced.
-    # - Physical XPU counts/topology are unchanged; we only create derived *model views* for costs.
+    # - We reduce the *effective* TP2D YZ degree for the projection path by a factor of g.
+    # - This models splitting projection work across g independent YZ subgroups: comm collectives
+    #   run on a smaller group, but per-chip projection compute and projection memory traffic
+    #   grow by g because sharding shrinks.
+    # - Attention-core sharding (and KV-cache footprint) is unaffected: only the projection view
+    #   is derived. Physical XPU counts/topology are unchanged; we only create derived
+    #   *model views* for costs.
+    # - Concept generalizes to 1D TP; current implementation requires TP-2D (see field docstring
+    #   on `projection_groups`).
     # ------------------------------------------------------------------------------------------
     def _resize_view_tag_size(*, view, tag: str, new_size: int, view_name: str):
         mapping = view.get_mapping_for_tag(tag)
@@ -1039,21 +1049,21 @@ def get_model_stats(
 
     if pass_mode == PassMode.INFERENCE_DECODE:
         assert isinstance(workload_spec, InferenceDecodeSpec)
-        g = int(getattr(workload_spec, "decode_tp2d_qkv_groups", 1) or 1)
+        g = int(getattr(workload_spec, "projection_groups", 1) or 1)
         if g < 1:
-            raise ValueError("decode_tp2d_qkv_groups must be >= 1")
+            raise ValueError("projection_groups must be >= 1")
         if g > 1:
             if attn_tp_variant != TensorParallelVariant.SHARD_WEIGHTS_2D:
                 raise ValueError(
-                    "decode_tp2d_qkv_groups > 1 currently requires TP-2D attention (variant: SHARD_WEIGHTS_2D)."
+                    "projection_groups > 1 currently requires TP-2D attention (variant: SHARD_WEIGHTS_2D)."
                 )
             if attn_tp_spec.split_2d is None or proj_tp_spec.split_2d is None:
                 raise ValueError(
-                    "decode_tp2d_qkv_groups > 1 requires explicit tp_attn_spec.split_2d and tp_proj_spec.split_2d."
+                    "projection_groups > 1 requires explicit tp_attn_spec.split_2d and tp_proj_spec.split_2d."
                 )
             if len(attn_tp_spec.split_2d.yz_tags) == 0 or len(proj_tp_spec.split_2d.yz_tags) == 0:
                 raise ValueError(
-                    "decode_tp2d_qkv_groups requires non-empty yz_tags for both attn and proj split_2d specs."
+                    "projection_groups requires non-empty yz_tags for both attn and proj split_2d specs."
                 )
             proj_yz_tags = proj_tp_spec.split_2d.yz_tags
             proj_yz_size = 1
@@ -1061,7 +1071,7 @@ def get_model_stats(
                 proj_yz_size *= proj_tp_topology_view.get_mapping_for_tag(proj_yz_tag).size
             if proj_yz_size % g != 0:
                 raise ValueError(
-                    f"decode_tp2d_qkv_groups={g} must divide projection TP2D YZ size {proj_yz_size} "
+                    f"projection_groups={g} must divide projection TP2D YZ size {proj_yz_size} "
                     f"(yz_tags={proj_yz_tags})."
                 )
 
@@ -1103,7 +1113,7 @@ def get_model_stats(
 
             if remaining_divisor != 1:
                 raise ValueError(
-                    f"decode_tp2d_qkv_groups={g} could not be distributed across projection yz_tags={proj_yz_tags}."
+                    f"projection_groups={g} could not be distributed across projection yz_tags={proj_yz_tags}."
                 )
 
     match pass_mode:
@@ -2812,7 +2822,7 @@ def get_detailed_mem_stats(
             tp_x_attn = _prod_from_shape(shape_attn, attn_x_dims)
             tp_yz_attn = _prod_from_shape(shape_attn, attn_yz_dims)
 
-            # Projections may be modeled on a different TP domain (e.g., decode_tp2d_qkv_groups).
+            # Projections may be modeled on a different TP domain (e.g., projection_groups).
             if proj_tp_topology_view is None:
                 proj_tp_topology_view = attn_tp_topology_view
                 proj_x_dims = attn_x_dims

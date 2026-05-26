@@ -472,16 +472,25 @@ class InferenceDecodeSpec(WorkloadSpec):
     seq_length: int = Field(
         default=1, gt=0, description="Sequence length per decode step (typically 1)"
     )
-    decode_tp2d_qkv_groups: int = Field(
+    projection_groups: int = Field(
         default=1,
         ge=1,
         description=(
-            "Decode-only TP2D knob (projection-domain grouping): split the TP2D YZ domain into `g` independent "
-            "groups for *projection-domain* work (Q/K/V projections and output projection). This reduces the "
-            "projection-domain YZ collective group size (lower comm latency) and increases projection compute "
-            "and projection memory traffic per chip due to replication/duplication across groups. "
-            "Attention-core sharding (and KV-cache footprint) remains determined by the attention TP2D domain. "
-            "1 means no grouping. Must divide the projection TP2D YZ size when used."
+            "Projection grouping factor `g` for the projection path (Q/K/V projections and output "
+            "projection). The TP collective participant group used for projection work is split into "
+            "`g` independent subgroups, each running its own smaller collective; per-chip projection "
+            "compute and projection memory traffic grow by `g` because the work is effectively "
+            "replicated across the subgroups, while collective latency shrinks because each subgroup "
+            "has fewer participants. Attention-core sharding (and KV-cache footprint) is unaffected.\n"
+            "\n"
+            "Concept generalizes to both 1D and 2D TP. The current implementation only supports the "
+            "TP-2D variant: it shrinks the *projection-domain* YZ degree by `g` (validated in "
+            "`run_scalescope.py` — non-TP-2D configs raise on g > 1). Extending to 1D TP is a "
+            "natural follow-up.\n"
+            "\n"
+            "Constraints: `g >= 1` (1 means no grouping). Under the TP-2D implementation, `g` must "
+            "divide the projection TP-2D YZ size and be distributable across the projection "
+            "`yz_tags`. Decode-only (lives on `InferenceDecodeSpec`)."
         ),
     )
 

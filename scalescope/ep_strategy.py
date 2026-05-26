@@ -223,6 +223,23 @@ def infer_expert_placement_per_xpu(
         (total_distinct_experts * normalized_xpus_per_colocated_group) / num_colocated_experts
     )
     num_colocated_groups_per_set = ceil(total_distinct_experts / num_colocated_experts)
+    # No-spill invariant: each colocated expert group must live entirely
+    # inside a single attention TP domain. We rely on this in the locality
+    # model used by `calculate_moe_comm_hierarchical_total_exchange` (remote
+    # fraction = 1 - 1/G under "groups don't cross attention domains").
+    # Concretely: attn_tp_size must be a positive integer multiple of
+    # xpus_per_colocated_group. This rejects the (rare) case where a group's
+    # q chips span multiple attention TP domains. Cross-domain expert sets
+    # (attn_domains_per_full_expert_set > 1) are still supported as long as
+    # groups themselves stay within one attention domain.
+    if attn_tp_size % normalized_xpus_per_colocated_group != 0:
+        raise ValueError(
+            f"xpus_per_colocated_group ({normalized_xpus_per_colocated_group}) "
+            f"must divide attn_tp_size ({attn_tp_size}) so that no colocated "
+            "expert group spills across attention TP domains. Multi-attention-"
+            "domain expert sets are supported, but a single group is required "
+            "to live in one attention domain."
+        )
     attn_domains_per_full_expert_set, full_expert_sets_per_attn_domain = (
         _resolve_attn_expert_size_ratio(
             full_expert_set_xpu_count=full_expert_set_xpu_count,
@@ -279,6 +296,8 @@ def calculate_moe_comm_first_total_exchange(
     float_size,
     tp_moe_y_shards: int,
     workload_spec=None,
+    layout_trace=NULL_LAYOUT_TRACE,
+    a2a_leg: str = "dispatch",
 ):
     return calculate_moe_comm_hierarchical_total_exchange(
         ep_topology_view,
@@ -288,6 +307,8 @@ def calculate_moe_comm_first_total_exchange(
         float_size,
         workload_spec=workload_spec,
         tp_moe_y_shards=tp_moe_y_shards,
+        layout_trace=layout_trace,
+        a2a_leg=a2a_leg,
     )
 
 
@@ -299,6 +320,7 @@ def calculate_moe_comm_second_total_exchange(
     float_size,
     tp_moe_y_shards: int,
     workload_spec=None,
+    layout_trace=NULL_LAYOUT_TRACE,
 ):
     # assume for now that we get the same stats when we are returning tokens after they are processed by teh experts
     return calculate_moe_comm_first_total_exchange(
@@ -309,6 +331,8 @@ def calculate_moe_comm_second_total_exchange(
         float_size,
         workload_spec=workload_spec,
         tp_moe_y_shards=tp_moe_y_shards,
+        layout_trace=layout_trace,
+        a2a_leg="combine",
     )
 
 
@@ -321,10 +345,16 @@ def calculate_moe_combine_decode(
     float_size: int,
     tp_moe_x_shards: int,
     tp_moe_y_shards: int,
-    decode_tp2d_qkv_groups: int,
+    projection_groups: int,
     layout_trace=NULL_LAYOUT_TRACE,
 ) -> CommStats:
-    """D=1 decode combine: per-layer reduce-scatter across G expert groups.
+    """Single-attention-domain decode combine: per-layer reduce-scatter
+    across the colocated expert groups within one expert set.
+
+    Used only when ``attn_domains_per_full_expert_set == 1`` (each expert set
+    is contained in exactly one attention TP domain, so dispatch is free and
+    only the combine needs to be modeled). Multi-attention-domain decode goes
+    through the symmetric A2A path in ``comm_model.py`` instead.
 
     Returns **per-layer** comm stats; the caller is responsible for
     multiplying by ``num_layers_per_pp_stage`` (consistent with the TP
@@ -388,8 +418,8 @@ def calculate_moe_combine_decode(
         )
     if tp_moe_x_shards <= 0:
         raise ValueError(f"tp_moe_x_shards must be > 0, got {tp_moe_x_shards}")
-    if decode_tp2d_qkv_groups <= 0:
-        raise ValueError(f"decode_tp2d_qkv_groups must be > 0, got {decode_tp2d_qkv_groups}")
+    if projection_groups <= 0:
+        raise ValueError(f"projection_groups must be > 0, got {projection_groups}")
     if xpus_per_group % tp_moe_y_shards != 0:
         raise ValueError(
             f"xpus_per_colocated_group ({xpus_per_group}) must be divisible by "
@@ -495,7 +525,7 @@ def calculate_moe_combine_decode(
         combine_bytes_per_rank,
         per_layer_rs,
         note=(
-            f"D=1 dense combine/handoff: RS across G={G} groups, "
+            f"single-attention-domain dense combine/handoff: RS across G={G} colocated expert groups, "
             f"buffer=[B_set={tokens_per_set:.0f}, D_local={d_model/xpus_per_group:.0f}]"
             f", S_processing={num_processing_sets}, S_attn={num_combine_sets}"
             f", mode={rs_handoff_mode}, rs_axis={combine_base_tag}"
@@ -581,12 +611,12 @@ def calculate_moe_combine_decode(
     else:
         tokens_per_attn_domain = tokens_per_set
 
-    # decode_tp2d_qkv_groups>1 means projection-domain work is split into
-    # multiple independent YZ groups. After combine RS(G) (and optional cross-set
+    # projection_groups>1 means projection-domain work is split into
+    # multiple independent YZ subgroups. After combine RS(G) (and optional cross-set
     # AG), we need an extra AG over that group axis so every rank in the active
     # attention shard sees the full post-combine token domain.
-    if decode_tp2d_qkv_groups > 1:
-        # decode_tp2d_qkv_groups (`g`) is introduced by shrinking projection-domain
+    if projection_groups > 1:
+        # projection_groups (`g`) is introduced by shrinking projection-domain
         # YZ tags in run_scalescope. This reconciliation AG therefore stays on the
         # attention Y axis regardless of whether RS(G)/cross-set AG used X or Y.
         # It models restoring full visibility across projection groups in the YZ domain.
@@ -596,14 +626,14 @@ def calculate_moe_combine_decode(
         except Exception as e:
             raise ValueError(
                 f"Missing required logical tag '{u_base_tag}' for projection-group combine AG(U) "
-                f"(g={decode_tp2d_qkv_groups}, combine_axis={combine_base_tag})."
+                f"(g={projection_groups}, combine_axis={combine_base_tag})."
             ) from e
 
         combine_u_ag_output_bytes = tokens_per_attn_domain * d_local_bytes
         combine_u_view = topo_ref.create_virtual_view_from_tag(
             view_name="Combine_U",
             base_tag=u_base_tag,
-            virtual_size=decode_tp2d_qkv_groups,
+            virtual_size=projection_groups,
             global_sharing_context="max_exclusive",
         )
         per_layer_combine_u = hockney_model_all_gather_on_nd_topology(
@@ -614,12 +644,12 @@ def calculate_moe_combine_decode(
         layout_trace.record_comm(
             "combine_ag_u",
             "AG",
-            f"{u_base_tag}({decode_tp2d_qkv_groups})",
-            decode_tp2d_qkv_groups,
+            f"{u_base_tag}({projection_groups})",
+            projection_groups,
             combine_u_ag_output_bytes,
             per_layer_combine_u,
             note=(
-                f"Projection-group combine AG(U): g={decode_tp2d_qkv_groups}, "
+                f"Projection-group combine AG(U): g={projection_groups}, "
                 f"[B={tokens_per_attn_domain:.0f}, D_local={d_model/xpus_per_group:.0f}] "
                 "to restore full combine-domain visibility for next-layer handoff."
             ),
@@ -695,11 +725,16 @@ def calculate_moe_comm_hierarchical_total_exchange(
     float_size: int,
     tp_moe_y_shards: int,
     workload_spec=None,
+    layout_trace=NULL_LAYOUT_TRACE,
+    a2a_leg: str = "dispatch",
 ):
     """Per-layer MoE A2A exchange cost (hierarchical or fused).
 
     Returns **per-layer** comm stats; the caller is responsible for
     multiplying by ``num_layers_per_pp_stage``.
+
+    ``a2a_leg`` labels the layout-trace stage emitted by this call:
+    ``"dispatch"`` (token routing to experts) or ``"combine"`` (return leg).
     """
     if transformer_config.num_regular_experts == 0:
         return CommStats()
@@ -747,24 +782,43 @@ def calculate_moe_comm_hierarchical_total_exchange(
     num_full_sets = ep_total_xpus // max(1, full_expert_set_xpu_count)
 
     tokens_per_set = num_global_batch_tokens / max(1, num_full_sets)
-    # Smooth locality model (independence assumption):
-    # - D = attn_domains_per_full_expert_set (feeder attention domains per expert set)
-    # - G = num_colocated_groups_per_set (destination expert groups)
-    # - remote_fraction = 1 - 1/(D*G)
+    # Smooth locality model (independence approximation):
+    #   routing_nonlocal_fraction = 1 - 1 / (attn_domains_per_full_expert_set
+    #                                        * num_colocated_groups_per_set)
     #
-    # This makes locality a continuous function:
-    # - D=1 and G=1 -> remote_fraction=0 (fully local, no MoE exchange volume)
-    # - larger D/G -> remote_fraction approaches 1 (more exchange required)
-    source_partitions = max(
+    # The two factors index distinct "routing buckets" inside one expert set:
+    #   - attn_domains_per_full_expert_set = number of feeder attention TP
+    #     domains that share one expert set,
+    #   - num_colocated_groups_per_set    = number of destination colocated
+    #     expert groups inside that set.
+    #
+    # NOTE — this is intentionally coarse and is a known approximation:
+    # under the no-spill placement invariant (each colocated group lives in
+    # exactly one attention TP domain), the *correct* total-volume fraction
+    # is 1 - 1/num_colocated_groups_per_set, and the
+    # attn_domains_per_full_expert_set factor is only needed when separating
+    # the within-attention-domain remote share from the cross-attention-
+    # domain remote share (which only matters for cross-rack fabric
+    # accounting). For the intra-rack centralized-pool path the two formulas
+    # pick the same physical fabric — only the volume scales differ. We
+    # keep the current product form for now so historical baselines are
+    # preserved.
+    #
+    # TODO: refine into separate within-attention-domain and cross-attention-
+    # domain fractions so cross-rack centralized pools (full_expert_set spans
+    # scale-out fabric) attribute the right volume to EP_SU vs. EP_SO.
+    # Current product form double-counts locality when both factors are > 1
+    # and under-counts the SO leg when only the cross-domain share is remote.
+    routing_buckets_per_set = max(
         1, attn_domains_per_full_expert_set * max(1, num_colocated_groups_per_set)
     )
-    remote_fraction = max(0.0, 1.0 - (1.0 / float(source_partitions)))
+    routing_nonlocal_fraction = max(0.0, 1.0 - (1.0 / float(routing_buckets_per_set)))
     # Model routed exchange at expert-group granularity, then map to per-XPU payload
     # by dividing across TP ranks inside the group.
     tokens_per_group = (
         tokens_per_set
         * routed_expert_traffic_multiplier
-        * remote_fraction
+        * routing_nonlocal_fraction
         / max(1, num_colocated_groups_per_set)
     )
     # EP A2A toggle semantics:
@@ -777,22 +831,31 @@ def calculate_moe_comm_hierarchical_total_exchange(
     )
     tokens_per_xpu = tokens_per_group / max(1, xpus_per_colocated_group) * a2a_replication_factor
 
-    # Resolve this once so hierarchical and fused paths are based on the same EP interpretation.
-    # EP_SU is modeled as XPU-domain capacity for experts in the scale-up domain.
+    # Resolve this once so hierarchical and fused paths are based on the same EP
+    # interpretation. EP_SU is the scale-up XPU-domain capacity for experts.
     try:
-        high_bw_group_size_xpus = int(ep_topology_view.get_mapping_for_tag("EP_SU").size)
+        ep_su_domain_size_xpus = ep_topology_view.get_mapping_for_tag("EP_SU").size
     except Exception as e:
         raise ValueError(
-            "EP topology must include tag `EP_SU` to resolve high-bandwidth expert group size."
+            "EP topology must include tag `EP_SU` to resolve the scale-up " "expert domain size."
         ) from e
-    if high_bw_group_size_xpus <= 0:
-        raise ValueError(f"Invalid EP_SU size: {high_bw_group_size_xpus}. Expected > 0.")
+    if ep_su_domain_size_xpus <= 0:
+        raise ValueError(f"Invalid EP_SU size: {ep_su_domain_size_xpus}. Expected > 0.")
 
     moe_a2a_comm_mode = workload_spec.moe_a2a_comm_mode
     # Shard MoE A2A activation payload by TP_MoE_Y.
     # For 1D MoE TP this value is 1, so behavior is unchanged.
     tp_moe_y_shards = max(1, int(tp_moe_y_shards))
     bytes_per_token = (d_model * float_size) / tp_moe_y_shards
+
+    # Stage name in the layout trace.  Mirrors the TensorRecord stages
+    # emitted by `decode_layout_trace._trace_moe_stages`:
+    #   - decode_dispatch  (a2a_leg="dispatch")
+    #   - decode_combine_a2a (a2a_leg="combine")
+    # Prefill and single-attention-domain decode also pass through here; the
+    # records are still emitted (NULL_LAYOUT_TRACE is a no-op for callers that
+    # don't pass a real trace).
+    trace_stage = "decode_dispatch" if a2a_leg == "dispatch" else "decode_combine_a2a"
 
     if moe_a2a_comm_mode == MoEA2ACommMode.FUSED_ND:
         # Experimental path: model MoE exchange as a single fused N-D total-exchange on EP topology.
@@ -802,52 +865,97 @@ def calculate_moe_comm_hierarchical_total_exchange(
             P_total_send_bytes_per_node=payload_bytes_per_xpu,
             float_size_bytes=float_size,
         )
+        layout_trace.record_comm(
+            f"{trace_stage}_fused",
+            "A2A",
+            "EP_FUSED",
+            ep_total_xpus,
+            payload_bytes_per_xpu,
+            per_layer,
+            note=(
+                f"{a2a_leg} A2A fused over EP topology; "
+                f"tokens_per_xpu={tokens_per_xpu:.3g}, bytes/token={bytes_per_token:.3g}, "
+                f"routing_nonlocal_fraction={routing_nonlocal_fraction:.3f} "
+                f"(routing_buckets_per_set={routing_buckets_per_set} = "
+                f"attn_domains_per_full_expert_set={attn_domains_per_full_expert_set} * "
+                f"num_colocated_groups_per_set={num_colocated_groups_per_set})"
+            ),
+        )
     elif moe_a2a_comm_mode == MoEA2ACommMode.HIERARCHICAL_SPLIT:
-        # Original hierarchical split path (intra high-bandwidth + inter low-bandwidth).
-        # Ensure HB group size does not exceed the set footprint
-        if high_bw_group_size_xpus > full_expert_set_xpu_count:
-            high_bw_group_size_xpus = full_expert_set_xpu_count
-        frac_local = min(1.0, high_bw_group_size_xpus / max(1, full_expert_set_xpu_count))
-        frac_remote = max(0.0, 1.0 - frac_local)
+        # Hierarchical split: scale-up (EP_SU) carries the in-domain share,
+        # scale-out (second-fastest EP tag, typically EP_SO) carries the
+        # cross-rack share when the expert set spills out of one SU domain.
+        # Clamp SU size to the set footprint so frac_local <= 1.
+        if ep_su_domain_size_xpus > full_expert_set_xpu_count:
+            ep_su_domain_size_xpus = full_expert_set_xpu_count
+        su_fabric_fraction = min(1.0, ep_su_domain_size_xpus / max(1, full_expert_set_xpu_count))
+        so_fabric_fraction = max(0.0, 1.0 - su_fabric_fraction)
 
-        P_intra_bytes_per_xpu = tokens_per_xpu * frac_local * bytes_per_token
-        P_inter_bytes_per_xpu = tokens_per_xpu * frac_remote * bytes_per_token
+        su_fabric_bytes_per_xpu = tokens_per_xpu * su_fabric_fraction * bytes_per_token
+        so_fabric_bytes_per_xpu = tokens_per_xpu * so_fabric_fraction * bytes_per_token
 
-        comm_stats_intra_per_layer = CommStats()
-        comm_stats_inter_per_layer = CommStats()
+        su_fabric_stats_per_layer = CommStats()
+        so_fabric_stats_per_layer = CommStats()
         topology_view_speed_sorted_tags = ep_topology_view.get_tags_sorted_by_speed()
 
-        if high_bw_group_size_xpus > 1 and P_intra_bytes_per_xpu > 0:
-            fastest_tag = topology_view_speed_sorted_tags[0]
-            intra_view = ep_topology_view.original_topology_ref.create_virtual_view_from_tag(
-                view_name="EP_Intra_Virtual",
-                base_tag=fastest_tag,
-                virtual_size=high_bw_group_size_xpus,
+        if ep_su_domain_size_xpus > 1 and su_fabric_bytes_per_xpu > 0:
+            su_fabric_fastest_tag = topology_view_speed_sorted_tags[0]
+            su_fabric_view = ep_topology_view.original_topology_ref.create_virtual_view_from_tag(
+                view_name="EP_SU_Fabric_Virtual",
+                base_tag=su_fabric_fastest_tag,
+                virtual_size=ep_su_domain_size_xpus,
                 global_sharing_context="max_exclusive",
             )
-            comm_stats_intra_per_layer = hockney_model_total_exchange_on_nd_topology(
-                intra_view,
-                P_total_send_bytes_per_node=P_intra_bytes_per_xpu,
+            su_fabric_stats_per_layer = hockney_model_total_exchange_on_nd_topology(
+                su_fabric_view,
+                P_total_send_bytes_per_node=su_fabric_bytes_per_xpu,
                 float_size_bytes=float_size,
             )
+            layout_trace.record_comm(
+                f"{trace_stage}_intra",
+                "A2A",
+                f"{su_fabric_fastest_tag}({ep_su_domain_size_xpus})",
+                ep_su_domain_size_xpus,
+                su_fabric_bytes_per_xpu,
+                su_fabric_stats_per_layer,
+                note=(
+                    f"{a2a_leg} A2A on EP_SU (scale-up, intra-rack); "
+                    f"su_fabric_fraction={su_fabric_fraction:.3f}, "
+                    f"bytes/token={bytes_per_token:.3g}"
+                ),
+            )
 
-        inter_size = max(0, full_expert_set_xpu_count - high_bw_group_size_xpus)
-        if inter_size > 1 and P_inter_bytes_per_xpu > 0:
+        so_fabric_participant_xpus = max(0, full_expert_set_xpu_count - ep_su_domain_size_xpus)
+        if so_fabric_participant_xpus > 1 and so_fabric_bytes_per_xpu > 0:
             tag_index = 1 if len(topology_view_speed_sorted_tags) > 1 else 0
-            inter_tag = topology_view_speed_sorted_tags[tag_index]
-            inter_view = ep_topology_view.original_topology_ref.create_virtual_view_from_tag(
-                view_name="EP_Inter_Virtual",
-                base_tag=inter_tag,
-                virtual_size=inter_size,
+            so_fabric_tag = topology_view_speed_sorted_tags[tag_index]
+            so_fabric_view = ep_topology_view.original_topology_ref.create_virtual_view_from_tag(
+                view_name="EP_SO_Fabric_Virtual",
+                base_tag=so_fabric_tag,
+                virtual_size=so_fabric_participant_xpus,
                 global_sharing_context="max_exclusive",
             )
-            comm_stats_inter_per_layer = hockney_model_total_exchange_on_nd_topology(
-                inter_view,
-                P_total_send_bytes_per_node=P_inter_bytes_per_xpu,
+            so_fabric_stats_per_layer = hockney_model_total_exchange_on_nd_topology(
+                so_fabric_view,
+                P_total_send_bytes_per_node=so_fabric_bytes_per_xpu,
                 float_size_bytes=float_size,
             )
+            layout_trace.record_comm(
+                f"{trace_stage}_inter",
+                "A2A",
+                f"{so_fabric_tag}({so_fabric_participant_xpus})",
+                so_fabric_participant_xpus,
+                so_fabric_bytes_per_xpu,
+                so_fabric_stats_per_layer,
+                note=(
+                    f"{a2a_leg} A2A on second-fastest EP tag (scale-out, "
+                    f"typically EP_SO; cross-rack); "
+                    f"so_fabric_fraction={so_fabric_fraction:.3f}, "
+                    f"bytes/token={bytes_per_token:.3g}"
+                ),
+            )
 
-        per_layer = comm_stats_intra_per_layer + comm_stats_inter_per_layer
+        per_layer = su_fabric_stats_per_layer + so_fabric_stats_per_layer
     else:
         raise ValueError(f"Unsupported moe_a2a_comm_mode: {moe_a2a_comm_mode}")
     return per_layer

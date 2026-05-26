@@ -285,11 +285,11 @@ def _verifier_tp1d_attn_tp_leq_num_heads(
     return tp <= num_heads
 
 
-def _verifier_decode_tp2d_qkv_groups_divides_proj_yz(
+def _verifier_projection_groups_divides_proj_yz(
     case: Case, base_specs: Mapping[str, BaseModel], params: Mapping[str, Any] | None = None
 ) -> bool:
     """
-    Verifier: for TP2D decode sweeps, ensure `workload_spec.decode_tp2d_qkv_groups` divides the
+    Verifier: for TP2D decode sweeps, ensure `workload_spec.projection_groups` divides the
     resolved TP2D projection YZ size (product of split_2d.yz_tags sizes on the logical topology).
 
     If the case does not describe TP2D decode with projection split tags, this returns True.
@@ -303,7 +303,7 @@ def _verifier_decode_tp2d_qkv_groups_divides_proj_yz(
     if ws is None or topo is None:
         return True
 
-    g = int(getattr(ws, "decode_tp2d_qkv_groups", 1) or 1)
+    g = int(getattr(ws, "projection_groups", 1) or 1)
     if g <= 1:
         return True
 
@@ -369,7 +369,7 @@ def _verifier_decode_sharded_router_proj_y_eff_matches_moe_y(
     if not proj_yz_tags:
         return True
 
-    g = int(getattr(ws, "decode_tp2d_qkv_groups", 1) or 1)
+    g = int(getattr(ws, "projection_groups", 1) or 1)
     if g <= 0:
         return False
 
@@ -459,7 +459,7 @@ def _verifier_decode_sharded_router_proj_y_eff_matches_moe_y_all_shapes(
     if not proj_yz_tags:
         return True
 
-    g = int(getattr(ws, "decode_tp2d_qkv_groups", 1) or 1)
+    g = int(getattr(ws, "projection_groups", 1) or 1)
     if g <= 0:
         return False
 
@@ -608,9 +608,9 @@ def _verifier_decode_nx1_router_compat(
     if "sharded_router" not in router_mode_val:
         return False
 
-    if not hasattr(ws, "decode_tp2d_qkv_groups"):
+    if not hasattr(ws, "projection_groups"):
         return False
-    g = getattr(ws, "decode_tp2d_qkv_groups")
+    g = getattr(ws, "projection_groups")
     if not isinstance(g, int) or g <= 0:
         return False
     if (attn_y % g) != 0:
@@ -621,8 +621,8 @@ def _verifier_decode_nx1_router_compat(
 
 
 # Extend allowlist
-ALLOWED_SWEEP_VERIFIERS["decode_tp2d_qkv_groups_divides_proj_yz"] = (
-    _verifier_decode_tp2d_qkv_groups_divides_proj_yz
+ALLOWED_SWEEP_VERIFIERS["projection_groups_divides_proj_yz"] = (
+    _verifier_projection_groups_divides_proj_yz
 )
 ALLOWED_SWEEP_VERIFIERS["decode_sharded_router_proj_y_eff_matches_moe_y"] = (
     _verifier_decode_sharded_router_proj_y_eff_matches_moe_y
