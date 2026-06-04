@@ -22,6 +22,16 @@ attn_domains_per_full_expert_set_label = "Attn_Domains_Per_Full_Expert_Set"
 num_complete_expert_sets_label = "Num_Complete_Expert_Sets"
 num_dp_ranks_per_expert_group_label = "Num_DP_Ranks_Per_Expert_Group"
 
+# Expert activation cardinality diagnostics (see workload_spec.ExpertWeightResidencyPolicy).
+# Emitted whenever the workload has experts (num_regular_experts > 0); active-subset
+# values are meaningful regardless of the configured policy — under RESIDENT_FULL_SET
+# they describe what active-subset accounting *would* have produced for the same workload.
+expert_imbalance_rho_label = "Expert_Imbalance_Rho"
+expert_weight_residency_policy_label = "Expert_Weight_Residency_Policy"
+expert_support_size_label = "Expert_Support_Size"
+expert_active_count_label = "Expert_Active_Count"
+active_expert_fraction_label = "Active_Expert_Fraction"
+
 optimizer_label = "Optmizer"
 seq_len_label = "Seq_Length"
 n_layers_label = "Num_Layers_Per_PP_Stage"

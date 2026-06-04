@@ -19,12 +19,63 @@ from scalescope.utils import PassMode
 from scalescope.workload_spec import (
     ActivationStorageOptimizationStrategy,
     DataParallelVariant,
+    ExpertWeightResidencyPolicy,
     InferenceDecodeSpec,
     MoERouterSyncMode,
     TensorParallelVariant,
     TrainSpec,
     WorkloadSpec,
 )
+
+
+def _expert_weight_residency_fraction(
+    *,
+    workload_spec: WorkloadSpec,
+    transformer_config: TransformerConfig,
+    tokens_per_set: float,
+) -> float:
+    """Return the multiplier applied to the resident-weight memory-traffic term.
+
+    Under ``RESIDENT_FULL_SET`` returns ``1.0`` (every colocated expert is
+    billed every step — today's behavior).
+
+    Under ``RESIDENT_ACTIVE_SUBSET`` returns
+    ``active_expert_fraction = E_active / num_colocated_experts``, derived from
+    ``(tokens_per_set, top_k, num_regular_experts, num_colocated_experts,
+    expert_imbalance)`` via ``ep_strategy.compute_expert_activation_cardinality``.
+    Scope is **expert weights only**; routed-token terms keep their current scaling.
+    """
+    # Local import to avoid a circular dependency between memory_model and ep_strategy.
+    from scalescope.ep_strategy import compute_expert_activation_cardinality
+
+    policy = workload_spec.moe_spec_v2.expert_weight_residency_policy
+    match policy:
+        case ExpertWeightResidencyPolicy.RESIDENT_FULL_SET:
+            return 1.0
+        case ExpertWeightResidencyPolicy.RESIDENT_ACTIVE_SUBSET:
+            # Attention-only models (no FFN: num_regular_experts == 0) or models with
+            # no routing (num_selected_experts == 0) have no "active subset" notion.
+            # The policy is moot and must not error — return 1.0 (no scaling), matching
+            # the guard in `run_scalescope._expert_activation_diagnostics`. A dense
+            # model (num_regular_experts == 1, num_selected_experts == 1) is NOT caught
+            # here: it flows through compute_expert_activation_cardinality, which yields
+            # active_expert_fraction == 1.0 (its single FFN is always fully resident).
+            if (
+                transformer_config.num_regular_experts <= 0
+                or transformer_config.num_selected_experts <= 0
+            ):
+                return 1.0
+            cardinality = compute_expert_activation_cardinality(
+                tokens_per_set=tokens_per_set,
+                num_selected_experts=transformer_config.num_selected_experts,
+                num_regular_experts=transformer_config.num_regular_experts,
+                num_colocated_experts=workload_spec.moe_spec_v2.num_colocated_experts,
+                expert_imbalance=workload_spec.moe_spec_v2.expert_imbalance,
+                routing_distribution=workload_spec.moe_spec_v2.expert_routing_distribution,
+            )
+            return cardinality.active_expert_fraction
+        case _:
+            raise ValueError(f"Unsupported expert_weight_residency_policy: {policy}")
 
 
 @dataclass
@@ -1027,9 +1078,24 @@ def _forward_pass_prefill_moe_ffn_tp_1d_memory_traffic(
 
     # Weights read
     # Colocated experts share the same XPU; scale weights read by the number of colocated experts hosted.
+    # Under RESIDENT_ACTIVE_SUBSET, this term is additionally scaled by
+    # active_expert_fraction to model tiny-batch selective expert activation
+    # (see workload_spec.ExpertWeightResidencyPolicy).
     num_colocated = moe_config.num_colocated_experts
+    tokens_per_set_for_residency = (
+        workload_spec.get_resolved_batches().batch_size_per_full_expert_set * n_seq
+    )
+    expert_weight_residency_fraction = _expert_weight_residency_fraction(
+        workload_spec=workload_spec,
+        transformer_config=transformer_config,
+        tokens_per_set=tokens_per_set_for_residency,
+    )
     total_w_bytes = (
-        num_colocated * transformer_config.expert_params_per_expert * float_size / moe_tp_size
+        num_colocated
+        * transformer_config.expert_params_per_expert
+        * float_size
+        / moe_tp_size
+        * expert_weight_residency_fraction
     )
     traffic.weights.bytes_read += total_w_bytes
 
@@ -1456,12 +1522,24 @@ def _forward_pass_prefill_moe_ffn_tp_2d_memory_traffic(
     # Each XPU hosts `num_colocated_experts` experts; in TP-2D each expert weight is sharded
     # by (X * YZ), so per-XPU weight volume scales as num_colocated_experts / (X * YZ).
     # This keeps parity with the TP-1D path and avoids undercounting when colocation increases.
+    # Under RESIDENT_ACTIVE_SUBSET, this term is additionally scaled by
+    # active_expert_fraction to model tiny-batch selective expert activation
+    # (see workload_spec.ExpertWeightResidencyPolicy).
     num_colocated = int(getattr(moe_config, "num_colocated_experts", 1) or 1)
+    tokens_per_set_for_residency = (
+        workload_spec.get_resolved_batches().batch_size_per_full_expert_set * n_seq
+    )
+    expert_weight_residency_fraction = _expert_weight_residency_fraction(
+        workload_spec=workload_spec,
+        transformer_config=transformer_config,
+        tokens_per_set=tokens_per_set_for_residency,
+    )
     total_w_bytes = (
         num_colocated
         * transformer_config.expert_params_per_expert
         * float_size
-        // (moe_tp_size_x * moe_tp_size_yz)
+        / (moe_tp_size_x * moe_tp_size_yz)
+        * expert_weight_residency_fraction
     )
     traffic.weights.bytes_read += total_w_bytes
 
@@ -1862,8 +1940,23 @@ def _backward_moe_tp_1d_memory_traffic(
 
     moe_tp_size = moe_tp_topology.num_chips if moe_tp_topology else 1
 
+    # Under RESIDENT_ACTIVE_SUBSET, the resident-weight read term is scaled by
+    # active_expert_fraction (model tiny-batch selective activation). Gradient
+    # writes match the read pattern — only experts that received tokens have
+    # gradients to materialize — so the same fraction is applied symmetrically.
     num_colocated = moe_config.num_colocated_experts
-    total_w = num_colocated * transformer_config.expert_params_per_expert * float_size / moe_tp_size
+    expert_weight_residency_fraction = _expert_weight_residency_fraction(
+        workload_spec=workload_spec,
+        transformer_config=transformer_config,
+        tokens_per_set=tokens_per_set,
+    )
+    total_w = (
+        num_colocated
+        * transformer_config.expert_params_per_expert
+        * float_size
+        / moe_tp_size
+        * expert_weight_residency_fraction
+    )
     traffic.weights.bytes_read += total_w
     traffic.gradients.bytes_written += total_w
     if not activation_checkpointing:
@@ -1917,21 +2010,31 @@ def _backward_moe_tp_2d_memory_traffic(
     if getattr(moe_config, "num_shared_experts_per_dp_rank", 0) > 0:
         raise NotImplementedError("Shared experts are not supported in 2D TP MoE backward traffic")
 
-    # Weights sharded across 2D TP (FFN only here).
-    # Per-expert FFN weight bytes scale with mlp_num_weight_matrices (2 for
-    # DENSE_2MATRIX, 3 for GATED_3MATRIX), routed via expert_params_per_expert.
-    total_w = (transformer_config.expert_params_per_expert * float_size) // (
-        moe_tp_size_x * moe_tp_size_yz
-    )
-    traffic.weights.bytes_read += total_w
-    traffic.gradients.bytes_written += total_w
-
     # Mirror 1D token-volume logic for routed experts, adapted to 2D sharding
     num_colocated = moe_config.num_colocated_experts
     total_num_routed_experts = transformer_config.num_regular_experts
 
     tokens_per_set = workload_spec.get_resolved_batches().batch_size_per_full_expert_set * n_seq
     traffic_mult = moe_config.regular_expert_traffic_multiplier
+
+    # Weights sharded across 2D TP (FFN only here).
+    # Per-expert FFN weight bytes scale with mlp_num_weight_matrices (2 for
+    # DENSE_2MATRIX, 3 for GATED_3MATRIX), routed via expert_params_per_expert.
+    # Under RESIDENT_ACTIVE_SUBSET, scale by active_expert_fraction symmetrically
+    # on read and gradient-write (gradients exist only for experts that fired).
+    expert_weight_residency_fraction = _expert_weight_residency_fraction(
+        workload_spec=workload_spec,
+        transformer_config=transformer_config,
+        tokens_per_set=tokens_per_set,
+    )
+    total_w = (
+        transformer_config.expert_params_per_expert
+        * float_size
+        / (moe_tp_size_x * moe_tp_size_yz)
+        * expert_weight_residency_fraction
+    )
+    traffic.weights.bytes_read += total_w
+    traffic.gradients.bytes_written += total_w
 
     if not activation_checkpointing:
         if total_num_routed_experts > 0:

@@ -15,7 +15,12 @@ from scalescope.network_topology_model import (
     hockney_model_total_exchange_on_nd_topology,
 )
 from scalescope.stats import CommStats
-from scalescope.workload_spec import MoEA2ACommMode, MoERouterSyncMode, MoESpecV2
+from scalescope.workload_spec import (
+    ExpertRoutingDistribution,
+    MoEA2ACommMode,
+    MoERouterSyncMode,
+    MoESpecV2,
+)
 
 
 @dataclass
@@ -106,6 +111,305 @@ def _resolve_attn_expert_size_ratio(
             f"attention TP domain is larger than the expert set."
         )
     return 1, attn_tp_size // full_expert_set_xpu_count
+
+
+@dataclass(frozen=True)
+class ExpertActivationCardinality:
+    """Per-step expected active-expert cardinality under top-k routing.
+
+    Computed under the sole ``bottleneck_group_collector`` model (worst-loaded
+    colocated group = the ``c`` hottest experts of the global Zipf(rho)).
+
+    Fields:
+    - e_support: full expert-set size ``E`` (``num_regular_experts``). The
+      distribution has full support.
+    - e_active: expected count of distinct experts touched on the worst-loaded
+      colocated group this step (the ``c`` hottest experts; collector's-problem
+      expectation ``max(1, sum_{k=1..c} (1 - (1 - p_k)^m))``).
+    - active_expert_fraction: ``e_active / num_colocated_experts`` (i.e.
+      ``e_active / c``) in ``[0, 1]``. The multiplier applied to resident-weight
+      memory-traffic terms under ``RESIDENT_ACTIVE_SUBSET``; dividing by ``c``
+      (the chip's resident set, not the full expert set) exposes the per-shard
+      weight read.
+    """
+
+    e_support: float
+    e_active: float
+    active_expert_fraction: float
+
+
+def validate_expert_imbalance_realizability(
+    *,
+    expert_imbalance: float,
+    num_regular_experts: int,
+    num_selected_experts: int,
+) -> None:
+    """Fail fast if ``expert_imbalance`` is outside the top-k realizable range.
+
+    This bound is purely combinatorial: it follows from top-k routing alone and
+    is independent of the routing-load distribution (Zipf or otherwise). The
+    distribution shape only matters later, when we turn ``rho`` into an active-
+    expert count; here we just reject a ``rho`` that no top-k assignment can
+    produce.
+
+    Definitions. With ``E = num_regular_experts``, ``k = num_selected_experts``,
+    and ``T`` tokens each routing to ``k`` *distinct* experts, let ``p_i`` be
+    expert ``i``'s **share** of all routing assignments (so ``sum_i p_i = 1``).
+    The mean share is ``1/E``, and ``rho = p_max / (1/E) = p_max * E`` is the
+    max-to-mean ratio.
+
+    Upper bound. The total number of assignments is ``T * k``. Because a token's
+    ``k`` experts are distinct, any single expert receives at most one slot per
+    token, i.e. at most ``T`` assignments, so its share obeys
+    ``p_i <= T / (T * k) = 1/k``. Substituting ``p_max <= 1/k`` into
+    ``rho = p_max * E`` gives ``rho <= E / k = num_regular_experts /
+    num_selected_experts``.
+
+    Lower bound. The max share is always at least the mean, so ``rho >= 1``
+    (``rho == 1`` is perfectly balanced routing).
+
+    Realizable range: ``rho in [1, num_regular_experts / num_selected_experts]``.
+    Example: ``E=8, k=2`` gives ``[1, 4]`` — even if every token picked the same
+    two experts, each would take ``T`` of the ``2T`` slots (share ``1/2``,
+    ``rho = 4``); you cannot do worse because a token cannot spend both slots on
+    one expert.
+
+    Dense models are represented as a single routed expert
+    (``num_regular_experts == num_selected_experts == 1``) and ARE checked: the
+    range collapses to ``rho == 1`` (a single expert cannot be imbalanced). The
+    check is skipped only for attention-only models with no FFN/routing
+    (``num_regular_experts == 0`` or ``num_selected_experts == 0``).
+    """
+    if num_regular_experts <= 0 or num_selected_experts <= 0:
+        return
+    upper = num_regular_experts / num_selected_experts
+    if not (1.0 <= expert_imbalance <= upper):
+        raise ValueError(
+            f"expert_imbalance={expert_imbalance} is outside the top-k realizable range "
+            f"[1, num_regular_experts/num_selected_experts] = [1, {upper}] for "
+            f"E={num_regular_experts}, top_k={num_selected_experts}. Top-k routing with "
+            f"distinct experts per token bounds rho <= E/top_k."
+        )
+
+
+_ZIPF_EXPONENT_CACHE: dict[tuple[int, float], float] = {}
+
+
+def _solve_zipf_exponent(*, num_regular_experts: int, expert_imbalance: float) -> float:
+    """Solve for the Zipf exponent ``s`` such that ``E / H_{E,s} = rho``.
+
+    H_{E,s} = sum_{k=1..E} k^{-s} is the generalized harmonic number, and the
+    Zipf distribution sets ``p_k = k^{-s} / H_{E,s}``. The spec ties
+    ``rho = p_max * E = p_1 * E = E / H_{E,s}``, so given (E, rho) we recover
+    ``s`` by a monotone 1-D root find:
+
+      f(s) := H_{E,s} - E/rho      (strictly decreasing in s on s > 0;
+                                    f(0) = E - E/rho > 0 for rho > 1,
+                                    f(+inf) -> 1 - E/rho < 0)
+
+    At ``rho == 1`` the target H = E is hit only at ``s = 0`` (uniform);
+    we short-circuit to avoid log(1)/0 issues.
+
+    Returns the non-negative exponent ``s``.
+    """
+    if num_regular_experts <= 0:
+        raise ValueError(f"num_regular_experts must be > 0, got {num_regular_experts}")
+    if expert_imbalance < 1.0:
+        raise ValueError(f"expert_imbalance must be >= 1, got {expert_imbalance}")
+    cache_key = (int(num_regular_experts), float(expert_imbalance))
+    cached = _ZIPF_EXPONENT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    if num_regular_experts == 1:
+        _ZIPF_EXPONENT_CACHE[cache_key] = 0.0
+        return 0.0
+    target = num_regular_experts / expert_imbalance
+    if abs(target - num_regular_experts) <= 1e-12:
+        _ZIPF_EXPONENT_CACHE[cache_key] = 0.0
+        return 0.0
+
+    def h(s: float) -> float:
+        if s == 0.0:
+            return float(num_regular_experts)
+        total = 0.0
+        for k in range(1, num_regular_experts + 1):
+            total += k ** (-s)
+        return total
+
+    lo, hi = 0.0, 1.0
+    while h(hi) > target:
+        hi *= 2.0
+        if hi > 1e6:
+            raise RuntimeError(
+                f"Zipf exponent search failed to bracket rho={expert_imbalance}, "
+                f"E={num_regular_experts} (hi={hi}, H(hi)={h(hi)}, target={target})."
+            )
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if h(mid) > target:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < 1e-10:
+            break
+    s = 0.5 * (lo + hi)
+    _ZIPF_EXPONENT_CACHE[cache_key] = s
+    return s
+
+
+def _zipf_active_experts_top_c(
+    *,
+    num_regular_experts: int,
+    expert_imbalance: float,
+    num_colocated_experts: int,
+    m: float,
+) -> float:
+    """Expected distinct active experts on the worst-loaded colocated group.
+
+    Step time is set by the worst chip. We model that chip (worst case) as
+    hosting the ``c = num_colocated_experts`` hottest experts of the global
+    Zipf(rho) distribution. Expert ``k`` (k = 1..c) is active with probability
+    ``1 - (1 - p_k)^m`` under ``m`` independent routing draws, so
+
+        E_active_chip(m) = max(1, sum_{k=1..c} (1 - (1 - p_k)^m))
+
+    with ``p_k = k^{-s} / H_{E,s}`` and ``s`` solved from ``rho``. The floor of
+    1.0 (for m > 0) encodes that the realized worst chip always loads at least
+    its single hottest expert.
+
+    Asymptotes:
+      m -> 0  : 0
+      m -> oo : c  (every hosted expert eventually touched)
+      steep Zipf (outlier): bounded well below c (only the genuinely-hot
+                            experts contribute), so the chip reads ~1 shard.
+    """
+    if m <= 0:
+        return 0.0
+    s = _solve_zipf_exponent(
+        num_regular_experts=num_regular_experts, expert_imbalance=expert_imbalance
+    )
+    if s == 0.0:
+        # Uniform routing: each of the top-c experts is an i.i.d. collector draw.
+        per_expert_active = 1.0 - (1.0 - 1.0 / num_regular_experts) ** m
+        return max(1.0, num_colocated_experts * per_expert_active)
+    h_es = 0.0
+    for k in range(1, num_regular_experts + 1):
+        h_es += k ** (-s)
+    total = 0.0
+    for k in range(1, num_colocated_experts + 1):
+        p_k = (k ** (-s)) / h_es
+        total += 1.0 - (1.0 - p_k) ** m
+    return max(1.0, total)
+
+
+def compute_expert_activation_cardinality(
+    *,
+    tokens_per_set: float,
+    num_selected_experts: int,
+    num_regular_experts: int,
+    num_colocated_experts: int,
+    expert_imbalance: float,
+    routing_distribution: ExpertRoutingDistribution,
+) -> ExpertActivationCardinality:
+    """Compute the active-expert quantity used for the per-chip weight-read
+    multiplier under ``RESIDENT_ACTIVE_SUBSET``.
+
+      bottleneck_group_collector (per-chip worst-group distinct count, skew
+      aware, correct asymptote and correct c=1 behavior):
+          p_k       = k^{-s} / H_{E,s},  s solved from E / H_{E,s} = rho
+          E_active  = max(1, sum_{k=1..c} (1 - (1 - p_k)^m))  (worst chip = c
+                      hottest experts; floor = its single hottest always loads)
+          frac      = E_active / c
+
+    Why coupon collector. ``m = tokens_per_set * num_selected_experts`` is the
+    number of routing "draws" (token->expert assignments) that hit one full
+    expert set this step. The quantity we need is how many *distinct* experts
+    those ``m`` draws touch — which is exactly the coupon-collector (occupancy)
+    problem, generalized to *unequal* coupon probabilities. Expert ``k`` is
+    missed by one draw with probability ``1 - p_k``, missed by all ``m``
+    independent draws with probability ``(1 - p_k)^m``, and therefore hit at
+    least once with probability ``1 - (1 - p_k)^m``. Summing that hit
+    probability over the ``c`` hosted experts gives the expected number of
+    distinct experts collected, i.e. how many distinct weight shards the worst
+    chip must read this step. The skew sets how fast coupons saturate: under a
+    steep Zipf only the few hot coupons are ever collected (the chip reads ~1
+    shard no matter how large ``m`` gets), while under uniform routing enough
+    draws eventually collect all ``c`` (the textbook coupon-collector limit).
+
+      Step time is set by the worst-loaded chip, so this multiplier is the
+      physically-grounded choice. The memory model multiplies resident weight
+      by ``frac``; since ``frac = E_active / c`` this equals
+      ``E_active * (w / TP_MoE)``, exposing the per-shard read so 2D TP_MoE
+      (finer sharding) shrinks an outlier's bottleneck. At c=1 it returns 1.0
+      for any m > 0 (the chip's single expert must be loaded). At c=E it
+      becomes the full Zipf active count (within-chip skew preserved).
+
+    ``rho = expert_imbalance`` is the **raw** (un-damped) per-expert
+    max/mean routing-load ratio at single-expert placement (SC26 §II-D). The
+    bottleneck path uses raw ``rho`` because the top-c selection captures
+    worst-group concentration directly (no ``rho_eff`` damping).
+
+    Returned fields:
+    - ``e_support``: effective support size of the distribution (``E``).
+    - ``e_active``: the worst-chip distinct-active-expert count.
+    - ``active_expert_fraction``: the multiplier to apply to resident-weight
+      memory traffic — ``e_active`` divided by ``c`` (the bottleneck
+      "denominator" is the chip's resident set, not the full expert set).
+
+    Defense-in-depth: validates ``expert_imbalance`` against the top-k
+    realizability bound before computing.
+    """
+    if num_regular_experts <= 0:
+        raise ValueError(
+            f"num_regular_experts must be > 0 to define active-expert cardinality, "
+            f"got {num_regular_experts}"
+        )
+    if num_selected_experts <= 0:
+        raise ValueError(f"num_selected_experts must be > 0, got {num_selected_experts}")
+    if num_colocated_experts <= 0:
+        raise ValueError(f"num_colocated_experts must be > 0, got {num_colocated_experts}")
+    if num_colocated_experts > num_regular_experts:
+        raise ValueError(
+            f"num_colocated_experts ({num_colocated_experts}) cannot exceed "
+            f"num_regular_experts ({num_regular_experts})"
+        )
+    if tokens_per_set < 0:
+        raise ValueError(f"tokens_per_set must be >= 0, got {tokens_per_set}")
+    validate_expert_imbalance_realizability(
+        expert_imbalance=expert_imbalance,
+        num_regular_experts=num_regular_experts,
+        num_selected_experts=num_selected_experts,
+    )
+
+    m = tokens_per_set * num_selected_experts
+
+    if routing_distribution == ExpertRoutingDistribution.BOTTLENECK_GROUP_COLLECTOR:
+        e_support = float(num_regular_experts)
+        if m <= 0:
+            e_active = 0.0
+            per_chip_frac = 0.0
+        else:
+            # Distinct active experts on the worst chip (the c hottest experts
+            # of the global Zipf(rho)). Dividing by c makes the memory model's
+            # `resident * frac` equal `e_active * (w / TP_MoE)`, exposing the
+            # per-shard weight read so finer sharding (2D TP_MoE) shrinks the
+            # outlier bottleneck.
+            e_active = _zipf_active_experts_top_c(
+                num_regular_experts=num_regular_experts,
+                expert_imbalance=expert_imbalance,
+                num_colocated_experts=num_colocated_experts,
+                m=m,
+            )
+            per_chip_frac = e_active / num_colocated_experts
+        active_expert_fraction = per_chip_frac
+    else:
+        raise ValueError(f"Unsupported routing_distribution: {routing_distribution}")
+
+    return ExpertActivationCardinality(
+        e_support=e_support,
+        e_active=e_active,
+        active_expert_fraction=active_expert_fraction,
+    )
 
 
 def damp_expert_imbalance(

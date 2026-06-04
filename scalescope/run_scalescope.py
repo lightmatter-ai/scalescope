@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from enum import Enum
 from hashlib import sha256
@@ -39,7 +40,11 @@ from scalescope.decode_layout_trace import (
     LayoutTrace,
     NULL_LAYOUT_TRACE,
 )
-from scalescope.ep_strategy import infer_expert_placement_per_xpu
+from scalescope.ep_strategy import (
+    compute_expert_activation_cardinality,
+    infer_expert_placement_per_xpu,
+    validate_expert_imbalance_realizability,
+)
 from scalescope.hardware_spec import HardwareRegistry
 from scalescope.memory_model import (
     _backward_attn_tp_1d_memory_traffic,
@@ -389,18 +394,22 @@ def _where_predicate_ok(row: dict, pred: dict) -> bool:
     return False
 
 
-def _write_summary_csv(*, run_dir: Path, manifest: dict, records: list[dict], report_spec) -> None:
-    """Write summary.csv for a sweep run directory if a report spec is present."""
+def _summary_row_from_record(record: dict, report_spec) -> dict:
+    """Extract the flat report columns for one structured record.
+
+    Lets callers build the small report row per record inside their iteration and
+    discard the (heavyweight) full structured record immediately, instead of
+    accumulating every record just to extract a handful of columns at the end.
+    """
+    return {col.name: _extract_by_path(record, col.path) for col in report_spec.columns}
+
+
+def _write_summary_csv(*, run_dir: Path, manifest: dict, rows: list[dict], report_spec) -> None:
+    """Write summary.csv from pre-extracted flat report rows (see
+    `_summary_row_from_record`). Each entry of ``rows`` already maps report
+    column name -> value; this only computes BEST markers and writes the CSV."""
     if report_spec is None:
         return
-
-    # Build flat rows by extracting requested columns from each record by path.
-    rows: list[dict] = []
-    for rec in records:
-        flat = {}
-        for col in report_spec.columns:
-            flat[col.name] = _extract_by_path(rec, col.path)
-        rows.append(flat)
 
     # Compute BEST markers (optional).
     best_col = "Best"
@@ -572,23 +581,37 @@ def main():
         git_sha = _git_head_sha(repo_root)
 
         runs_index = []
-        run_records = []
+        # Only the small flat report rows are retained across the whole sweep.
+        # Full structured records are heavyweight nested dicts; for large sweeps
+        # accumulating all of them (on top of the results DataFrame) exhausts RAM
+        # and thrashes swap, so we extract the report row per iteration and let
+        # each full record be garbage-collected immediately. Full records are
+        # only retained when we must write per-run YAML artifacts.
+        summary_rows: list[dict] = []
+        report_spec = sweep_cfg.report
+        num_runs = 0
         total_records = int(df.shape[0])
         if args.save_run_artifacts:
             print(f"Writing run artifacts: {total_records} files")
-            artifact_iter = tqdm(
-                df.iterrows(),
-                total=total_records,
-                desc="Artifact progress",
-                unit="run",
-                dynamic_ncols=True,
-                leave=False,
-            )
         else:
             print(
                 "Run artifacts disabled (use --save-run-artifacts to enable per-point YAML files)."
             )
-            artifact_iter = df.iterrows()
+        # Building structured records (`structure_run_results` per row) is a
+        # pure-Python per-row pass that is slow and previously silent for large
+        # sweeps (hundreds of thousands of rows). Always show a progress bar for
+        # this phase, regardless of whether per-point YAML artifacts are written.
+        artifact_iter = tqdm(
+            df.iterrows(),
+            total=total_records,
+            desc="Building records" if not args.save_run_artifacts else "Artifact progress",
+            unit="run",
+            dynamic_ncols=True,
+            # leave=True so close() paints the final, accurate frame
+            # (total/total) instead of clearing the last throttled refresh,
+            # which otherwise leaves a misleading sub-total count on screen.
+            leave=True,
+        )
 
         for step, (_, row) in enumerate(artifact_iter, start=1):
             record = structure_run_results(row, not args.raw_output)
@@ -596,7 +619,9 @@ def main():
             labels = record.get("labels") or {}
             run_id = _stable_run_id(sweep_case=sweep_case, labels=labels)
             record["run_id"] = run_id
-            run_records.append(record)
+            num_runs += 1
+            if report_spec is not None:
+                summary_rows.append(_summary_row_from_record(record, report_spec))
             if args.save_run_artifacts:
                 run_rel = Path("runs") / f"{run_id}.yaml"
                 run_path = run_dir / run_rel
@@ -611,8 +636,8 @@ def main():
                     }
                 )
 
-        if args.save_run_artifacts:
-            artifact_iter.close()
+        artifact_iter.refresh()
+        artifact_iter.close()
 
         manifest = {
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -635,14 +660,14 @@ def main():
                 "run_name": args.run_name,
                 "timestamped": (not args.no_timestamp),
             },
-            "num_runs": len(run_records),
+            "num_runs": num_runs,
             "num_run_artifacts": len(runs_index),
             "save_run_artifacts": bool(args.save_run_artifacts),
             "runs": runs_index if args.save_run_artifacts else [],
         }
         # Optional summary/reporting (driven by sweep config's `report:` section).
         _write_summary_csv(
-            run_dir=run_dir, manifest=manifest, records=run_records, report_spec=sweep_cfg.report
+            run_dir=run_dir, manifest=manifest, rows=summary_rows, report_spec=report_spec
         )
         with open(run_dir / "manifest.yaml", "w") as f:
             yaml.dump(manifest, f, indent=2, sort_keys=False, default_flow_style=False)
@@ -678,6 +703,49 @@ def main():
 
 
 _decode_trace_emitted: set[str] = set()
+
+
+def _expert_activation_diagnostics(
+    *,
+    workload_spec: WorkloadSpec,
+    model_spec: TransformerConfig,
+) -> dict:
+    """Build a dict of expert activation cardinality diagnostics for run output.
+
+    Always returns the configured policy and ``rho``. When the workload has
+    routed experts (``num_regular_experts > 0`` and ``num_selected_experts > 0``)
+    also returns ``(E_support, E_active, active_expert_fraction)`` computed at
+    ``tokens_per_set = batch_size_per_full_expert_set * seq_length`` so the
+    diagnostics describe the same per-step routing scope the memory model uses.
+
+    Diagnostics are computed regardless of which residency policy is in effect
+    — under ``RESIDENT_FULL_SET`` they describe what active-subset accounting
+    *would* produce for the same workload, which is useful for sweeping policy
+    decisions.
+    """
+    moe_v2 = workload_spec.moe_spec_v2
+    diagnostics = {
+        plotting.expert_imbalance_rho_label: moe_v2.expert_imbalance,
+        plotting.expert_weight_residency_policy_label: moe_v2.expert_weight_residency_policy.value,
+    }
+    if model_spec.num_regular_experts <= 0 or model_spec.num_selected_experts <= 0:
+        return diagnostics
+    tokens_per_set = (
+        workload_spec.get_resolved_batches().batch_size_per_full_expert_set
+        * workload_spec.seq_length
+    )
+    cardinality = compute_expert_activation_cardinality(
+        tokens_per_set=tokens_per_set,
+        num_selected_experts=model_spec.num_selected_experts,
+        num_regular_experts=model_spec.num_regular_experts,
+        num_colocated_experts=moe_v2.num_colocated_experts,
+        expert_imbalance=moe_v2.expert_imbalance,
+        routing_distribution=moe_v2.expert_routing_distribution,
+    )
+    diagnostics[plotting.expert_support_size_label] = cardinality.e_support
+    diagnostics[plotting.expert_active_count_label] = cardinality.e_active
+    diagnostics[plotting.active_expert_fraction_label] = cardinality.active_expert_fraction
+    return diagnostics
 
 
 def _resolve_decode_trace_params(
@@ -998,6 +1066,16 @@ def get_model_stats(
             _router_shard_factor = attn_tp_topology_view.num_chips
     else:
         raise ValueError(f"Unsupported router_sync_mode: {router_sync_mode}")
+
+    # Top-k realizability check (see conf26_followup/modeling_improvements_todo.md §6, Step 7):
+    # under top-k routing with distinct experts per token, rho is bounded by
+    # `num_regular_experts / num_selected_experts`. Fail fast here, before any
+    # compute/comm/memory work begins, with `model_spec` and `v2_spec` both resolved.
+    validate_expert_imbalance_realizability(
+        expert_imbalance=v2_spec.expert_imbalance,
+        num_regular_experts=model_spec.num_regular_experts,
+        num_selected_experts=model_spec.num_selected_experts,
+    )
 
     moe_config = infer_expert_placement_per_xpu(
         model_spec=model_spec,
@@ -2445,6 +2523,13 @@ def get_model_stats(
         plotting.num_experts_per_dp_rank_label: moe_config.num_all_experts_per_dp_rank,
         plotting.attn_domains_per_full_expert_set_label: moe_config.attn_domains_per_full_expert_set,
         plotting.num_complete_expert_sets_label: moe_config.num_complete_expert_sets,
+        # Expert activation cardinality diagnostics — see workload_spec.ExpertWeightResidencyPolicy
+        # and conf26_followup/modeling_improvements_todo.md §6 for definitions.
+        # Computed unconditionally so that switching policies produces auditable diffs.
+        **_expert_activation_diagnostics(
+            workload_spec=workload_spec,
+            model_spec=model_spec,
+        ),
         plotting.optimizer_label: getattr(workload_spec, "optimizer", "N/A"),
         plotting.float_size_label: workload_spec.float_size_bytes,
         plotting.mlp_ratio_label: model_spec.mlp_ratio,
@@ -2667,10 +2752,55 @@ def run_sweep(
     enable_decode_layout_trace: bool = True,
 ):
 
-    data = []
-    points = list(generate_cases(cfg=sweep_cfg, base_specs=base_specs))
+    # Records are assembled in flight: completed rows are flushed from a dict
+    # buffer into compact columnar chunks every RECORD_CHUNK_SIZE points and the
+    # raw dicts are freed, so we never hold the full list-of-dicts (the dominant
+    # memory peak for large sweeps) alongside the final DataFrame. Chunks are
+    # concatenated once at the end.
+    RECORD_CHUNK_SIZE = 20_000
+    record_frames: list[pd.DataFrame] = []
+    record_buffer: list[dict] = []
+    first_record_keys: list[str] = []
+
+    def _flush_record_buffer() -> None:
+        if record_buffer:
+            record_frames.append(pd.DataFrame.from_records(record_buffer))
+            record_buffer.clear()
+
+    # Expansion runs every verifier on every cartesian combo before the first
+    # point is yielded; for large 2D grids this is a long, silent phase, so we
+    # label it and report how long it took once the point count is known.
+    print(
+        "\nExpanding sweep grid (running verifiers over all combos; "
+        "large 2D grids can take a while)...",
+        flush=True,
+    )
+    expand_start = time.perf_counter()
+    # The expansion is eager (every candidate combo is verified before the
+    # first point is yielded), so a determinate bar is impossible — the total
+    # combo count is unknown until it finishes. We surface a live count of
+    # verified candidate combos via a callback instead.
+    expand_bar = tqdm(
+        desc="Expanding grid",
+        unit="combo",
+        dynamic_ncols=True,
+        leave=False,
+    )
+    points = list(
+        generate_cases(
+            cfg=sweep_cfg,
+            base_specs=base_specs,
+            progress_callback=lambda: expand_bar.update(1),
+        )
+    )
+    combos_evaluated = expand_bar.n
+    expand_bar.close()
     total_points = len(points)
-    print(f"\nSweep points to evaluate: {total_points}")
+    print(
+        f"Sweep points to evaluate: {total_points} "
+        f"(evaluated {combos_evaluated} candidate combos in "
+        f"{time.perf_counter() - expand_start:.1f}s)"
+    )
     if total_points == 0:
         raise ValueError("Sweep expanded to zero points; check sweep filters/verifiers.")
 
@@ -2722,7 +2852,11 @@ def run_sweep(
             for lk, lv in pt.labels.items():
                 stats[f"label.{lk}"] = lv
 
-            data.append(stats)
+            if not first_record_keys and isinstance(stats, dict):
+                first_record_keys = list(stats.keys())
+            record_buffer.append(stats)
+            if len(record_buffer) >= RECORD_CHUNK_SIZE:
+                _flush_record_buffer()
         except Exception as e:
             print(f"Error in sweep iteration {i}: {e}")
             sweep_iter.close()
@@ -2731,7 +2865,22 @@ def run_sweep(
 
     sweep_iter.close()
 
-    df = pd.DataFrame.from_records(data)
+    _flush_record_buffer()
+    if not record_frames:
+        raise ValueError("Sweep produced zero result records.")
+    print(
+        f"Assembling results dataframe ({total_points} rows, " f"{len(record_frames)} chunk(s))...",
+        flush=True,
+    )
+    assemble_start = time.perf_counter()
+    df = (
+        record_frames[0] if len(record_frames) == 1 else pd.concat(record_frames, ignore_index=True)
+    )
+    # Drop chunk references to free memory, but keep `record_frames` bound: it is
+    # captured by the `_flush_record_buffer` closure, and `del` would make that
+    # free variable undefined.
+    record_frames.clear()
+    print(f"Dataframe assembled in {time.perf_counter() - assemble_start:.1f}s")
     # TODO(MB) we need to add all-reduce flops here as well
     required = [
         plotting.compute_time_forward_pass_label,
@@ -2743,7 +2892,7 @@ def run_sweep(
     ]
     missing = [c for c in required if c not in df.columns]
     if missing:
-        sample_keys = list(data[0].keys())[:30] if data and isinstance(data[0], dict) else []
+        sample_keys = first_record_keys[:30]
         raise KeyError(
             "Sweep results are missing required flat columns needed for derived metrics. "
             f"Missing={missing}. Sample keys (first record)={sample_keys}"
@@ -2755,11 +2904,22 @@ def run_sweep(
     comm_time = (
         df[plotting.comm_time_forward_pass_label] + df[plotting.comm_time_backward_pass_label]
     )
-    df[plotting.compute_time_label] = compute_time
-    df[plotting.memory_time_label] = mem_time
-    df[plotting.comm_time_label] = comm_time
-    df[plotting.comm_compute_ratio_label] = comm_time / compute_time
-    df[plotting.memory_compute_ratio_label] = mem_time / compute_time
+    # Join all derived columns at once via concat(axis=1). The assembled frame
+    # has many columns (>100 blocks), so per-column inserts (incl. df.assign,
+    # which sets columns one at a time) trip pandas' "highly fragmented"
+    # PerformanceWarning. concat(axis=1) never calls insert and returns a
+    # consolidated (de-fragmented) frame.
+    derived = pd.DataFrame(
+        {
+            plotting.compute_time_label: compute_time,
+            plotting.memory_time_label: mem_time,
+            plotting.comm_time_label: comm_time,
+            plotting.comm_compute_ratio_label: comm_time / compute_time,
+            plotting.memory_compute_ratio_label: mem_time / compute_time,
+        },
+        index=df.index,
+    )
+    df = pd.concat([df, derived], axis=1)
     return df
 
 
@@ -2773,12 +2933,22 @@ def build_results_df(
         pass_mode=pass_mode,
         enable_decode_layout_trace=enable_decode_layout_trace,
     )
-    df["Comm_Ineff"] = np.where(df["Comm_Compute_Ratio"] > 1.0, 1, 0.1)
-    df["Comp_Util"] = np.where(df["Comm_Compute_Ratio"] > 1.0, 1.0 / df["Comm_Compute_Ratio"], 1)
-    df["Comp_Comm_Ratio"] = 1.0 / df["Comm_Compute_Ratio"]
-    df["Num_Tokens_Per_Batch_Per_TP_Group"] = (
-        df[plotting.seq_len_label] * df[plotting.batch_size_per_dp_label]
+    # Join all derived columns at once via concat(axis=1); avoids the per-insert
+    # "DataFrame is highly fragmented" PerformanceWarning and returns a
+    # consolidated frame (see run_sweep for details).
+    comm_compute_ratio = df["Comm_Compute_Ratio"]
+    derived = pd.DataFrame(
+        {
+            "Comm_Ineff": np.where(comm_compute_ratio > 1.0, 1, 0.1),
+            "Comp_Util": np.where(comm_compute_ratio > 1.0, 1.0 / comm_compute_ratio, 1),
+            "Comp_Comm_Ratio": 1.0 / comm_compute_ratio,
+            "Num_Tokens_Per_Batch_Per_TP_Group": (
+                df[plotting.seq_len_label] * df[plotting.batch_size_per_dp_label]
+            ),
+        },
+        index=df.index,
     )
+    df = pd.concat([df, derived], axis=1)
     return df
 
 

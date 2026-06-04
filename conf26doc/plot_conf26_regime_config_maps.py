@@ -17,12 +17,21 @@ from matplotlib.patches import FancyBboxPatch
 
 # Locked paper palette (Figure 4 and companion regime maps).
 # Keep this mapping stable for artifact reproducibility.
+#
+# Color logic: the `NxY` shape determines hue family.
+#   - Pure-Y shapes (`1xY`):     blues, lighter as Y shrinks.
+#   - High-Y mixed (`NxY` Y≥64): blue→purple, deeper as X grows
+#                                (1x128 deep teal-blue → 8x128 blue-purple →
+#                                 16x128 muted purple → 32x128 dark purple).
+#   - Mid-Y mixed (`NxY` Y=32):  muted blue-grays.
+#   - Tiny-Y (`1x4`, `1x1`):     warm earth tones.
 PAPER_SHAPE_COLORS: dict[str, str] = {
     "1x128": "#2C6A8F",
     "1x64": "#4A8DB8",
     "1x32": "#7CB8DA",
     "4x32": "#A3BECC",
     "8x32": "#9BC4D8",
+    "8x128": "#6E84B5",
     "16x8": "#A3BECC",
     "16x128": "#9B7EB6",
     "32x128": "#7A5C98",
@@ -35,6 +44,7 @@ PAPER_TEXT_COLORS: dict[str, str] = {
     "1x32": "#1A3A4A",
     "4x32": "#1A3A4A",
     "8x32": "#1A3A4A",
+    "8x128": "#FFFFFF",
     "16x8": "#1A3A4A",
     "16x128": "#FFFFFF",
     "32x128": "#FFFFFF",

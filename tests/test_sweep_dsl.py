@@ -1,11 +1,54 @@
 from pydantic import BaseModel, ConfigDict
 
+import scalescope.sweep_dsl as dsl
 from scalescope.sweep_dsl import generate_cases, SweepConfig
 
 
 class _Dummy(BaseModel):
     model_config = ConfigDict(frozen=True)
     x: int = 0
+
+
+def test_custom_verifier_receives_applied_specs(tmp_path):
+    # Verifier contract: verify_case materializes the case once and passes it
+    # via the required keyword-only `applied_specs`. A custom verifier reads
+    # those specs directly instead of re-applying the case itself.
+    seen: list[int] = []
+
+    def _keep_even(case, base_specs, params=None, *, applied_specs):
+        assert applied_specs is not None
+        x = applied_specs["model_spec"].x
+        seen.append(x)
+        return x % 2 == 0
+
+    dsl.ALLOWED_SWEEP_VERIFIERS["_test_keep_even"] = _keep_even
+    try:
+        sweep_yaml = """
+leaves:
+  a:
+    paths: [model_spec.x]
+    cases: [[1], [2], [3], [4]]
+sweep:
+  cartesian:
+    - ref: a
+  where: ["_test_keep_even"]
+  on_fail: skip
+"""
+        p = tmp_path / "custom.yaml"
+        p.write_text(sweep_yaml)
+        cfg = SweepConfig.load_from_yaml(str(p))
+        base_specs = {
+            "model_spec": _Dummy(x=0),
+            "workload_spec": _Dummy(x=0),
+            "logical_topology": _Dummy(x=0),
+            "physical_topology": _Dummy(x=0),
+        }
+        cases = list(generate_cases(cfg=cfg, base_specs=base_specs))
+        kept = sorted(c.case["model_spec.x"] for c in cases)
+        assert kept == [2, 4]
+        assert sorted(seen) == [1, 2, 3, 4]
+    finally:
+        dsl.ALLOWED_SWEEP_VERIFIERS.pop("_test_keep_even", None)
 
 
 def test_cartesian_and_collision_and_zip_strict_default(tmp_path):

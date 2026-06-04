@@ -152,7 +152,10 @@ def _set_nested_attr_pydantic(obj: BaseModel, attr_path: str, value: Any) -> Bas
 
 
 Case = Dict[str, Any]  # mapping full_path -> value
-VerifierFn = Callable[[Case, Mapping[str, BaseModel], Mapping[str, Any] | None], bool]
+# Verifiers must accept (case, base_specs, params, *, applied_specs): `verify_case`
+# materializes the specs for a case once and passes them via `applied_specs` so
+# verifiers never re-clone the base specs themselves (see `_resolve_specs`).
+VerifierFn = Callable[..., bool]
 Labels = Dict[str, Any]  # scalar-only values (enforced on leaf parse)
 
 
@@ -162,15 +165,47 @@ class SweepPoint:
     labels: Labels
 
 
-def _verifier_pydantic_valid(
-    case: Case, base_specs: Mapping[str, BaseModel], params: Mapping[str, Any] | None = None
-) -> bool:
-    """Verifier: returns True iff the case can be applied to the base_specs without validation error."""
+# Sentinel meaning "the case was applied for this candidate and application
+# FAILED" — distinct from `None` ("not pre-applied; apply yourself"). This lets
+# `verify_case` apply each case exactly once and share the result across all of
+# a node's verifiers instead of every verifier re-cloning the base specs.
+_APPLY_FAILED: Any = object()
+
+
+def _resolve_specs(
+    case: Case,
+    base_specs: Mapping[str, BaseModel],
+    applied_specs: Any,
+) -> Dict[str, BaseModel] | None:
+    """Return materialized specs for ``case``, or ``None`` if application fails.
+
+    - ``applied_specs is None``  → not pre-applied; apply here (standalone call).
+    - ``applied_specs is _APPLY_FAILED`` → pre-application failed → ``None``.
+    - otherwise → reuse the pre-applied specs (the fast path during sweeps).
+
+    Reusing the pre-applied specs is exact: within one ``verify_case`` call every
+    verifier sees the same ``case``, so the materialized specs are identical to
+    what each verifier would compute on its own. Verifiers only read from specs.
+    """
+    if applied_specs is _APPLY_FAILED:
+        return None
+    if applied_specs is not None:
+        return applied_specs
     try:
-        _apply_case_to_specs(case, base_specs)
-        return True
+        return apply_case_to_specs(case, base_specs=base_specs)
     except Exception:
-        return False
+        return None
+
+
+def _verifier_pydantic_valid(
+    case: Case,
+    base_specs: Mapping[str, BaseModel],
+    params: Mapping[str, Any] | None = None,
+    *,
+    applied_specs: Any = None,
+) -> bool:
+    """Verifier: returns True iff the case applies to base_specs without error."""
+    return _resolve_specs(case, base_specs, applied_specs) is not None
 
 
 # ---- Generators (no numpy dependency; keep minimal and deterministic) ----
@@ -248,16 +283,19 @@ ALLOWED_SWEEP_VERIFIERS: Dict[str, VerifierFn] = {
 
 
 def _verifier_tp1d_attn_tp_leq_num_heads(
-    case: Case, base_specs: Mapping[str, BaseModel], params: Mapping[str, Any] | None = None
+    case: Case,
+    base_specs: Mapping[str, BaseModel],
+    params: Mapping[str, Any] | None = None,
+    *,
+    applied_specs: Any = None,
 ) -> bool:
     """Verifier: for TP1D attention, ensure the TP group does not exceed num_heads.
 
     Rationale: in 1D weight-stationary attention, sharding is fundamentally along attention heads.
     You cannot shard more ways than there are (query) heads without introducing duplication.
     """
-    try:
-        specs = _apply_case_to_specs(case, base_specs)
-    except Exception:
+    specs = _resolve_specs(case, base_specs, applied_specs)
+    if specs is None:
         return False
     ws = specs.get("workload_spec")
     topo = specs.get("logical_topology")
@@ -286,7 +324,11 @@ def _verifier_tp1d_attn_tp_leq_num_heads(
 
 
 def _verifier_projection_groups_divides_proj_yz(
-    case: Case, base_specs: Mapping[str, BaseModel], params: Mapping[str, Any] | None = None
+    case: Case,
+    base_specs: Mapping[str, BaseModel],
+    params: Mapping[str, Any] | None = None,
+    *,
+    applied_specs: Any = None,
 ) -> bool:
     """
     Verifier: for TP2D decode sweeps, ensure `workload_spec.projection_groups` divides the
@@ -294,9 +336,8 @@ def _verifier_projection_groups_divides_proj_yz(
 
     If the case does not describe TP2D decode with projection split tags, this returns True.
     """
-    try:
-        specs = _apply_case_to_specs(case, base_specs)
-    except Exception:
+    specs = _resolve_specs(case, base_specs, applied_specs)
+    if specs is None:
         return False
     ws = specs.get("workload_spec")
     topo = specs.get("logical_topology")
@@ -327,7 +368,11 @@ def _verifier_projection_groups_divides_proj_yz(
 
 
 def _verifier_decode_sharded_router_proj_y_eff_matches_moe_y(
-    case: Case, base_specs: Mapping[str, BaseModel], params: Mapping[str, Any] | None = None
+    case: Case,
+    base_specs: Mapping[str, BaseModel],
+    params: Mapping[str, Any] | None = None,
+    *,
+    applied_specs: Any = None,
 ) -> bool:
     """
     Verifier (decode + sharded_router):
@@ -339,9 +384,8 @@ def _verifier_decode_sharded_router_proj_y_eff_matches_moe_y(
       depends directly on Y-group compatibility.
     - If not applicable (non-decode, replicated router, missing 2D splits), returns True.
     """
-    try:
-        specs = _apply_case_to_specs(case, base_specs)
-    except Exception:
+    specs = _resolve_specs(case, base_specs, applied_specs)
+    if specs is None:
         return False
 
     ws = specs.get("workload_spec")
@@ -418,7 +462,11 @@ def _verifier_decode_sharded_router_proj_y_eff_matches_moe_y(
 
 
 def _verifier_decode_sharded_router_proj_y_eff_matches_moe_y_all_shapes(
-    case: Case, base_specs: Mapping[str, BaseModel], params: Mapping[str, Any] | None = None
+    case: Case,
+    base_specs: Mapping[str, BaseModel],
+    params: Mapping[str, Any] | None = None,
+    *,
+    applied_specs: Any = None,
 ) -> bool:
     """
     Verifier (decode + sharded_router):
@@ -429,9 +477,8 @@ def _verifier_decode_sharded_router_proj_y_eff_matches_moe_y_all_shapes(
     - Enforced for all MoE TP shapes in sharded-router decode path.
     - If not applicable (non-decode, replicated router, missing 2D splits), returns True.
     """
-    try:
-        specs = _apply_case_to_specs(case, base_specs)
-    except Exception:
+    specs = _resolve_specs(case, base_specs, applied_specs)
+    if specs is None:
         return False
 
     ws = specs.get("workload_spec")
@@ -495,7 +542,11 @@ def _verifier_decode_sharded_router_proj_y_eff_matches_moe_y_all_shapes(
 
 
 def _verifier_decode_fc_flexible_tp_moe_compat(
-    case: Case, base_specs: Mapping[str, BaseModel], params: Mapping[str, Any] | None = None
+    case: Case,
+    base_specs: Mapping[str, BaseModel],
+    params: Mapping[str, Any] | None = None,
+    *,
+    applied_specs: Any = None,
 ) -> bool:
     """
     Verifier (decode, FC-independent-rack style):
@@ -505,9 +556,8 @@ def _verifier_decode_fc_flexible_tp_moe_compat(
 
     This is intentionally flexible (does not require attn == proj).
     """
-    try:
-        specs = _apply_case_to_specs(case, base_specs)
-    except Exception:
+    specs = _resolve_specs(case, base_specs, applied_specs)
+    if specs is None:
         return False
 
     ws = specs.get("workload_spec")
@@ -559,7 +609,11 @@ def _verifier_decode_fc_flexible_tp_moe_compat(
 
 
 def _verifier_decode_nx1_router_compat(
-    case: Case, base_specs: Mapping[str, BaseModel], params: Mapping[str, Any] | None = None
+    case: Case,
+    base_specs: Mapping[str, BaseModel],
+    params: Mapping[str, Any] | None = None,
+    *,
+    applied_specs: Any = None,
 ) -> bool:
     """
     Verifier (decode, Nx1 MoE TP):
@@ -568,9 +622,8 @@ def _verifier_decode_nx1_router_compat(
       * sharded_router only when Y_eff == 1.
     - Non-Nx1 cases pass through unchanged.
     """
-    try:
-        specs = _apply_case_to_specs(case, base_specs)
-    except Exception:
+    specs = _resolve_specs(case, base_specs, applied_specs)
+    if specs is None:
         return False
 
     ws = specs.get("workload_spec")
@@ -620,7 +673,50 @@ def _verifier_decode_nx1_router_compat(
     return y_eff == 1
 
 
+def _verifier_batch_divides_dp_attn(
+    case: Case,
+    base_specs: Mapping[str, BaseModel],
+    params: Mapping[str, Any] | None = None,
+    *,
+    applied_specs: Any = None,
+) -> bool:
+    """Reject cases where the global batch size is not divisible by the DP-Attn chip count.
+
+    The DP-Attn chip count is ``DP_Attn_SO * DP_Attn_SU``. Without this guard,
+    ``WorkloadSpec.infer_batch_size_per_dp`` raises a runtime ``ValueError``
+    when the sweep DSL tries to evaluate the case downstream.
+    """
+    specs = _resolve_specs(case, base_specs, applied_specs)
+    if specs is None:
+        return False
+
+    ws = specs.get("workload_spec")
+    topo = specs.get("logical_topology")
+    if ws is None or topo is None:
+        return True
+
+    gb = getattr(ws, "global_batch_size", None)
+    if not isinstance(gb, int) or gb <= 0:
+        return False
+
+    dp_chips = 1
+    for tag in ("DP_Attn_SO", "DP_Attn_SU"):
+        try:
+            dim = topo.get_mapping_for_tag(tag)
+        except Exception:
+            continue
+        size = int(dim.size)
+        if size <= 0:
+            return False
+        dp_chips *= size
+
+    if dp_chips <= 0:
+        return False
+    return gb % dp_chips == 0
+
+
 # Extend allowlist
+ALLOWED_SWEEP_VERIFIERS["batch_divides_dp_attn"] = _verifier_batch_divides_dp_attn
 ALLOWED_SWEEP_VERIFIERS["projection_groups_divides_proj_yz"] = (
     _verifier_projection_groups_divides_proj_yz
 )
@@ -964,9 +1060,18 @@ def _parse_node(obj: Any) -> NodeSpec:
 
 
 def generate_cases(
-    *, cfg: SweepConfig, base_specs: Mapping[str, BaseModel]
+    *,
+    cfg: SweepConfig,
+    base_specs: Mapping[str, BaseModel],
+    progress_callback: Callable[[], None] | None = None,
 ) -> Iterator[SweepPoint]:
-    """Yield sweep points (case dict + merged labels) after applying verifier filters."""
+    """Yield sweep points (case dict + merged labels) after applying verifier filters.
+
+    ``progress_callback`` (optional) is invoked once per candidate combo that
+    reaches a verifier step, so callers can render live expansion progress. The
+    expansion phase is eager (every combo is verified before the first point is
+    yielded), so this callback is the only way to surface progress during it.
+    """
     leaf_cache: dict[str, list[SweepPoint]] = {}
 
     def eval_leaf(name: str) -> list[SweepPoint]:
@@ -1009,8 +1114,18 @@ def generate_cases(
         return out
 
     def verify_case(case: Case, *, where: list[WhereVerifierSpec] | None, on_fail: str) -> bool:
+        if progress_callback is not None:
+            progress_callback()
         if not where:
             return True
+        # Apply the case to the base specs exactly once and share the result
+        # across all of this node's verifiers, instead of each verifier
+        # re-cloning all four base specs. `_APPLY_FAILED` records a failed
+        # application so verifiers reject the case (same as before).
+        try:
+            applied: Any = apply_case_to_specs(case, base_specs=base_specs)
+        except Exception:
+            applied = _APPLY_FAILED
         for vspec in where:
             vname = vspec.name
             fn = ALLOWED_SWEEP_VERIFIERS.get(vname)
@@ -1018,7 +1133,7 @@ def generate_cases(
                 raise SweepDSLError(
                     f"Unknown verifier '{vname}'. Allowed: {sorted(ALLOWED_SWEEP_VERIFIERS)}"
                 )
-            ok = bool(fn(case, base_specs, vspec.params))
+            ok = bool(fn(case, base_specs, vspec.params, applied_specs=applied))
             if not ok:
                 if on_fail == "error":
                     raise SweepDSLError(f"Verifier '{vname}' failed for case: {case}")
@@ -1093,7 +1208,7 @@ def generate_cases(
         yield pt
 
 
-def _apply_case_to_specs(case: Case, base_specs: Mapping[str, BaseModel]) -> Dict[str, BaseModel]:
+def apply_case_to_specs(case: Case, *, base_specs: Mapping[str, BaseModel]) -> Dict[str, BaseModel]:
     """Apply a case dict to base_specs and return a new specs dict (does not mutate base specs)."""
     current: Dict[str, BaseModel] = {k: v.model_copy() for k, v in base_specs.items()}
     for full_path, value in case.items():
@@ -1125,8 +1240,3 @@ def _apply_case_to_specs(case: Case, base_specs: Mapping[str, BaseModel]) -> Dic
         else:
             current[spec_key] = _set_nested_attr_pydantic(obj, attr_path, value)
     return current
-
-
-def apply_case_to_specs(case: Case, *, base_specs: Mapping[str, BaseModel]) -> Dict[str, BaseModel]:
-    """Public wrapper around _apply_case_to_specs."""
-    return _apply_case_to_specs(case, base_specs)

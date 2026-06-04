@@ -64,6 +64,64 @@ class MoEA2ACommMode(StrEnum):
     FUSED_ND = "fused_nd"
 
 
+class ExpertWeightResidencyPolicy(StrEnum):
+    """Policy for how MoE expert weights are accounted for in memory traffic.
+
+    Selects how the resident-weight read term in `memory_model.py` is billed.
+    Routed-token traffic (compute FLOPs, EP A2A volume, TP MoE collectives) is
+    already scaled by `rho_eff * top_k` via `regular_expert_traffic_multiplier`
+    and is unaffected by this policy.
+
+    Values:
+    - `resident_full_set`: every colocated expert weight is read every step
+      (today's behavior). Appropriate for training and high-concurrency decode.
+    - `resident_active_subset`: weight-read term is scaled by
+      `active_expert_fraction = E_active / num_colocated_experts`, modeling that
+      at small batch only a subset of the chip's experts is touched per step. See
+      `ep_strategy.compute_expert_activation_cardinality` for the formula.
+
+    Scope is intentionally *expert* weights only — attention QKV / output
+    projections, embeddings, and LM head weights are unaffected.
+    """
+
+    RESIDENT_FULL_SET = "resident_full_set"
+    RESIDENT_ACTIVE_SUBSET = "resident_active_subset"
+
+
+class ExpertRoutingDistribution(StrEnum):
+    """Shape of the per-expert routing probability distribution used to compute
+    the per-chip weight-read fraction under `RESIDENT_ACTIVE_SUBSET`.
+
+    The formula returns the **per-chip** weight-traffic multiplier (what
+    fraction of a chip's resident expert weights are read in the step).
+    Step time is set by the worst-loaded chip, not the average.
+
+    Values:
+    - `bottleneck_group_collector`: per-chip multiplier evaluated on the
+      worst-loaded colocated group, computed skew-aware over the global Zipf:
+          p_k      = k^{-s} / H_{E,s},  s solved from E / H_{E,s} = rho
+          E_active = max(1, sum_{k=1..c} (1 - (1 - p_k)^m))
+          frac     = E_active / c
+      where `c = num_colocated_experts`, `m = batch * top_k` is the per-set
+      routing-event count, and the worst chip is modeled (worst case) as
+      hosting the `c` hottest experts. Because the memory model reads
+      `resident * frac = c·(w/TP_MoE)·(E_active/c) = E_active·(w/TP_MoE)`, the
+      per-shard size `w/TP_MoE` is explicit: 2D TP_MoE (finer sharding) shrinks
+      an outlier expert's bottleneck while `E_active` stays ≈ 1. Correct
+      asymptote (→ 1 as `m → ∞`), correct `c = 1` semantics (always 1.0, the
+      chip's one expert must load if touched), and the `c = E` corner is the
+      full Zipf active count — within-chip skew is preserved (no collapse to
+      uniform). This is the physically-grounded choice for step-time modeling.
+
+      Modeling assumption: worst-case placement (the `c` hottest experts
+      colocated) is a deliberate upper bound on the realized worst chip; under
+      random placement the worst chip is "hottest expert + (c-1) average
+      experts," numerically close for steep Zipf.
+    """
+
+    BOTTLENECK_GROUP_COLLECTOR = "bottleneck_group_collector"
+
+
 # Pydantic Spec Classes
 
 
@@ -146,6 +204,28 @@ class MoESpecV2(BaseModel):
     model_config = ConfigDict(frozen=True)
     # Required
     expert_imbalance: float = Field(..., ge=1.0)
+    expert_weight_residency_policy: ExpertWeightResidencyPolicy = Field(
+        ...,
+        description=(
+            "How MoE expert-weight memory traffic is billed. "
+            "'resident_full_set' charges every colocated expert weight per step (training and "
+            "high-concurrency decode); 'resident_active_subset' scales the weight-read term by "
+            "the expected fraction of experts actually touched in the step "
+            "(modeling tiny-batch selective activation). Scope is expert weights only; attention, "
+            "embeddings, and LM-head weights are unaffected."
+        ),
+    )
+    expert_routing_distribution: ExpertRoutingDistribution = Field(
+        ...,
+        description=(
+            "Shape of the per-expert routing probability distribution used to compute "
+            "the expected fraction of experts active per step. "
+            "'bottleneck_group_collector' evaluates the worst-loaded colocated group "
+            "skew-aware over the global Zipf solved from rho (correct large-batch "
+            "asymptote and correct c=1 semantics). Only consulted when "
+            "expert_weight_residency_policy = resident_active_subset."
+        ),
+    )
     # Optional
     num_colocated_experts: int = Field(1, ge=1, description="Number of colocated experts")
     shared_expert_copies: Optional[int] = Field(
@@ -153,6 +233,13 @@ class MoESpecV2(BaseModel):
         ge=1,
         description="Replication factor per shared expert; if None, may be inferred later",
     )
+
+    _parse_expert_weight_residency_policy = field_validator(
+        "expert_weight_residency_policy", mode="before"
+    )(parse_enum_by_name_or_value(ExpertWeightResidencyPolicy))
+    _parse_expert_routing_distribution = field_validator(
+        "expert_routing_distribution", mode="before"
+    )(parse_enum_by_name_or_value(ExpertRoutingDistribution))
 
 
 class PipelineParallelSpec(BaseModel):
@@ -272,8 +359,7 @@ class WorkloadSpec(BaseModel):
     def infer_batch_size_per_dp(self, dp_attn_chips: int) -> int:
         """
         Returns per-DP batch size from global batch size and dp_attn_chips.
-        If no global batch size is defined, falls back to micro_batch_size * GA.
-        Enforces divisibility when global batch size is provided.
+        Enforces divisibility of the global batch by dp_attn_chips.
         """
         gb = self.global_batch_size
         if gb % dp_attn_chips != 0:
@@ -346,7 +432,7 @@ class WorkloadSpec(BaseModel):
             )
         return int(layers)
 
-    # ---- TP helpers (backward-compatible) ----
+    # ---- TP helpers ----
     def get_attn_tp_spec(self) -> TensorParallelSpecV2:
         """Return the attention TP spec (V2)."""
         return self.tp_attn_spec
@@ -359,11 +445,8 @@ class WorkloadSpec(BaseModel):
         """
         Return the projection TP spec (V2), falling back to the attention TP spec.
 
-        Rationale:
-        - If `tp_proj_spec` is omitted, we assume projections run on the same TP domain/variant
-          as attention (current behavior).
-        - If legacy `tp_spec.variant` is used, `get_attn_tp_spec()` already enforces that 2D TP
-          requires an explicit split.
+        If `tp_proj_spec` is omitted, projections run on the same TP domain/variant
+        as attention.
         """
         if self.tp_proj_spec is not None:
             return self.tp_proj_spec

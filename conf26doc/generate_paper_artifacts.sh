@@ -14,11 +14,36 @@ python3 -c "import scalescope" 2>/dev/null || {
 }
 #
 # Usage:
-#   bash conf26doc/generate_paper_artifacts.sh
+#   bash conf26doc/generate_paper_artifacts.sh            # reproduce submitted artifacts
+#   bash conf26doc/generate_paper_artifacts.sh --extended # also run the extended full-s sweep
 #
 # Notes:
 # - This script deletes out/conf26/build before generating outputs.
 # - Sweeps and paper artifacts are always regenerated from scratch.
+# - Default mode reproduces the *submitted* pipeline (single-set HyperX EP
+#   sweep) and runs the conf26 paper-regression tests against the hardcoded
+#   submitted values. --extended runs the additional HyperX full-s sweep and
+#   derives Table II / Figure 5 from the combined HyperX summary; the submitted
+#   paper-regression tests are intentionally skipped in that mode because the
+#   extended numbers differ from the submitted ones by design.
+
+EXTENDED=0
+for arg in "$@"; do
+  case "${arg}" in
+    --extended) EXTENDED=1 ;;
+    -h|--help)
+      echo "Usage: $0 [--extended]"
+      echo "  (default)    Reproduce the submitted paper artifacts and run regression tests."
+      echo "  --extended   Also run the HyperX full-s sweep; derive artifacts from the combined summary."
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: ${arg}" >&2
+      echo "Usage: $0 [--extended]" >&2
+      exit 2
+      ;;
+  esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -35,10 +60,23 @@ rm -rf "${PAPER_ARTIFACTS_DIR}"
 mkdir -p "${CONF26_BUILD_DIR}"
 
 # Always regenerate sweeps from scratch.
-bash "${REPO_ROOT}/conf26doc/run_conf26_sweeps.sh"
+if [[ "${EXTENDED}" -eq 1 ]]; then
+  echo "Running EXTENDED sweep set (includes HyperX full-s sweep)."
+  bash "${REPO_ROOT}/conf26doc/run_conf26_sweeps.sh" --extended
+else
+  echo "Running SUBMITTED sweep set (single-set HyperX EP sweep)."
+  bash "${REPO_ROOT}/conf26doc/run_conf26_sweeps.sh"
+fi
 
 # Required inputs (produced by publication sweep launcher).
-REQ_HYPERX="${CONF26_SWEEP_DIR}/generalized_ep_hyperx/summary.csv"
+# In submitted mode the HyperX summary is the single-set EP sweep. In extended
+# mode it is the union of that sweep and the FC-style full-s sweep
+# (s in {1,2,4,8,16,32}); see conf26doc/run_conf26_sweeps.sh.
+if [[ "${EXTENDED}" -eq 1 ]]; then
+  REQ_HYPERX="${CONF26_SWEEP_DIR}/generalized_ep_hyperx_combined.csv"
+else
+  REQ_HYPERX="${CONF26_SWEEP_DIR}/generalized_ep_hyperx/summary.csv"
+fi
 REQ_TORUS="${CONF26_SWEEP_DIR}/generalized_ep_torus3d/summary.csv"
 REQ_FC="${CONF26_SWEEP_DIR}/fc128x32_disagg_ep_baseline/summary.csv"
 
@@ -105,7 +143,13 @@ python3 "${REPO_ROOT}/conf26doc/verify_topology_claims.py" \
 python3 "${REPO_ROOT}/conf26doc/check_table2_speedups_consistency.py"
 
 # Run conf26 paper-regression tests against generated artifacts/data.
-pytest -q -m conf26_paper_regression
+# These assert the hardcoded *submitted* values, so only run them in the
+# default (submitted) mode; in extended mode the numbers differ by design.
+if [[ "${EXTENDED}" -eq 1 ]]; then
+  echo "Skipping conf26 paper-regression tests (extended mode: numbers differ from submitted)."
+else
+  pytest -q -m conf26_paper_regression
+fi
 
 cat > "${PAPER_ARTIFACTS_DIR}/README.txt" <<'EOF'
 Paper artifacts (current draft):

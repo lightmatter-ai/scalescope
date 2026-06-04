@@ -27,8 +27,9 @@ from pydantic import (
 class MlpKind(str, Enum):
     """MLP block topology.
 
-    Applied uniformly to dense FFN (when ``num_regular_experts == 0``) and
-    to every expert in an MoE configuration.
+    Applied uniformly to the dense FFN (modeled as a single expert,
+    ``num_regular_experts == 1``) and to every expert in an MoE configuration
+    (``num_regular_experts > 1``).
 
     Variants:
         DENSE_2MATRIX:
@@ -123,10 +124,20 @@ class TransformerConfig(BaseModel):
 
     # MoE Parameters (optional, default to dense)
     num_regular_experts: int = Field(
-        default=0, ge=0, description="Number of 'regular' experts per layer (0=dense)"
+        default=0,
+        ge=0,
+        description=(
+            "Number of 'regular' experts per layer. ScaleScope convention: "
+            "1=dense (single FFN), >1=MoE, 0=attention-only (no FFN compute)."
+        ),
     )
     num_selected_experts: int = Field(
-        default=0, ge=0, description="Number of experts selected per token (0=dense)"
+        default=0,
+        ge=0,
+        description=(
+            "Number of experts selected per token. 1 for dense, top-k for MoE, "
+            "0 for attention-only."
+        ),
     )
     num_shared_experts: int = Field(
         default=0, ge=0, description="Number of shared experts per layer"
