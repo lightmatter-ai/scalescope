@@ -10,6 +10,8 @@ micro_batch_size: 1
 prefill_seq_len: 1
 num_generated_tokens: 1
 seq_length: 1
+# Host kernel-launch floor not modeled
+kernel_launch_latency_per_layer_sec: 0.0
 
 decode_moe_router_sync_mode: replicated_router
 float_size_bytes: 1
@@ -62,7 +64,7 @@ dp_spec:
 moe_spec_v2:
   num_colocated_experts: 1024
   expert_imbalance: 1.0
-  expert_weight_residency_policy: resident_full_set  # TEMP: switched from resident_active_subset for experiments
+  expert_weight_residency_policy: resident_full_set
   expert_routing_distribution: bottleneck_group_collector
 
 pp_spec:

@@ -5,25 +5,34 @@ set -euo pipefail
 # Default output root:
 #   out/conf26/build/sweeps
 #
-# By default this reproduces the *submitted* sweep set: torus3d, a single
-# HyperX single-set EP sweep (generalized_ep_hyperx), and the FC baseline.
+# By default (--extended) this runs the FC-aligned set so HyperX can search the
+# same replicated-expert-set space the FC baseline is forced into (32 disconnected
+# racks => 32 complete expert sets). Four runs are produced:
+#   1. generalized_ep_torus3d          - 3D torus (16x16x16) single-set EP sweep.
+#   2. generalized_ep_hyperx           - HyperX single-set EP sweep (legacy /
+#                                        2D MoE-TP shapes).
+#   3. generalized_ep_hyperx_full_s    - HyperX DP-replicated expert sets at
+#                                        s in {1,2,4,8,16,32}, then merged with (2)
+#                                        into generalized_ep_hyperx_combined.csv.
+#   4. fc128x32_disagg_ep_baseline     - FC128x32 disaggregated baseline (32 sets).
 #
-# Pass --extended to additionally run the HyperX FC-style full-s sweep
-# (s in {1,2,4,8,16,32}) and build the combined HyperX summary
-# (generalized_ep_hyperx_combined.csv) used by the extended analysis.
+# Pass --submitted to reproduce the original submitted set: skips run (3) and the
+# combined HyperX summary, leaving HyperX at single-set EP only.
 
-EXTENDED=0
+EXTENDED=1
 for arg in "$@"; do
   case "${arg}" in
     --extended) EXTENDED=1 ;;
+    --submitted) EXTENDED=0 ;;
     -h|--help)
-      echo "Usage: $0 [--extended]"
-      echo "  --extended   Also run the HyperX full-s sweep and build the combined summary."
+      echo "Usage: $0 [--extended|--submitted]"
+      echo "  --extended   Run HyperX full-s sweep and build combined summary (default)."
+      echo "  --submitted  Reproduce original submitted set (skip full-s extension)."
       exit 0
       ;;
     *)
       echo "Unknown argument: ${arg}" >&2
-      echo "Usage: $0 [--extended]" >&2
+      echo "Usage: $0 [--extended|--submitted]" >&2
       exit 2
       ;;
   esac

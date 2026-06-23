@@ -65,7 +65,7 @@ if [[ "${EXTENDED}" -eq 1 ]]; then
   bash "${REPO_ROOT}/conf26doc/run_conf26_sweeps.sh" --extended
 else
   echo "Running SUBMITTED sweep set (single-set HyperX EP sweep)."
-  bash "${REPO_ROOT}/conf26doc/run_conf26_sweeps.sh"
+  bash "${REPO_ROOT}/conf26doc/run_conf26_sweeps.sh" --submitted
 fi
 
 # Required inputs (produced by publication sweep launcher).

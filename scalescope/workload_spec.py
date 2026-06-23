@@ -117,9 +117,42 @@ class ExpertRoutingDistribution(StrEnum):
       colocated) is a deliberate upper bound on the realized worst chip; under
       random placement the worst chip is "hottest expert + (c-1) average
       experts," numerically close for steep Zipf.
+
+    - `bottleneck_group_collector_random`: the expected (rather than worst-case)
+      straggler model. Under load-agnostic (random/hash) placement the worst-loaded
+      chip holds the single hottest expert (rank 1) plus `c-1` experts drawn
+      uniformly from the remaining `E-1`, so the fillers contribute the cold-tail
+      average rather than the next-hottest experts:
+          a_k      = 1 - (1 - p_k)^m              # P(expert k hit by >= 1 of m events)
+          E_active = a_1 + (c - 1) * mean_{k=2..E} a_k
+          frac     = E_active / c
+      Using the tail average `mean_{k=2..E} a_k` for the fillers (instead of the
+      next-hottest `a_2..a_c` of the worst-case model) makes `frac` strictly
+      smaller in the interior `1 < c < E`: the straggler reads fewer distinct
+      experts. The model is corner-exact against the worst-case bound:
+      `c = 1` → `a_1`; `c = E` → `sum_{k=1..E} a_k` (the full Zipf active count);
+      `rho = 1` → plain coupon collector. It carries the same `w/TP_MoE` shard
+      term, so 2D `TP_MoE` keeps shrinking an outlier expert's bottleneck
+      (`E_active → 1` for steep Zipf at small `m`).
+
+      No floor on `E_active` (the key difference from the worst-case model).
+      The worst-case variant takes `E_active = max(1, ...)`: it is an *upper
+      bound*, and a bound on the worst chip that is assumed to host the hottest
+      expert should never claim fewer than that one expert's weight read. This
+      model is instead an *expectation* over placements and routing, so a value
+      below 1.0 is meaningful: at small `m` each routing event touches only a few
+      of the `E` experts, so `a_1 = 1 - (1 - p_1)^m ≈ m·p_1` can be well under 1,
+      and `E_active` (the expected distinct-active count on the straggler) is
+      genuinely fractional — the straggler reads less than one full expert's
+      weights per step on average. Flooring at 1.0 would force every step to pay a
+      full per-expert HBM read even in that regime, systematically over-counting
+      weight traffic and inflating decode step time at small batch / low top-k.
+      Leaving it unfloored preserves the correct small-`m` asymptote (linear in
+      `m`) while still rising to the full Zipf active count as `m` grows.
     """
 
     BOTTLENECK_GROUP_COLLECTOR = "bottleneck_group_collector"
+    BOTTLENECK_GROUP_COLLECTOR_RANDOM = "bottleneck_group_collector_random"
 
 
 # Pydantic Spec Classes
@@ -304,6 +337,17 @@ class WorkloadSpec(BaseModel):
     comp_comm_efficiency: float = Field(..., ge=0.0, le=1.0)
     comp_mem_efficiency: float = Field(..., ge=0.0, le=1.0)
     comm_mem_efficiency: float = Field(..., ge=0.0, le=1.0)
+    kernel_launch_latency_per_layer_sec: float = Field(
+        ...,
+        ge=0,
+        description=(
+            "Per-layer host kernel-launch/dispatch floor (seconds), added once per "
+            "transformer layer per pass (TP-independent, not overlapped): per decode step in "
+            "decode, the single forward pass in prefill, and each of the forward and backward "
+            "passes in training. Empirical runtime/framework overhead, not a model-architecture "
+            "or hardware property. Set 0.0 where this floor is not modeled."
+        ),
+    )
     # TP-MoE expert-input redistribution optimization toggle (mode-agnostic).
     tp_moe_a2a_replication_optimization: bool = Field(
         ...,

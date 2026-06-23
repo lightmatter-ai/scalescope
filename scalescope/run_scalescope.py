@@ -1194,6 +1194,11 @@ def get_model_stats(
                     f"projection_groups={g} could not be distributed across projection yz_tags={proj_yz_tags}."
                 )
 
+    # Per-layer host kernel-launch/dispatch floor, applied once per layer per pass.
+    kernel_launch_floor_per_pass = (
+        workload_spec.get_layers_per_pp_stage() * workload_spec.kernel_launch_latency_per_layer_sec
+    )
+
     match pass_mode:
         case PassMode.TRAINING:
             assert isinstance(workload_spec, TrainSpec)
@@ -1215,6 +1220,7 @@ def get_model_stats(
                 moe_config,
                 workload_spec,
             )
+            batch_compute_time_forward_pass += kernel_launch_floor_per_pass
 
             # Attention compute breakdown: projection vs core attention (per-batch, per-chip)
             attn_proj_compute_time_fwd_per_layer, _, attn_core_compute_time_fwd_per_layer, _ = (
@@ -1261,6 +1267,7 @@ def get_model_stats(
                 moe_config,
                 workload_spec,
             )
+            batch_compute_time_backward_pass += kernel_launch_floor_per_pass
             compute_time_param_update, flops_param_update = parameter_update_flops(
                 attn_tp_topology_view, model_spec, moe_config, workload_spec
             )
@@ -1286,6 +1293,7 @@ def get_model_stats(
                 moe_config,
                 workload_spec,
             )
+            batch_compute_time_forward_pass += kernel_launch_floor_per_pass
 
             # Attention compute breakdown: projection vs core attention (per-batch, per-chip)
             attn_proj_compute_time_fwd_per_layer, _, attn_core_compute_time_fwd_per_layer, _ = (
@@ -1367,7 +1375,7 @@ def get_model_stats(
                     workload_spec,
                     n_seq_so_far,
                 )
-                batch_compute_time_forward_pass += step_time
+                batch_compute_time_forward_pass += step_time + kernel_launch_floor_per_pass
                 batch_flops_forward_pass += step_flops
                 attn_flops_forward_pass += step_attn_flops
                 moe_flops_forward_pass += step_moe_flops
