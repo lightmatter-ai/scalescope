@@ -1,0 +1,14 @@
+# 1× B200 SXM5 180 GB (single Blackwell die). Used by InferenceX
+# non-disagg single-chip MiniMax-M2.5 records. No scale-up communication
+# happens at TP=1 but the dimension still exists for ScaleScope's
+# topology spec.
+
+name: "B200_1x"
+
+node_definition_ref: "B200_NODE"
+
+dimensions:
+  - name: "ScaleUpFabric"
+    interconnect_name: "fast_fabric"
+    topology_type: "switched"
+    size: 1

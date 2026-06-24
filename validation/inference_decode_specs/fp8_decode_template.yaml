@@ -1,0 +1,75 @@
+# Single-decode-step FP8 workload template for the measured-panel
+# driver (`measurements/run_measured_panel.py`).
+#
+# Per-record overrides applied by the driver (in-place, on a YAML
+# copy):
+#   - global_batch_size      (= InferenceX conc / TRT-LLM sweep batch)
+#   - prefill_seq_len        (= record ISL)
+#   - moe_spec_v2.num_colocated_experts (set per case-table entry)
+#
+# Constants (do NOT override per-record):
+#   - num_generated_tokens = 1, seq_length = 1: one decode step ⇒
+#     output `time.tpot_user_seconds` IS the per-token TPOT.
+#   - micro_batch_size = 1: one micro-batch per step (additive timing).
+#   - float_size_bytes = 1: FP8 weights + KV (matches the TRT-LLM
+#     perf-overview FP8 rows and the FP8 InferenceX records).
+#   - decode_moe_router_sync_mode = replicated_router: cheap-routing
+#     assumption, valid for top-2 / top-8 routing where the router
+#     GEMM is not the bottleneck.
+#   - tp_*_spec.variant = SHARD_WEIGHTS_1D: matches the parallelism
+#     hypothesis in the logical topologies (TP=1, 2, or 8 along a
+#     single axis). 2D TP would require split_2d annotations.
+#   - Overlap efficiencies = 0.0: pure additive composition for clean
+#     comparison. Real systems achieve 0.5-0.8 overlap; the driver
+#     reports this as a known model-vs-system gap.
+
+global_batch_size: 1            # OVERRIDDEN per record by the driver.
+micro_batch_size: 1
+prefill_seq_len: 1024           # OVERRIDDEN per record by the driver.
+num_generated_tokens: 1
+seq_length: 1
+decode_moe_router_sync_mode: replicated_router
+kernel_launch_latency_per_layer_sec: 0.0   # OVERRIDDEN per record by the driver (per-model calibration).
+
+float_size_bytes: 1             # FP8
+
+memory_device_map_traffic:
+  weights: xpu_memory
+  activations: xpu_memory
+  gradients: xpu_memory
+  kv_cache: xpu_memory
+
+memory_device_map_footprint:
+  weights: xpu_memory
+  optimizer_states: xpu_memory
+  saved_activations: xpu_memory
+  gradient_buffers: xpu_memory
+  kv_cache: xpu_memory
+  transient_forward_peak: xpu_memory
+  transient_backward_peak: xpu_memory
+
+comp_comm_efficiency: 0.0
+comp_mem_efficiency: 0.0
+comm_mem_efficiency: 0.0
+tp_moe_a2a_replication_optimization: false
+
+tp_attn_spec:
+  variant: SHARD_WEIGHTS_1D
+
+tp_proj_spec:
+  variant: SHARD_WEIGHTS_1D
+
+tp_moe_spec:
+  variant: SHARD_WEIGHTS_1D
+
+dp_spec:
+  variant: DDP
+
+moe_spec_v2:
+  num_colocated_experts: 1      # OVERRIDDEN per record (1 for dense, varies for MoE).
+  expert_imbalance: 4.0         # realistic routing skew (not overridden by the driver).
+  expert_weight_residency_policy: resident_active_subset
+  expert_routing_distribution: bottleneck_group_collector_random
+
+pp_spec:
+  variant: GPIPE

@@ -1,0 +1,16 @@
+# Two H100s (80 GB SXM, NVLink-4 NVSwitch) — used by TRT-LLM
+# perf-overview TP=2 runs (Llama-3.3-70B FP8 split across two chips
+# inside one HGX).
+#
+# Same H100_NODE definition as h100_1x.yaml; just size 2 on the
+# scale-up fabric (NVSwitch fully-connected).
+
+name: "H100_2x"
+
+node_definition_ref: "H100_NODE"
+
+dimensions:
+  - name: "ScaleUpFabric"
+    interconnect_name: "fast_fabric"
+    topology_type: "switched"
+    size: 2

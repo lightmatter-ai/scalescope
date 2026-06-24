@@ -1,0 +1,25 @@
+# Llama-3-70B (dense, GATED_3MATRIX SwiGLU, 8-way GQA).
+#
+# Architecture per the Llama-3 paper (Grattafiori et al., 2024, arxiv:2407.21783):
+#   - 80 layers, hidden 8192, 64 heads, num_kv_heads = 8 (8:1 GQA).
+#   - SwiGLU FFN with intermediate 28672 -> mlp_ratio = 28672/8192 = 3.5.
+#   - Context 8192 (base model), vocab 128256.
+#
+# Validation panel: GenZ (training scaling) and LIMINAL (multi-XPU prefill/
+# decode under TP). Anchors the 70B point of the dense scaling curve.
+
+d_model: 8192
+n_layers: 80
+num_heads: 64
+num_kv_heads: 8
+head_dim: 128
+mlp_ratio: 3.5
+mlp_kind: gated_3matrix
+max_sequence_length: 8192
+vocab_size: 128256
+
+# Dense model: modeled as a single expert (1/1) so ScaleScope computes the FFN.
+# (num_regular_experts=0 would be attention-only with no FFN compute.)
+num_regular_experts: 1
+num_selected_experts: 1
+num_shared_experts: 0

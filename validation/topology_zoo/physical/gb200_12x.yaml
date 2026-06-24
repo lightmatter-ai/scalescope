@@ -1,0 +1,16 @@
+# 12× GB200 Blackwell dies on a single NVLink-Switch (NVL72) island.
+#
+# See `gb200_2x.yaml` for the NVL72 fabric assumption. Used by exactly one
+# InferenceX disagg-decode row (gpt-oss-120b TP=4 EP=4 DP=3 with
+# DP-attention, num_decode_gpu=12). NVL72 fits 72 dies on one fabric so a
+# 12-die slice is just a contiguous subset.
+
+name: "GB200_12x"
+
+node_definition_ref: "GB200_NODE"
+
+dimensions:
+  - name: "ScaleUpFabric"
+    interconnect_name: "fast_fabric"
+    topology_type: "switched"
+    size: 12

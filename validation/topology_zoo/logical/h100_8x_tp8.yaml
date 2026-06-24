@@ -1,0 +1,58 @@
+# Logical: TP=8 across 8 H100s on a single NVSwitch domain. Used by
+# the TRT-LLM perf-overview Llama-3.1-405B FP8 records — the model is
+# ~405 GB at FP8, which forces TP=8 to fit in 8×80 GB H100s with
+# KV-cache headroom (≈ 150 GB free for KV across the box).
+#
+# TP_Attn_X = 8 splits attention weights along the X (head) axis;
+# TP_Proj_X = 8 mirrors this for QKV/O projections. SHARD_WEIGHTS_1D
+# variant (single-axis split, all-reduce after each block).
+
+name: "H100_8x_TP8"
+
+dimensions:
+  - logical_tag: "PP"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_Attn_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 8
+  - logical_tag: "TP_Attn_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_Proj_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 8
+  - logical_tag: "TP_Proj_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "DP_Attn_SU"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "DP_Attn_SO"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "DP_MoE"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  # Dense FFN: this topology serves only dense models (Llama), whose single
+  # MLP is tensor-parallel-sharded across the full TP domain exactly like the
+  # attention/projection weights. We therefore set TP_MoE_X = TP_Attn_X = 8 so
+  # the FFN forms one complete set spanning all 8 chips (num_complete_expert_sets
+  # = 1) instead of 8 replicated single-chip sets.
+  - logical_tag: "TP_MoE_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 8
+  - logical_tag: "TP_MoE_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "EP_SU"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "EP_SO"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1

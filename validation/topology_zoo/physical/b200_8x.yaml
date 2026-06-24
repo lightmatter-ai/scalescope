@@ -1,0 +1,18 @@
+# HGX B200 / DGX B200 (8× B200 SXM5 180 GB on a single NVL Switch
+# domain) — the canonical 8-GPU Blackwell inference platform.
+#
+# Per-chip: FP8 4500 TFLOPS dense, HBM3e 8 TB/s × 180 GB, NVLink-5
+# 1.8 TB/s bidirectional (= 900 GB/s outgoing). Across the box the 8
+# chips are connected via NVL Switch fabric (single switched scale-up
+# domain in this hardware library, identical topology to the H100x8
+# DGX/HGX baseline at the abstraction level we model).
+
+name: "B200_8x"
+
+node_definition_ref: "B200_NODE"
+
+dimensions:
+  - name: "ScaleUpFabric"
+    interconnect_name: "fast_fabric"
+    topology_type: "switched"
+    size: 8

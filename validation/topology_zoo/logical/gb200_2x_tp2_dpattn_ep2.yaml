@@ -1,0 +1,61 @@
+# Logical: 2-chip TP group with DP-attention + EP=2 (gpt-oss-120b on
+# GB200 NVL72, InferenceX shape `decode_tp=2 decode_ep=2
+# decode_dp_attention=True num_decode_gpu=2`).
+#
+# Per the Dynamo/SGLang convention, when `dp_attention` is enabled the
+# attention block is REPLICATED across the TP-group ranks rather than
+# tensor-parallel-sharded — each rank holds full attention weights and
+# processes batch/TP-group users for that block. The MoE block uses EP to
+# distribute experts (128 / EP = 64 experts per chip), with each expert
+# whole on its owner chip (TP_MoE = 1).
+#
+# Dimension consistency on a 2-chip ScaleUpFabric:
+#   - attention group:  DP_Attn_SU × TP_Attn_X = 2 × 1 = 2 ✓
+#   - moe       group:  DP_MoE × EP_SU × TP_MoE_X = 1 × 2 × 1 = 2 ✓
+#
+# Companion case carries `num_colocated_experts = 64` (= 128 / EP_SU).
+
+name: "GB200_2x_TP2_DPattn_EP2"
+
+dimensions:
+  - logical_tag: "PP"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_Attn_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "TP_Attn_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_Proj_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "TP_Proj_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "DP_Attn_SU"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 2
+  - logical_tag: "DP_Attn_SO"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "DP_MoE"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_MoE_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "TP_MoE_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "EP_SU"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 2
+  - logical_tag: "EP_SO"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1

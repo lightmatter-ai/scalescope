@@ -1,0 +1,21 @@
+# Single H100 (80 GB SXM, NVLink-4) — used by TRT-LLM perf-overview TP=1
+# runs (Llama-3.1-8B FP8 on a single GH200 / H100 / H200 chip).
+#
+# H100_NODE in `hardware_specs/hardware_library.yaml` provides:
+#   - H100_COMPUTE: FP8 nominal 3958 TFLOPS, BF16 nominal 1000 TFLOPS,
+#     efficiency 0.7.
+#   - H100_MEMORY: 5×16GB HBM3 stacks @ 820 GB/s each → 80 GB / 4.1 TB/s
+#     aggregate, efficiency 0.7.
+#   - H100_INTERCONNECT: NVLink-4 (18×450 GB/s outgoing = 8.1 TB/s
+#     bidirectional). Unused at size 1 but the dimension must exist for
+#     scalescope to lay out parallelism dimensions on top.
+
+name: "H100_1x"
+
+node_definition_ref: "H100_NODE"
+
+dimensions:
+  - name: "ScaleUpFabric"
+    interconnect_name: "fast_fabric"
+    topology_type: "switched"
+    size: 1

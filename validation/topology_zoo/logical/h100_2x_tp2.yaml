@@ -1,0 +1,57 @@
+# Logical: TP=2 across two H100s on the same NVSwitch domain. Used by
+# TRT-LLM perf-overview Llama-3.3-70B FP8 (TP=2 — the model is too
+# large for one chip's HBM at FP8 with KV headroom).
+#
+# TP_Attn_X = 2 means weights are sharded across 2 ranks along the X
+# axis (head dim). TP_Proj_X = 2 mirrors this for QKV/O projections.
+# We use the 1D TP variant (SHARD_WEIGHTS_1D) — single-axis split.
+
+name: "H100_2x_TP2"
+
+dimensions:
+  - logical_tag: "PP"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_Attn_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 2
+  - logical_tag: "TP_Attn_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_Proj_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 2
+  - logical_tag: "TP_Proj_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "DP_Attn_SU"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "DP_Attn_SO"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "DP_MoE"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  # Dense FFN: this topology serves only dense models (Llama), whose single
+  # MLP is tensor-parallel-sharded across the full TP domain exactly like the
+  # attention/projection weights. We therefore set TP_MoE_X = TP_Attn_X = 2 so
+  # the FFN forms one complete set spanning both chips (num_complete_expert_sets
+  # = 1) instead of 2 replicated single-chip sets.
+  - logical_tag: "TP_MoE_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 2
+  - logical_tag: "TP_MoE_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "EP_SU"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "EP_SO"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1

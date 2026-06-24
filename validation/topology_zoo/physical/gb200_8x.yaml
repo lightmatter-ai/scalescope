@@ -1,0 +1,14 @@
+# 8× GB200 Blackwell dies on a single NVLink-Switch (NVL72) island.
+#
+# See `gb200_2x.yaml` for the NVL72 fabric assumption. Per-die NVLink-5:
+# 1.8 TB/s aggregate bidirectional (900 GB/s outgoing).
+
+name: "GB200_8x"
+
+node_definition_ref: "GB200_NODE"
+
+dimensions:
+  - name: "ScaleUpFabric"
+    interconnect_name: "fast_fabric"
+    topology_type: "switched"
+    size: 8

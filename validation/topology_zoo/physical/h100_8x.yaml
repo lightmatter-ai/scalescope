@@ -1,0 +1,15 @@
+# DGX H100 (8× H100 SXM 80 GB on a single NVSwitch domain) — the
+# canonical 8-GPU H100 inference platform.
+#
+# Same H100_NODE definition as h100_1x.yaml; size 8 on the scale-up
+# fabric. NVLink-4 NVSwitch fully-connected within the box.
+
+name: "H100_8x"
+
+node_definition_ref: "H100_NODE"
+
+dimensions:
+  - name: "ScaleUpFabric"
+    interconnect_name: "fast_fabric"
+    topology_type: "switched"
+    size: 8

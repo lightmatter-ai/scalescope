@@ -1,0 +1,51 @@
+# Logical: TP=2 across 2 GB200 dies on one NVL72 island.
+#
+# Used as the parallelism HYPOTHESIS for InferenceX disagg-decode rows where
+# `decode_tp = 2, decode_ep = 1, decode_dp_attention = false, num_decode_gpu = 2`.
+# Pure tensor-parallel decode pool, no expert parallelism, all 128 experts
+# colocated on each chip (TP-sharded along the d_ff axis).
+
+name: "GB200_2x_TP2"
+
+dimensions:
+  - logical_tag: "PP"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_Attn_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 2
+  - logical_tag: "TP_Attn_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_Proj_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 2
+  - logical_tag: "TP_Proj_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "DP_Attn_SU"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "DP_Attn_SO"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "DP_MoE"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_MoE_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 2
+  - logical_tag: "TP_MoE_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "EP_SU"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "EP_SO"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1

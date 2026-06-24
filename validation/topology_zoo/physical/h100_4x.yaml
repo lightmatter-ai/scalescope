@@ -1,0 +1,9 @@
+name: "H100_4x"
+
+node_definition_ref: "H100_NODE"
+
+dimensions:
+  - name: "ScaleUpFabric"
+    interconnect_name: "fast_fabric"
+    topology_type: "switched"
+    size: 4

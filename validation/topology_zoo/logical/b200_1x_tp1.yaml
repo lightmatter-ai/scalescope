@@ -1,0 +1,47 @@
+# Logical: TP=1 on a single B200 (MiniMax-M2.5 InferenceX records on
+# b200_1x physical). Trivial single-chip layout.
+
+name: "B200_1x_TP1"
+
+dimensions:
+  - logical_tag: "PP"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_Attn_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "TP_Attn_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_Proj_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "TP_Proj_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "DP_Attn_SU"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "DP_Attn_SO"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "DP_MoE"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_MoE_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "TP_MoE_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "EP_SU"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "EP_SO"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1

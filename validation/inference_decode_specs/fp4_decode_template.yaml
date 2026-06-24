@@ -1,0 +1,63 @@
+# Single-decode-step FP4 workload template for the measured-panel
+# driver (`measurements/run_measured_panel.py`). Identical to
+# `fp8_decode_template.yaml` except `float_size_bytes: 0.5` (FP4
+# weights and KV cache).
+#
+# Used for the FP4 InferenceX records (gpt-oss-120b disagg on GB200,
+# MiniMax-M2.5 / Llama-3.3-70B FP4 on B200).
+#
+# Per-record overrides applied by the driver (in-place, on a YAML copy):
+#   - global_batch_size      (= InferenceX conc / TRT-LLM sweep batch)
+#   - prefill_seq_len        (= record ISL)
+#   - moe_spec_v2.num_colocated_experts (set per case-table entry)
+
+global_batch_size: 1            # OVERRIDDEN per record by the driver.
+micro_batch_size: 1
+prefill_seq_len: 1024           # OVERRIDDEN per record by the driver.
+num_generated_tokens: 1
+seq_length: 1
+decode_moe_router_sync_mode: replicated_router
+kernel_launch_latency_per_layer_sec: 0.0   # OVERRIDDEN per record by the driver (per-model calibration).
+
+float_size_bytes: 0.5           # FP4
+
+memory_device_map_traffic:
+  weights: xpu_memory
+  activations: xpu_memory
+  gradients: xpu_memory
+  kv_cache: xpu_memory
+
+memory_device_map_footprint:
+  weights: xpu_memory
+  optimizer_states: xpu_memory
+  saved_activations: xpu_memory
+  gradient_buffers: xpu_memory
+  kv_cache: xpu_memory
+  transient_forward_peak: xpu_memory
+  transient_backward_peak: xpu_memory
+
+comp_comm_efficiency: 0.0
+comp_mem_efficiency: 0.0
+comm_mem_efficiency: 0.0
+tp_moe_a2a_replication_optimization: false
+
+tp_attn_spec:
+  variant: SHARD_WEIGHTS_1D
+
+tp_proj_spec:
+  variant: SHARD_WEIGHTS_1D
+
+tp_moe_spec:
+  variant: SHARD_WEIGHTS_1D
+
+dp_spec:
+  variant: DDP
+
+moe_spec_v2:
+  num_colocated_experts: 1      # OVERRIDDEN per record (1 for dense, varies for MoE).
+  expert_imbalance: 4.0         # realistic routing skew (not overridden by the driver).
+  expert_weight_residency_policy: resident_active_subset
+  expert_routing_distribution: bottleneck_group_collector_random
+
+pp_spec:
+  variant: GPIPE

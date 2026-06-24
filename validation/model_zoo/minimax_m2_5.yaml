@@ -1,0 +1,46 @@
+# MiniMax-M2.5 (MiniMaxAI/MiniMax-M2.5, fine-grained MoE, GATED_3MATRIX
+# SwiGLU experts, native FP8 (E4M3) quantisation).
+#
+# Architecture per the published HuggingFace config
+# (`MiniMaxAI/MiniMax-M2.5/config.json`):
+#   - 62 transformer layers, hidden 3072, head_dim 128.
+#   - `attn_type_list` is all 1s -> ALL 62 layers are full softmax
+#     attention (no hybrid lightning/linear-attention mix as in earlier
+#     MiniMax-Text-01).
+#   - 48 query heads, 8 KV heads (6:1 GQA), head_dim = 128. 48 × 128 =
+#     6144 ≠ hidden_size = 3072 — wide-Q attention layout (Q-proj is 2×
+#     wider than d_model), represented directly via the independent
+#     `head_dim` field on `TransformerConfig`.
+#   - `intermediate_size: 1536` (per-expert MoE width) ->
+#     mlp_ratio = 1536/3072 = 0.5.
+#   - 256 regular experts per layer, top-8 routing, NO shared experts
+#     (`shared_intermediate_size: 0`).
+#   - Context 196608 (RoPE base 5e6), vocab 200064, tied embeddings = false.
+#   - ~228B total params, ~10B activated per token.
+#   - Native FP8 (E4M3) weight quantisation (`quantization_config.quant_method = fp8`,
+#     128×128 block scaling).
+#
+# Caveats not modelled by ScaleScope today:
+#   - **MTP (multi-token prediction)**: `use_mtp: true` with 3 MTP
+#     modules in the published weights. The InferenceX rows we compare
+#     against all run with `spec_method = none` (MTP disabled), so this
+#     doesn't affect our measurement targets.
+#   - **QK normalisation** (`use_qk_norm: true`, per-layer RMSNorm on Q
+#     and K before attention): cheap O(d_model) compute, ScaleScope
+#     ignores layer-norm cost (negligible at decode).
+#   - **Routing bias** (`use_routing_bias: true`, `scoring_func: sigmoid`):
+#     a constant per-expert bias added to logits; doesn't change FLOPS.
+
+d_model: 3072
+n_layers: 62
+num_heads: 48
+num_kv_heads: 8
+head_dim: 128
+mlp_ratio: 0.5
+mlp_kind: gated_3matrix
+max_sequence_length: 196608
+vocab_size: 200064
+
+num_regular_experts: 256
+num_selected_experts: 8
+num_shared_experts: 0

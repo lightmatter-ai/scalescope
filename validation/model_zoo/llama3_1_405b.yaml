@@ -1,0 +1,26 @@
+# Llama-3.1-405B (dense, GATED_3MATRIX SwiGLU, 8-way GQA).
+#
+# Architecture per the Llama-3 paper (Grattafiori et al., 2024, arxiv:2407.21783):
+#   - 126 layers, hidden 16384, 128 heads, num_kv_heads = 8 (16:1 GQA).
+#   - SwiGLU FFN with intermediate 53248 -> mlp_ratio = 53248/16384 = 3.25.
+#   - Context 131072, vocab 128256.
+#
+# Validation panel: NVIDIA TRT-LLM perf-overview throughput tables
+# (FP8 on H100, TP=8). Anchors the 400B-class dense decode latency
+# point — TP=8 is forced by weight-capacity (≈ 405 GB at FP8).
+
+d_model: 16384
+n_layers: 126
+num_heads: 128
+num_kv_heads: 8
+head_dim: 128
+mlp_ratio: 3.25
+mlp_kind: gated_3matrix
+max_sequence_length: 131072
+vocab_size: 128256
+
+# Dense model: modeled as a single expert (1/1) so ScaleScope computes the FFN.
+# (num_regular_experts=0 would be attention-only with no FFN compute.)
+num_regular_experts: 1
+num_selected_experts: 1
+num_shared_experts: 0

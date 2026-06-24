@@ -1,0 +1,13 @@
+# 2× B200 SXM5 180 GB (one NVL Switch domain slice). Used by InferenceX
+# non-disagg MiniMax-M2.5 TP=2 records. Same NVLink-5 / NVL-Switch
+# fabric as `b200_8x.yaml`, just a 2-die slice.
+
+name: "B200_2x"
+
+node_definition_ref: "B200_NODE"
+
+dimensions:
+  - name: "ScaleUpFabric"
+    interconnect_name: "fast_fabric"
+    topology_type: "switched"
+    size: 2

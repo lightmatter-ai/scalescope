@@ -1,0 +1,190 @@
+# NVIDIA TensorRT-LLM perf-overview throughput tables.
+#
+# Source: https://nvidia.github.io/TensorRT-LLM/performance/perf-overview.html
+# Snapshot date: 2026-05-08.  Reproducible via the trtllm-bench commands
+# documented on that page (synthetic dataset of fixed (ISL, OSL)).
+#
+# Metric: ``Total Output Throughput (tokens/sec)`` — the system-wide
+# aggregate output token rate at saturating concurrency (offline /
+# infinite-rate request stream).  Per-user TPOT is NOT reported on
+# this page; to obtain it we'd need to re-run trtllm-bench locally
+# (the printed log includes per-user TPOT but the public table only
+# shows aggregate throughput).
+#
+# These numbers provide an (ISL, OSL) throughput sweep for the
+# saturating-batch regime, complementing the InferenceX decode records.
+
+schema_version: 1
+source: "NVIDIA TensorRT-LLM v0.21 perf-overview"
+url: "https://nvidia.github.io/TensorRT-LLM/performance/perf-overview.html"
+metric: "Total Output Throughput (tokens/sec) — system aggregate"
+methodology: |
+  Throughput run with trtllm-bench at saturating request rate. KV cache
+  set to 0.95 of free GPU memory (or 0.90 / lower if OOM). Synthetic
+  dataset, fixed (ISL, OSL), zero stdev. PyTorch backend.
+notes:
+  - Llama-3.3-70B is structurally identical to Llama-3.1-70B (same
+    d_model=8192, num_layers=80, num_heads=64, num_kv_heads=8,
+    intermediate_size=28672, GQA, SwiGLU). ScaleScope can use the
+    existing llama3_70b model spec.
+  - Llama-3.1-405B FP8 numbers exist for H100 and H200; FP4 numbers
+    exist only for B200 / GB200.
+  - Llama-4-Maverick requires G3 (chunked-attention alternation) per
+    `scalescope_model_feature_gaps.md` — DEFERRED (not in panel).
+
+models:
+
+  llama3_1_8b:
+    precision: fp8
+    huggingface_repo: nvidia/Llama-3.1-8B-Instruct-FP8
+    runs:
+      - { gpu: GH200,  tp: 1, isl: 128,    osl: 128,   total_output_tps: 27304.25 }
+      - { gpu: GH200,  tp: 1, isl: 128,    osl: 2048,  total_output_tps: 24045.60 }
+      - { gpu: GH200,  tp: 1, isl: 128,    osl: 4096,  total_output_tps: 15409.85 }
+      - { gpu: GH200,  tp: 1, isl: 500,    osl: 2000,  total_output_tps: 20123.88 }
+      - { gpu: GH200,  tp: 1, isl: 1000,   osl: 1000,  total_output_tps: 16352.99 }
+      - { gpu: GH200,  tp: 1, isl: 1000,   osl: 2000,  total_output_tps: 15705.82 }
+      - { gpu: GH200,  tp: 1, isl: 1024,   osl: 2048,  total_output_tps: 16102.52 }
+      - { gpu: GH200,  tp: 1, isl: 2048,   osl: 128,   total_output_tps:  3573.85 }
+      - { gpu: GH200,  tp: 1, isl: 2048,   osl: 2048,  total_output_tps: 10767.05 }
+      - { gpu: GH200,  tp: 1, isl: 5000,   osl: 500,   total_output_tps:  3584.74 }
+      - { gpu: GH200,  tp: 1, isl: 20000,  osl: 2000,  total_output_tps:  1393.31 }
+      - { gpu: H100,   tp: 1, isl: 128,    osl: 128,   total_output_tps: 26401.48 }
+      - { gpu: H100,   tp: 1, isl: 128,    osl: 2048,  total_output_tps: 21413.21 }
+      - { gpu: H100,   tp: 1, isl: 128,    osl: 4096,  total_output_tps: 13541.54 }
+      - { gpu: H100,   tp: 1, isl: 500,    osl: 2000,  total_output_tps: 17571.01 }
+      - { gpu: H100,   tp: 1, isl: 1000,   osl: 1000,  total_output_tps: 14991.62 }
+      - { gpu: H100,   tp: 1, isl: 1000,   osl: 2000,  total_output_tps: 13505.23 }
+      - { gpu: H100,   tp: 1, isl: 1024,   osl: 2048,  total_output_tps: 13165.91 }
+      - { gpu: H100,   tp: 1, isl: 2048,   osl: 128,   total_output_tps:  3275.55 }
+      - { gpu: H100,   tp: 1, isl: 2048,   osl: 2048,  total_output_tps:  9462.43 }
+      - { gpu: H100,   tp: 1, isl: 5000,   osl: 500,   total_output_tps:  3276.47 }
+      - { gpu: H100,   tp: 1, isl: 20000,  osl: 2000,  total_output_tps:  1340.69 }
+      - { gpu: H200,   tp: 1, isl: 128,    osl: 128,   total_output_tps: 27027.80 }
+      - { gpu: H200,   tp: 1, isl: 128,    osl: 2048,  total_output_tps: 23102.25 }
+      - { gpu: H200,   tp: 1, isl: 128,    osl: 4096,  total_output_tps: 17396.83 }
+      - { gpu: H200,   tp: 1, isl: 500,    osl: 2000,  total_output_tps: 19759.16 }
+      - { gpu: H200,   tp: 1, isl: 1000,   osl: 1000,  total_output_tps: 17162.49 }
+      - { gpu: H200,   tp: 1, isl: 1000,   osl: 2000,  total_output_tps: 16227.11 }
+      - { gpu: H200,   tp: 1, isl: 1024,   osl: 2048,  total_output_tps: 16057.66 }
+      - { gpu: H200,   tp: 1, isl: 2048,   osl: 128,   total_output_tps:  3390.69 }
+      - { gpu: H200,   tp: 1, isl: 2048,   osl: 2048,  total_output_tps: 11822.14 }
+      - { gpu: H200,   tp: 1, isl: 5000,   osl: 500,   total_output_tps:  3758.08 }
+      - { gpu: H200,   tp: 1, isl: 20000,  osl: 2000,  total_output_tps:  1705.68 }
+
+  llama3_3_70b_fp8:
+    precision: fp8
+    huggingface_repo: nvidia/Llama-3.3-70B-Instruct-FP8
+    aliased_to_scalescope_model: llama3_70b
+    runs:
+      - { gpu: H100,   tp: 2, isl: 128,    osl: 128,   total_output_tps:  6092.28 }
+      - { gpu: H100,   tp: 2, isl: 128,    osl: 2048,  total_output_tps:  5892.94 }
+      - { gpu: H100,   tp: 2, isl: 128,    osl: 4096,  total_output_tps:  3828.46 }
+      - { gpu: H100,   tp: 2, isl: 500,    osl: 2000,  total_output_tps:  4654.74 }
+      - { gpu: H100,   tp: 2, isl: 1000,   osl: 1000,  total_output_tps:  4181.06 }
+      - { gpu: H100,   tp: 2, isl: 1000,   osl: 2000,  total_output_tps:  3708.93 }
+      - { gpu: H100,   tp: 2, isl: 1024,   osl: 2048,  total_output_tps:  3785.04 }
+      - { gpu: H100,   tp: 2, isl: 2048,   osl: 128,   total_output_tps:   723.40 }
+      - { gpu: H100,   tp: 2, isl: 2048,   osl: 2048,  total_output_tps:  2785.53 }
+      - { gpu: H100,   tp: 2, isl: 5000,   osl: 500,   total_output_tps:   865.55 }
+      - { gpu: H100,   tp: 2, isl: 20000,  osl: 2000,  total_output_tps:   411.85 }
+      - { gpu: H200,   tp: 2, isl: 128,    osl: 128,   total_output_tps:  6327.98 }
+      - { gpu: H200,   tp: 2, isl: 128,    osl: 2048,  total_output_tps:  7467.36 }
+      - { gpu: H200,   tp: 2, isl: 128,    osl: 4096,  total_output_tps:  5526.42 }
+      - { gpu: H200,   tp: 2, isl: 500,    osl: 2000,  total_output_tps:  6639.15 }
+      - { gpu: H200,   tp: 2, isl: 1000,   osl: 1000,  total_output_tps:  4773.33 }
+      - { gpu: H200,   tp: 2, isl: 1000,   osl: 2000,  total_output_tps:  5790.36 }
+      - { gpu: H200,   tp: 2, isl: 1024,   osl: 2048,  total_output_tps:  5480.44 }
+      - { gpu: H200,   tp: 2, isl: 2048,   osl: 128,   total_output_tps:   747.55 }
+      - { gpu: H200,   tp: 2, isl: 2048,   osl: 2048,  total_output_tps:  3775.80 }
+      - { gpu: H200,   tp: 2, isl: 5000,   osl: 500,   total_output_tps:   978.28 }
+      - { gpu: H200,   tp: 2, isl: 20000,  osl: 2000,  total_output_tps:   609.42 }
+
+  llama3_1_405b_fp8:
+    precision: fp8
+    huggingface_repo: nvidia/Llama-3.1-405B-Instruct-FP8
+    aliased_to_scalescope_model: llama3_405b
+    runs:
+      # 128/128 missing on H100 in source table
+      - { gpu: H100,   tp: 8, isl: 128,    osl: 2048,  total_output_tps:  4517.39 }
+      - { gpu: H100,   tp: 8, isl: 128,    osl: 4096,  total_output_tps:  2910.31 }
+      - { gpu: H100,   tp: 8, isl: 500,    osl: 2000,  total_output_tps:  3664.62 }
+      - { gpu: H100,   tp: 8, isl: 1000,   osl: 1000,  total_output_tps:  2955.50 }
+      - { gpu: H100,   tp: 8, isl: 1000,   osl: 2000,  total_output_tps:  2884.69 }
+      - { gpu: H100,   tp: 8, isl: 1024,   osl: 2048,  total_output_tps:  3237.41 }
+      - { gpu: H100,   tp: 8, isl: 2048,   osl: 128,   total_output_tps:   433.47 }
+      - { gpu: H100,   tp: 8, isl: 2048,   osl: 2048,  total_output_tps:  2216.55 }
+      - { gpu: H100,   tp: 8, isl: 5000,   osl: 500,   total_output_tps:   579.05 }
+      - { gpu: H100,   tp: 8, isl: 20000,  osl: 2000,  total_output_tps:   363.27 }
+      - { gpu: H200,   tp: 8, isl: 128,    osl: 128,   total_output_tps:  3705.18 }
+      - { gpu: H200,   tp: 8, isl: 128,    osl: 2048,  total_output_tps:  4715.13 }
+      - { gpu: H200,   tp: 8, isl: 128,    osl: 4096,  total_output_tps:  4475.91 }
+      - { gpu: H200,   tp: 8, isl: 500,    osl: 2000,  total_output_tps:  4804.10 }
+      - { gpu: H200,   tp: 8, isl: 1000,   osl: 1000,  total_output_tps:  3208.25 }
+      - { gpu: H200,   tp: 8, isl: 1000,   osl: 2000,  total_output_tps:  3630.29 }
+      - { gpu: H200,   tp: 8, isl: 1024,   osl: 2048,  total_output_tps:  3609.50 }
+      - { gpu: H200,   tp: 8, isl: 2048,   osl: 128,   total_output_tps:   441.35 }
+      - { gpu: H200,   tp: 8, isl: 2048,   osl: 2048,  total_output_tps:  2840.86 }
+      - { gpu: H200,   tp: 8, isl: 5000,   osl: 500,   total_output_tps:   645.26 }
+      - { gpu: H200,   tp: 8, isl: 20000,  osl: 2000,  total_output_tps:   509.87 }
+
+  llama3_3_70b_fp4:
+    precision: fp4
+    huggingface_repo: nvidia/Llama-3.3-70B-Instruct-FP4
+    aliased_to_scalescope_model: llama3_70b
+    note: |
+      FP4 not yet modelled in ScaleScope (G14, deferred). Numbers
+      retained for future calibration once FP4 weight precision lands.
+    runs:
+      - { gpu: B200,   tp: 1, isl: 128,    osl: 128,   total_output_tps: 10613.84 }
+      - { gpu: B200,   tp: 1, isl: 128,    osl: 2048,  total_output_tps:  9445.51 }
+      - { gpu: B200,   tp: 1, isl: 128,    osl: 4096,  total_output_tps:  6276.85 }
+      - { gpu: B200,   tp: 1, isl: 500,    osl: 2000,  total_output_tps:  6983.27 }
+      - { gpu: B200,   tp: 1, isl: 1000,   osl: 1000,  total_output_tps:  6434.29 }
+      - { gpu: B200,   tp: 1, isl: 1000,   osl: 2000,  total_output_tps:  6725.03 }
+      - { gpu: B200,   tp: 1, isl: 1024,   osl: 2048,  total_output_tps:  6546.61 }
+      - { gpu: B200,   tp: 1, isl: 2048,   osl: 128,   total_output_tps:  1330.35 }
+      - { gpu: B200,   tp: 1, isl: 2048,   osl: 2048,  total_output_tps:  4528.48 }
+      - { gpu: B200,   tp: 1, isl: 5000,   osl: 500,   total_output_tps:  1427.44 }
+      - { gpu: B200,   tp: 1, isl: 20000,  osl: 2000,  total_output_tps:   636.36 }
+      - { gpu: GB200,  tp: 1, isl: 128,    osl: 128,   total_output_tps: 11100.97 }
+      - { gpu: GB200,  tp: 1, isl: 128,    osl: 2048,  total_output_tps: 10276.05 }
+      - { gpu: GB200,  tp: 1, isl: 128,    osl: 4096,  total_output_tps:  7351.12 }
+      - { gpu: GB200,  tp: 1, isl: 500,    osl: 2000,  total_output_tps:  8194.30 }
+      - { gpu: GB200,  tp: 1, isl: 1000,   osl: 1000,  total_output_tps:  7401.80 }
+      - { gpu: GB200,  tp: 1, isl: 1000,   osl: 2000,  total_output_tps:  6478.72 }
+      - { gpu: GB200,  tp: 1, isl: 1024,   osl: 2048,  total_output_tps:  7922.88 }
+      - { gpu: GB200,  tp: 1, isl: 2048,   osl: 128,   total_output_tps:  1418.47 }
+      - { gpu: GB200,  tp: 1, isl: 2048,   osl: 2048,  total_output_tps:  5326.77 }
+      - { gpu: GB200,  tp: 1, isl: 5000,   osl: 500,   total_output_tps:  1502.44 }
+      - { gpu: GB200,  tp: 1, isl: 20000,  osl: 2000,  total_output_tps:   732.43 }
+
+  llama3_1_405b_fp4:
+    precision: fp4
+    huggingface_repo: nvidia/Llama-3.1-405B-Instruct-FP4
+    aliased_to_scalescope_model: llama3_405b
+    note: |
+      FP4 not yet modelled in ScaleScope. TP=4 (Blackwell only).
+    runs:
+      - { gpu: B200,   tp: 4, isl: 128,    osl: 128,   total_output_tps:  6218.89 }
+      - { gpu: B200,   tp: 4, isl: 128,    osl: 2048,  total_output_tps:  7178.10 }
+      - { gpu: B200,   tp: 4, isl: 128,    osl: 4096,  total_output_tps:  5890.89 }
+      - { gpu: B200,   tp: 4, isl: 500,    osl: 2000,  total_output_tps:  5844.37 }
+      - { gpu: B200,   tp: 4, isl: 1000,   osl: 1000,  total_output_tps:  4958.53 }
+      - { gpu: B200,   tp: 4, isl: 1000,   osl: 2000,  total_output_tps:  4874.16 }
+      - { gpu: B200,   tp: 4, isl: 1024,   osl: 2048,  total_output_tps:  4833.19 }
+      - { gpu: B200,   tp: 4, isl: 2048,   osl: 128,   total_output_tps:   737.95 }
+      - { gpu: B200,   tp: 4, isl: 2048,   osl: 2048,  total_output_tps:  4024.02 }
+      - { gpu: B200,   tp: 4, isl: 5000,   osl: 500,   total_output_tps:  1032.40 }
+      - { gpu: B200,   tp: 4, isl: 20000,  osl: 2000,  total_output_tps:   667.39 }
+      - { gpu: GB200,  tp: 4, isl: 128,    osl: 128,   total_output_tps:  6598.97 }
+      - { gpu: GB200,  tp: 4, isl: 128,    osl: 2048,  total_output_tps:  7497.40 }
+      - { gpu: GB200,  tp: 4, isl: 128,    osl: 4096,  total_output_tps:  5898.19 }
+      - { gpu: GB200,  tp: 4, isl: 500,    osl: 2000,  total_output_tps:  6198.33 }
+      - { gpu: GB200,  tp: 4, isl: 1000,   osl: 1000,  total_output_tps:  5243.35 }
+      - { gpu: GB200,  tp: 4, isl: 1000,   osl: 2000,  total_output_tps:  4905.51 }
+      - { gpu: GB200,  tp: 4, isl: 1024,   osl: 2048,  total_output_tps:  4686.38 }
+      - { gpu: GB200,  tp: 4, isl: 2048,   osl: 128,   total_output_tps:   761.58 }
+      - { gpu: GB200,  tp: 4, isl: 2048,   osl: 2048,  total_output_tps:  4326.56 }
+      - { gpu: GB200,  tp: 4, isl: 5000,   osl: 500,   total_output_tps:  1078.87 }
+      - { gpu: GB200,  tp: 4, isl: 20000,  osl: 2000,  total_output_tps:   649.95 }

@@ -1,0 +1,60 @@
+# Logical: FOUR replicas of a 2-chip TP group, no DP-attention, no EP
+# (gpt-oss-120b on GB200 NVL72, InferenceX shape `decode_tp=2 decode_ep=1
+# decode_dp_attention=False num_decode_gpu=8`). 4 outer DP × 2-chip TP.
+#
+# Plain tensor-parallel within each 2-chip group (no DP-attention, attention
+# IS TP-sharded), expert weights are TP-sharded along d_ff axis with all
+# 128 experts colocated on each chip. Outer DP across replicas just splits
+# the request stream.
+#
+# Dimension consistency on an 8-chip ScaleUpFabric:
+#   - attention group:  DP_Attn_SU × TP_Attn_X = 4 × 2 = 8 ✓
+#   - moe       group:  DP_MoE × EP_SU × TP_MoE_X = 4 × 1 × 2 = 8 ✓
+#
+# Companion case carries `num_colocated_experts = 128` (all experts on
+# each chip, TP-sharded).
+
+name: "GB200_8x_TP2_DP4"
+
+dimensions:
+  - logical_tag: "PP"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_Attn_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 2
+  - logical_tag: "TP_Attn_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_Proj_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 2
+  - logical_tag: "TP_Proj_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "DP_Attn_SU"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 4
+  - logical_tag: "DP_Attn_SO"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "DP_MoE"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 4
+
+  - logical_tag: "TP_MoE_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 2
+  - logical_tag: "TP_MoE_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "EP_SU"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "EP_SO"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1

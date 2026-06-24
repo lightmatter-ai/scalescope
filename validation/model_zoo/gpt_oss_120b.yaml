@@ -1,0 +1,42 @@
+# gpt-oss-120b (OpenAI open-weight MoE, GATED_3MATRIX SwiGLU experts,
+# 8-way GQA, native MXFP4 quantisation).
+#
+# Architecture per the published HuggingFace config
+# (`openai/gpt-oss-120b/config.json`):
+#   - 36 transformer layers, hidden 2880, 64 heads, num_kv_heads = 8 (8:1 GQA).
+#   - SwiGLU experts with intermediate 2880  ->  mlp_ratio = 2880/2880 = 1.0.
+#   - 128 regular experts per layer, top-4 routing, NO shared experts.
+#   - Context 131072 (YARN), vocab 201088, tied embeddings = false.
+#   - 116.83B total params, ~5.1B activated per token.
+#   - Native MXFP4 quantization (`quantization_config.quant_method = mxfp4`)
+#     covering all expert weights; attention/router/embed stay in higher
+#     precision in the official weights.
+#
+# Caveats not modelled by ScaleScope today:
+#   - **Alternating sliding-window / full attention layers** (sliding window
+#     = 128 tokens every other layer). For long-context decode this means
+#     half the layers' KV-cache traffic is bounded by 128 tokens of history
+#     rather than the full ISL+OSL. ScaleScope assumes uniform full
+#     attention, so KV-traffic predictions are upper bounds at long OSL.
+#   - **Attention bias** (`attention_bias: true`). Small absolute weight
+#     contribution (~num_heads × head_dim per layer); negligible at this
+#     scale.
+#   - **YARN rope scaling**. Affects no compute or memory in ScaleScope's
+#     model, only positional-embedding numerics — irrelevant here.
+
+d_model: 2880
+n_layers: 36
+num_heads: 64
+num_kv_heads: 8
+# Wide-Q: HF config has head_dim=64, so num_heads × head_dim = 4096 ≠ d_model = 2880
+# (Q-proj output is 1.42× wider than d_model).
+head_dim: 64
+mlp_ratio: 1.0
+mlp_kind: gated_3matrix
+max_sequence_length: 131072
+vocab_size: 201088
+
+# MoE: fine-grained, top-4
+num_regular_experts: 128
+num_selected_experts: 4
+num_shared_experts: 0

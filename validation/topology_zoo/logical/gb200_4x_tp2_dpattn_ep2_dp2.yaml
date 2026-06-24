@@ -1,0 +1,60 @@
+# Logical: TWO replicas of a 2-chip TP group, each with DP-attention +
+# EP=2 (gpt-oss-120b on GB200 NVL72, InferenceX shape `decode_tp=2
+# decode_ep=2 decode_dp_attention=True num_decode_gpu=4`).
+#
+# Outer DP across the two TP groups (DP_MoE = 2) carries no MoE all-to-all
+# traffic — it just splits the request stream. Within each 2-chip group:
+# attention is DP-replicated, MoE is EP=2.
+#
+# Dimension consistency on a 4-chip ScaleUpFabric:
+#   - attention group:  DP_Attn_SU × TP_Attn_X = 4 × 1 = 4 ✓
+#       (= outer_DP × within_group_DP_attn = 2 × 2)
+#   - moe       group:  DP_MoE × EP_SU × TP_MoE_X = 2 × 2 × 1 = 4 ✓
+#
+# Companion case carries `num_colocated_experts = 64` (= 128 / EP_SU=2;
+# each chip holds 64 of 128 experts).
+
+name: "GB200_4x_TP2_DPattn_EP2_DP2"
+
+dimensions:
+  - logical_tag: "PP"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_Attn_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "TP_Attn_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "TP_Proj_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "TP_Proj_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "DP_Attn_SU"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 4
+  - logical_tag: "DP_Attn_SO"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "DP_MoE"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 2
+
+  - logical_tag: "TP_MoE_X"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+  - logical_tag: "TP_MoE_Y"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
+
+  - logical_tag: "EP_SU"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 2
+  - logical_tag: "EP_SO"
+    maps_to_physical_dimension_name: "ScaleUpFabric"
+    size: 1
