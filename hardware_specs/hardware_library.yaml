@@ -8,9 +8,29 @@ components:
       bf16_nominal: 1000e12
       fp32_nominal: 66.9e12
       efficiency: 0.7
+    # NVIDIA GB200 NVL (Grace-coupled Blackwell die). Per-Blackwell-die dense
+    # FLOPS, no sparsity. GB200 dies are the higher-binned Blackwell variant
+    # (vs. B200 SXM5):
+    #   - FP4 dense:  10 PFLOPS
+    #   - FP8 dense:  5  PFLOPS
+    #   - BF16 dense: 2.5 PFLOPS
+    # https://resources.nvidia.com/en-us-blackwell-architecture
     GB200_COMPUTE:
-      fp8_nominal: null
-      bf16_nominal: 2250e12 # 2250 TFLOPS
+      fp4_nominal: 10000e12
+      fp8_nominal: 5000e12
+      bf16_nominal: 2500e12
+      fp32_nominal: null
+      efficiency: 0.7
+    # NVIDIA B200 (SXM5, standalone Blackwell GPU, distinct from GB200
+    # NVL-coupled superchip). Per Blackwell datasheet (dense, no sparsity):
+    #   - FP4 dense:  9000 TFLOPS
+    #   - FP8 dense:  4500 TFLOPS
+    #   - BF16 dense: 2250 TFLOPS
+    # https://resources.nvidia.com/en-us-blackwell-architecture
+    B200_COMPUTE:
+      fp4_nominal: 9000e12
+      fp8_nominal: 4500e12
+      bf16_nominal: 2250e12
       fp32_nominal: null
       efficiency: 0.7
     ALTERNATIVE_COMPUTE:
@@ -28,6 +48,16 @@ components:
     GB200_MEMORY:
       bandwidth_per_stack_nominal: 1000e9 # 1 TB/s
       size_per_stack: 24e9             # 24 GB
+      num_stack: 8
+      efficiency: 0.7
+    # B200 SXM5 (180 GB capacity SKU used in MLPerf v5.0 submissions).
+    # 8 stacks of HBM3e × 22.5 GB = 180 GB; aggregate 8 TB/s nominal.
+    # Some B200 SKUs ship with 192 GB (8 × 24 GB stacks); we choose the
+    # 180 GB variant to match the labelled MLPerf systems
+    # ("B200-SXM-180GBx8_TRT").
+    B200_MEMORY:
+      bandwidth_per_stack_nominal: 1000e9 # 1 TB/s per stack -> 8 TB/s aggregate
+      size_per_stack: 22.5e9           # 22.5 GB per stack -> 180 GB total
       num_stack: 8
       efficiency: 0.7
     ALTERNATIVE_MEMORY:
@@ -71,14 +101,28 @@ components:
       type: "NVLink"
       num_links: 18
       bandwidth_nominal: 450e9 # 900 GB/s total / 2 = 450 GB/s outgoing
-      latency_sec: 150e-9
+      # Empirical small-message all-reduce latency floor from the validation panel.
+      latency_sec: 5e-6
       efficiency: 0.8
     GB200_INTERCONNECT:
       name: "GB200_Interconnect"
       type: "NVLink"
       num_links: 18
       bandwidth_nominal: 900e9 # 1800 GB/s total / 2 = 900 GB/s outgoing
-      latency_sec: 150e-9
+      # Realized NCCL small-message all-reduce latency floor (see H100_INTERCONNECT).
+      latency_sec: 5e-6
+      efficiency: 0.8
+    # B200 SXM5 NVLink-5: 1.8 TB/s aggregate bidirectional ->
+    # 900 GB/s unidirectional (matches GB200 chip-to-chip; the difference
+    # between B200 and GB200 lives at the inter-node Switch fabric, not
+    # the per-chip NVLink).
+    B200_INTERCONNECT:
+      name: "B200_Interconnect"
+      type: "NVLink"
+      num_links: 18
+      bandwidth_nominal: 900e9
+      # Realized NCCL small-message all-reduce latency floor (see H100_INTERCONNECT).
+      latency_sec: 5e-6
       efficiency: 0.8
     ALTERNATIVE_INTERCONNECT:
       name: "Alternative_Interconnect"
@@ -114,6 +158,17 @@ nodes:
       xpu_memory: "GB200_MEMORY"
     device_interconnects:
       "fast_fabric": "GB200_INTERCONNECT"
+      "cluster_fabric": "DP_INTERCONNECT_INFINIBAND"
+  # NVIDIA B200 SXM5 standalone GPU node — used for HGX-B200 and DGX-B200
+  # platforms in MLPerf v5.0. Same per-chip NVLink-5 as GB200 NVL but with
+  # InfiniBand cluster fabric (no NVL Switch over many trays).
+  B200_NODE:
+    node_name: "B200_SXM5_HGX"
+    device_compute: "B200_COMPUTE"
+    device_memory_tiers:
+      xpu_memory: "B200_MEMORY"
+    device_interconnects:
+      "fast_fabric": "B200_INTERCONNECT"
       "cluster_fabric": "DP_INTERCONNECT_INFINIBAND"
   ALTERNATIVE_NODE:
     node_name: "Alternative_3.6TB/s_Interconnect"
