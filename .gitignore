@@ -15,3 +15,7 @@ tmp/
 dist/
 build/
 node_modules/
+
+# Validation panel: generated outputs and matplotlib cache
+validation/validation_results/
+.mplcache/

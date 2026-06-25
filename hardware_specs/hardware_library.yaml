@@ -1,19 +1,24 @@
 # hardware_library.yaml
 # Defines reusable hardware components and node configurations.
+#
+# All compute FLOPS figures are dense (no sparsity).
 
 components:
   compute:
+    # NVIDIA H100 SXM5 (Hopper).
+    #   - FP8:  1979 TFLOPS
+    #   - BF16: ~989 TFLOPS
+    #   - FP32: 66.9 TFLOPS
     H100_COMPUTE:
-      fp8_nominal: 3958e12
+      fp8_nominal: 1979e12
       bf16_nominal: 1000e12
       fp32_nominal: 66.9e12
       efficiency: 0.7
-    # NVIDIA GB200 NVL (Grace-coupled Blackwell die). Per-Blackwell-die dense
-    # FLOPS, no sparsity. GB200 dies are the higher-binned Blackwell variant
-    # (vs. B200 SXM5):
-    #   - FP4 dense:  10 PFLOPS
-    #   - FP8 dense:  5  PFLOPS
-    #   - BF16 dense: 2.5 PFLOPS
+    # NVIDIA GB200 NVL (Grace-coupled Blackwell die). Per-Blackwell-die FLOPS.
+    # GB200 dies are the higher-binned Blackwell variant (vs. B200 SXM5):
+    #   - FP4:  10 PFLOPS
+    #   - FP8:  5  PFLOPS
+    #   - BF16: 2.5 PFLOPS
     # https://resources.nvidia.com/en-us-blackwell-architecture
     GB200_COMPUTE:
       fp4_nominal: 10000e12
@@ -22,10 +27,10 @@ components:
       fp32_nominal: null
       efficiency: 0.7
     # NVIDIA B200 (SXM5, standalone Blackwell GPU, distinct from GB200
-    # NVL-coupled superchip). Per Blackwell datasheet (dense, no sparsity):
-    #   - FP4 dense:  9000 TFLOPS
-    #   - FP8 dense:  4500 TFLOPS
-    #   - BF16 dense: 2250 TFLOPS
+    # NVL-coupled superchip). Per Blackwell datasheet:
+    #   - FP4:  9000 TFLOPS
+    #   - FP8:  4500 TFLOPS
+    #   - BF16: 2250 TFLOPS
     # https://resources.nvidia.com/en-us-blackwell-architecture
     B200_COMPUTE:
       fp4_nominal: 9000e12
@@ -41,8 +46,8 @@ components:
 
   memory:
     H100_MEMORY:
-      bandwidth_per_stack_nominal: 820e9 # 820 GB/s
-      size_per_stack: 16e9            # 16 GB
+      bandwidth_per_stack_nominal: 670e9 # 670 GB/s per stack -> 3.35 TB/s aggregate (SXM5 HBM3)
+      size_per_stack: 16e9            # 16 GB -> 80 GB total
       num_stack: 5
       efficiency: 0.7
     GB200_MEMORY:

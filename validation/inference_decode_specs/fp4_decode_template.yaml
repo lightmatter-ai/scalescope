@@ -1,5 +1,5 @@
-# Single-decode-step FP4 workload template for the measured-panel
-# driver (`measurements/run_measured_panel.py`). Identical to
+# Single-decode-step FP4 workload template for the validation-panel
+# driver (`run_validation_panel.py`). Identical to
 # `fp8_decode_template.yaml` except `float_size_bytes: 0.5` (FP4
 # weights and KV cache).
 #

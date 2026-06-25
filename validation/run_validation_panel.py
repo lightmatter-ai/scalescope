@@ -7,28 +7,28 @@ per record at the operating-point batch implied by the measurement, and
 emits a comparison markdown table.
 
 Run from the repo root:
-    # Full panel (canonical output to results/measured_panel_summary.{md,yaml}):
-    python validation/measurements/run_measured_panel.py
+    # Full panel (canonical output to validation_results/validation_panel_summary.{md,yaml}):
+    python validation/run_validation_panel.py
 
     # Smoke-test the first 3 records of each loaded source:
-    python validation/measurements/run_measured_panel.py --limit 3
+    python validation/run_validation_panel.py --limit 3
 
     # One corpus at a time:
-    python validation/measurements/run_measured_panel.py --source trtllm
-    python validation/measurements/run_measured_panel.py --source inferencex
+    python validation/run_validation_panel.py --source trtllm
+    python validation/run_validation_panel.py --source inferencex
 
     # Fine-grained subset (all filters are AND-combined; values within
     # a single flag are OR-combined):
-    python validation/measurements/run_measured_panel.py \
+    python validation/run_validation_panel.py \
         --source inferencex --model minimax_m2_5
-    python validation/measurements/run_measured_panel.py \
+    python validation/run_validation_panel.py \
         --gpu-class B200 --gpu-class GB200
-    python validation/measurements/run_measured_panel.py \
+    python validation/run_validation_panel.py \
         --record-contains isl8192_osl1024 --record-contains conc512
 
     # Dry-run — list what would run, no ScaleScope invocations, no files
     # written:
-    python validation/measurements/run_measured_panel.py \
+    python validation/run_validation_panel.py \
         --source inferencex --model minimax_m2_5 --list-only
 
 Any filter (--source != 'all', --limit, --model, --gpu-class,
@@ -56,9 +56,9 @@ compare at the same point on the per-token throughput curve):
     interleaving, no sweep guesswork.
 
 Outputs:
-    measurements/results/measured_panel_summary.md           (markdown table)
-    measurements/results/measured_panel_summary.yaml         (machine-readable summary)
-    measurements/results/runs/<record_id>.yaml               (per-record ScaleScope output)
+    validation_results/validation_panel_summary.md           (markdown table)
+    validation_results/validation_panel_summary.yaml         (machine-readable summary)
+    validation_results/runs/<record_id>.yaml                 (per-record ScaleScope output)
 """
 
 from __future__ import annotations
@@ -77,10 +77,10 @@ from pathlib import Path
 import yaml
 from tqdm import tqdm
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 HERE = Path(__file__).resolve().parent
-VALIDATION_DIR = HERE.parent
-RESULTS_DIR = HERE / "results"
+VALIDATION_DIR = HERE
+RESULTS_DIR = VALIDATION_DIR / "validation_results"
 RUNS_DIR = RESULTS_DIR / "runs"
 
 # Point matplotlib at a repo-local writable cache so each ScaleScope subprocess
@@ -126,8 +126,8 @@ KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER: dict[str, float] = {
 # passed; this allowlist is an always-include override, not a blanket opt-in.
 FP4_CANONICAL_MODEL_IDS: frozenset[str] = frozenset({"gpt_oss_120b"})
 
-TRTLLM_YAML = HERE / "trtllm_perf_overview.yaml"
-INFERENCEX_DIR = HERE / "inferencex_raw"
+TRTLLM_YAML = VALIDATION_DIR / "benchmark_data" / "trtllm_perf_overview.yaml"
+INFERENCEX_DIR = VALIDATION_DIR / "benchmark_data" / "inferencex_raw"
 
 # InferenceX display-name -> ScaleScope model_zoo filename (no extension).
 # Only models with a model_zoo YAML and a Case in INFERENCEX_CASE_TABLE will
@@ -844,7 +844,7 @@ def _run_scalescope(record: Record, case: Case, *, global_batch: int) -> dict:
     if case.model_yaml not in KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER:
         raise KeyError(
             f"No kernel-launch floor calibrated for model '{case.model_yaml}'. "
-            f"Add it to KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER in run_measured_panel.py "
+            f"Add it to KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER in run_validation_panel.py "
             f"(known: {sorted(KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER)})."
         )
     # Decode TPOT must be averaged over the generation: the per-step context
@@ -1223,7 +1223,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "Optional suffix appended to summary filenames "
-            "(e.g. '__smoke' -> 'measured_panel_summary__smoke.{md,yaml}'). "
+            "(e.g. '__smoke' -> 'validation_panel_summary__smoke.{md,yaml}'). "
             "Auto-set to '__partial' when any filter is active "
             "(--source != 'all', --limit, --model, --gpu-class, "
             "--record-contains), to avoid clobbering canonical full-run "
@@ -1418,6 +1418,7 @@ def main(argv: list[str] | None = None) -> int:
             "submitter": record.submitter,
             "system": record.system,
             "model_id": record.model_id,
+            "gpu_class": record.gpu_class,
             "benchmark": record.benchmark_label,
             "isl": record.isl,
             "osl": record.osl,
@@ -1449,6 +1450,11 @@ def main(argv: list[str] | None = None) -> int:
             row["global_batch"] = global_batch
             row["batch_selection"] = "inferencex_conc"
             row["disagg"] = record.disagg
+            # Structured decode shape consumed by the kernel-floor audit
+            # (calibration/calibrate_kernel_floor.py) so it never has to
+            # re-parse record_id.
+            row["tp"] = record.decode_tp
+            row["conc"] = record.conc
             if ss["ok"]:
                 predicted_tpot = ss["tpot_user_ms"]
                 predicted_tps = ss["tokens_per_second"]
@@ -1576,10 +1582,10 @@ def main(argv: list[str] | None = None) -> int:
     _heartbeat(force=True)
     progress.close()
 
-    summary_yaml = RESULTS_DIR / f"measured_panel_summary{suffix}.yaml"
+    summary_yaml = RESULTS_DIR / f"validation_panel_summary{suffix}.yaml"
     summary_yaml.write_text(yaml.safe_dump({"results": rows}, sort_keys=False))
 
-    summary_md = RESULTS_DIR / f"measured_panel_summary{suffix}.md"
+    summary_md = RESULTS_DIR / f"validation_panel_summary{suffix}.md"
     summary_md.write_text(_format_markdown(rows, deferred_count=len(deferred)))
 
     n_ok = sum(1 for r in rows if r.get("ok"))
@@ -1630,7 +1636,7 @@ def _stat_row(bucket: str, metric: str, ratios: list[float]) -> str | None:
 
 def _format_markdown(rows: list[dict], *, deferred_count: int) -> str:
     out: list[str] = []
-    out.append("# Measured-panel comparison — ScaleScope vs. published measurements\n")
+    out.append("# Validation-panel comparison — ScaleScope vs. published benchmarks\n")
     out.append(
         "Each row is one measured datapoint compared to a ScaleScope "
         "decode-step prediction at the operating-point batch.\n"
@@ -2155,6 +2161,20 @@ def _format_markdown(rows: list[dict], *, deferred_count: int) -> str:
         "caps KV history at 128 tokens on half its layers; the "
         "uniform-full-attention assumption over-counts KV traffic at long "
         "ISL.\n"
+    )
+    out.append(
+        "- **The kernel-launch floor is keyed on model only, not "
+        "(model, GPU).** `KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER` carries one "
+        "value per model, applied across every GPU class it runs on. "
+        "Kernel-launch/dispatch latency is physically a host + GPU-runtime "
+        "cost, so it has a per-GPU component the single value cannot "
+        "capture. On Llama-3.3-70B (the only model spanning two GPU "
+        "classes in the panel), matched (TP, conc, ISL, OSL) cells show "
+        "ScaleScope predicts ~6% higher TPOT on B200 than H100 at small "
+        "batch (~9% pooled): the shared 42 µs floor is centered on H100 "
+        "(small-batch geomean 1.00×) and slightly over-predicts B200 "
+        "(1.05×). The bias is within the ±10% band and small next to the "
+        "OSL-driven KV-cache error above, which is common to both GPUs.\n"
     )
     if contam_caveat is not None:
         out.append(contam_caveat)

@@ -1,5 +1,5 @@
-# Single-decode-step FP8 workload template for the measured-panel
-# driver (`measurements/run_measured_panel.py`).
+# Single-decode-step FP8 workload template for the validation-panel
+# driver (`run_validation_panel.py`).
 #
 # Per-record overrides applied by the driver (in-place, on a YAML
 # copy):
