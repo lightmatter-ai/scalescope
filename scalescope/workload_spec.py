@@ -97,61 +97,34 @@ class ExpertRoutingDistribution(StrEnum):
     Step time is set by the worst-loaded chip, not the average.
 
     Values:
-    - `bottleneck_group_collector`: per-chip multiplier evaluated on the
-      worst-loaded colocated group, computed skew-aware over the global Zipf:
+    - `bottleneck_group_collector_random`: the expected straggler model under
+      load-agnostic (random/hash) placement. The worst-loaded chip holds the
+      single hottest expert (rank 1) plus `c-1` experts drawn uniformly from the
+      remaining `E-1`, so the fillers contribute the cold-tail average:
           p_k      = k^{-s} / H_{E,s},  s solved from E / H_{E,s} = rho
-          E_active = max(1, sum_{k=1..c} (1 - (1 - p_k)^m))
-          frac     = E_active / c
-      where `c = num_colocated_experts`, `m = batch * top_k` is the per-set
-      routing-event count, and the worst chip is modeled (worst case) as
-      hosting the `c` hottest experts. Because the memory model reads
-      `resident * frac = c·(w/TP_MoE)·(E_active/c) = E_active·(w/TP_MoE)`, the
-      per-shard size `w/TP_MoE` is explicit: 2D TP_MoE (finer sharding) shrinks
-      an outlier expert's bottleneck while `E_active` stays ≈ 1. Correct
-      asymptote (→ 1 as `m → ∞`), correct `c = 1` semantics (always 1.0, the
-      chip's one expert must load if touched), and the `c = E` corner is the
-      full Zipf active count — within-chip skew is preserved (no collapse to
-      uniform). This is the physically-grounded choice for step-time modeling.
-
-      Modeling assumption: worst-case placement (the `c` hottest experts
-      colocated) is a deliberate upper bound on the realized worst chip; under
-      random placement the worst chip is "hottest expert + (c-1) average
-      experts," numerically close for steep Zipf.
-
-    - `bottleneck_group_collector_random`: the expected (rather than worst-case)
-      straggler model. Under load-agnostic (random/hash) placement the worst-loaded
-      chip holds the single hottest expert (rank 1) plus `c-1` experts drawn
-      uniformly from the remaining `E-1`, so the fillers contribute the cold-tail
-      average rather than the next-hottest experts:
           a_k      = 1 - (1 - p_k)^m              # P(expert k hit by >= 1 of m events)
           E_active = a_1 + (c - 1) * mean_{k=2..E} a_k
           frac     = E_active / c
-      Using the tail average `mean_{k=2..E} a_k` for the fillers (instead of the
-      next-hottest `a_2..a_c` of the worst-case model) makes `frac` strictly
-      smaller in the interior `1 < c < E`: the straggler reads fewer distinct
-      experts. The model is corner-exact against the worst-case bound:
-      `c = 1` → `a_1`; `c = E` → `sum_{k=1..E} a_k` (the full Zipf active count);
-      `rho = 1` → plain coupon collector. It carries the same `w/TP_MoE` shard
-      term, so 2D `TP_MoE` keeps shrinking an outlier expert's bottleneck
-      (`E_active → 1` for steep Zipf at small `m`).
+      where `c = num_colocated_experts` and `m = batch * top_k` is the per-set
+      routing-event count. Because the memory model reads
+      `resident * frac = c·(w/TP_MoE)·(E_active/c) = E_active·(w/TP_MoE)`, the
+      per-shard size `w/TP_MoE` is explicit: 2D `TP_MoE` (finer sharding) shrinks
+      an outlier expert's bottleneck (`E_active → 1` for steep Zipf at small `m`).
+      Corners: `c = 1` → `a_1`; `c = E` → `sum_{k=1..E} a_k` (the full Zipf active
+      count); `rho = 1` → plain coupon collector.
 
-      No floor on `E_active` (the key difference from the worst-case model).
-      The worst-case variant takes `E_active = max(1, ...)`: it is an *upper
-      bound*, and a bound on the worst chip that is assumed to host the hottest
-      expert should never claim fewer than that one expert's weight read. This
-      model is instead an *expectation* over placements and routing, so a value
-      below 1.0 is meaningful: at small `m` each routing event touches only a few
-      of the `E` experts, so `a_1 = 1 - (1 - p_1)^m ≈ m·p_1` can be well under 1,
-      and `E_active` (the expected distinct-active count on the straggler) is
-      genuinely fractional — the straggler reads less than one full expert's
-      weights per step on average. Flooring at 1.0 would force every step to pay a
-      full per-expert HBM read even in that regime, systematically over-counting
-      weight traffic and inflating decode step time at small batch / low top-k.
-      Leaving it unfloored preserves the correct small-`m` asymptote (linear in
-      `m`) while still rising to the full Zipf active count as `m` grows.
+      `E_active` is unfloored: it is an *expectation* over placements and routing,
+      so a value below 1.0 is meaningful. At small `m` each routing event touches
+      only a few of the `E` experts, so `a_1 = 1 - (1 - p_1)^m ≈ m·p_1` can be
+      well under 1, and `E_active` (the expected distinct-active count on the
+      straggler) is genuinely fractional — the straggler reads less than one full
+      expert's weights per step on average. Flooring at 1.0 would force every step
+      to pay a full per-expert HBM read even in that regime, systematically
+      over-counting weight traffic and inflating decode step time at small batch /
+      low top-k. Leaving it unfloored preserves the correct small-`m` asymptote
+      (linear in `m`) while still rising to the full Zipf active count as `m` grows.
     """
 
-    BOTTLENECK_GROUP_COLLECTOR = "bottleneck_group_collector"
     BOTTLENECK_GROUP_COLLECTOR_RANDOM = "bottleneck_group_collector_random"
 
 
@@ -253,10 +226,10 @@ class MoESpecV2(BaseModel):
         description=(
             "Shape of the per-expert routing probability distribution used to compute "
             "the expected fraction of experts active per step. "
-            "'bottleneck_group_collector' evaluates the worst-loaded colocated group "
-            "skew-aware over the global Zipf solved from rho (correct large-batch "
-            "asymptote and correct c=1 semantics). Only consulted when "
-            "expert_weight_residency_policy = resident_active_subset."
+            "'bottleneck_group_collector_random' evaluates the expected worst-loaded "
+            "colocated group under random placement (hottest expert + cold-tail-average "
+            "fillers), skew-aware over the global Zipf solved from rho. Only consulted "
+            "when expert_weight_residency_policy = resident_active_subset."
         ),
     )
     # Optional

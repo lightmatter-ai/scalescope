@@ -1067,10 +1067,10 @@ def get_model_stats(
     else:
         raise ValueError(f"Unsupported router_sync_mode: {router_sync_mode}")
 
-    # Top-k realizability check (see conf26_followup/modeling_improvements_todo.md §6, Step 7):
-    # under top-k routing with distinct experts per token, rho is bounded by
-    # `num_regular_experts / num_selected_experts`. Fail fast here, before any
-    # compute/comm/memory work begins, with `model_spec` and `v2_spec` both resolved.
+    # Top-k realizability check: under top-k routing with distinct experts per
+    # token, rho is bounded by `num_regular_experts / num_selected_experts`.
+    # Fail fast here, before any compute/comm/memory work begins, with
+    # `model_spec` and `v2_spec` both resolved.
     validate_expert_imbalance_realizability(
         expert_imbalance=v2_spec.expert_imbalance,
         num_regular_experts=model_spec.num_regular_experts,
@@ -2531,8 +2531,8 @@ def get_model_stats(
         plotting.num_experts_per_dp_rank_label: moe_config.num_all_experts_per_dp_rank,
         plotting.attn_domains_per_full_expert_set_label: moe_config.attn_domains_per_full_expert_set,
         plotting.num_complete_expert_sets_label: moe_config.num_complete_expert_sets,
-        # Expert activation cardinality diagnostics — see workload_spec.ExpertWeightResidencyPolicy
-        # and conf26_followup/modeling_improvements_todo.md §6 for definitions.
+        # Expert activation cardinality diagnostics — see
+        # workload_spec.ExpertWeightResidencyPolicy for definitions.
         # Computed unconditionally so that switching policies produces auditable diffs.
         **_expert_activation_diagnostics(
             workload_spec=workload_spec,

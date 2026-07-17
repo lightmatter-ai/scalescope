@@ -49,8 +49,11 @@ dp_spec:
 moe_spec_v2:
   num_colocated_experts: 1      # Number of experts hosted per XPU (colocation)
   expert_imbalance: 1.5         # Traffic multiplier modeling routed token skew (>= 1.0)
+  # Training keeps the full expert set resident: every expert's weights are
+  # read/updated in the optimizer step and backward pass regardless of
+  # routing, so active-subset streaming does not apply.
   expert_weight_residency_policy: resident_full_set
-  expert_routing_distribution: bottleneck_group_collector
+  expert_routing_distribution: bottleneck_group_collector_random
 
 pp_spec:
   variant: GPIPE                 # Pipeline-parallel strategy (GPIPE)

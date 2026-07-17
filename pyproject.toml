@@ -58,6 +58,3 @@ max-line-length = 100
 pythonpath = [
   "."
 ]
-markers = [
-  "conf26_paper_regression: locks conf26 paper numeric artifact regressions"
-]

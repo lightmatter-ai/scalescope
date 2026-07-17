@@ -51,8 +51,8 @@ dp_spec:
 moe_spec_v2:
   num_colocated_experts: 1
   expert_imbalance: 1.5
-  expert_weight_residency_policy: resident_full_set
-  expert_routing_distribution: bottleneck_group_collector
+  expert_weight_residency_policy: resident_active_subset
+  expert_routing_distribution: bottleneck_group_collector_random
 
 pp_spec:
   variant: GPIPE

@@ -15,8 +15,8 @@ import matplotlib
 import pandas as pd
 from matplotlib.patches import FancyBboxPatch
 
-# Locked paper palette (Figure 4 and companion regime maps).
-# Keep this mapping stable for artifact reproducibility.
+# Regime-map palette (Figure 4 and companion regime maps). Colors are assigned
+# explicitly per shape so regenerated figures stay visually consistent.
 #
 # Color logic: the `NxY` shape determines hue family.
 #   - Pure-Y shapes (`1xY`):     blues, lighter as Y shrinks.
@@ -62,12 +62,12 @@ BATCHES_FC = (32, 128, 1024, 4096)
 def _palette_colors(tp_moe_shape: str) -> tuple[str, str]:
     if tp_moe_shape not in PAPER_SHAPE_COLORS:
         raise ValueError(
-            f"Unknown tp_moe_shape '{tp_moe_shape}' for locked paper palette. "
+            f"Unknown tp_moe_shape '{tp_moe_shape}' for regime-map palette. "
             f"Add it explicitly to PAPER_SHAPE_COLORS and PAPER_TEXT_COLORS."
         )
     if tp_moe_shape not in PAPER_TEXT_COLORS:
         raise ValueError(
-            f"Missing text color for tp_moe_shape '{tp_moe_shape}' in locked paper palette."
+            f"Missing text color for tp_moe_shape '{tp_moe_shape}' in regime-map palette."
         )
     return PAPER_SHAPE_COLORS[tp_moe_shape], PAPER_TEXT_COLORS[tp_moe_shape]
 

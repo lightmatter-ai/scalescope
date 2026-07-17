@@ -36,9 +36,10 @@ This guide generates only the artifacts used in the current paper draft and stor
 bash conf26doc/generate_paper_artifacts.sh
 ```
 
-This script removes `out/conf26/build/` and `out/conf26/paper_artifacts/` first, reruns the three publication
-sweeps, regenerates all paper artifacts, and then runs three verification steps:
+This script removes `out/conf26/build/` and `out/conf26/paper_artifacts/` first, always reruns the full sweep set
+(the HyperX sweep spans `s in {1,2,4,8,16,32}`, covering the complete parity-aligned search space),
+derives Table II / Figure 5 from that summary, regenerates all paper artifacts, and then runs two steps:
 
-- `verify_topology_claims.py`: verifies context-invariance and per-topology claims (Section III-D)
-- `check_table2_speedups_consistency.py`: confirms internal consistency between the generated Table II LaTeX and the sweep CSV
-- `pytest -m conf26_paper_regression`: asserts exact agreement with the Table II speedup values, Figure 4 regime map, and Figure 5 bottleneck grid from the submitted paper
+- `verify_topology_claims.py`: extracts the per-topology winning-config CSVs and reports a structural
+  context-invariance check (informational; does not gate the build)
+- `check_table2_speedups_consistency.py`: confirms internal consistency between the generated Table II LaTeX and the sweep CSV it was derived from

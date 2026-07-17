@@ -257,65 +257,6 @@ def _solve_zipf_exponent(*, num_regular_experts: int, expert_imbalance: float) -
     return s
 
 
-def _zipf_active_experts_top_c_hottest(
-    *,
-    num_regular_experts: int,
-    expert_imbalance: float,
-    num_colocated_experts: int,
-    m: float,
-) -> float:
-    """Expected distinct active experts on the worst-loaded colocated group.
-
-    Step time is set by the worst chip. We model that chip (worst case) as
-    hosting the ``c = num_colocated_experts`` hottest experts of the global
-    Zipf(rho) distribution. Expert ``k`` (k = 1..c) is active with probability
-    ``1 - (1 - p_k)^m`` under ``m`` independent routing draws, so
-
-        E_active_chip(m) = max(1, sum_{k=1..c} (1 - (1 - p_k)^m))
-
-    with ``p_k = k^{-s} / H_{E,s}`` and ``s`` solved from ``rho``. The floor of
-    1.0 (for m > 0) encodes that the realized worst chip always loads at least
-    its single hottest expert.
-
-    Asymptotes:
-      m -> 0  : 0
-      m -> oo : c  (every hosted expert eventually touched)
-      steep Zipf (outlier): bounded well below c (only the genuinely-hot
-                            experts contribute), so the chip reads ~1 shard.
-    """
-    if m <= 0:
-        return 0.0
-    s = _solve_zipf_exponent(
-        num_regular_experts=num_regular_experts, expert_imbalance=expert_imbalance
-    )
-    if s == 0.0:
-        # Uniform routing (rho == 1): every expert has the same probability
-        # p = 1/E, so all c hosted experts share one activation probability and we
-        # can scale a single term by c instead of summing. Each expert is hit by
-        # at least one of the m draws w.p. 1 - (1 - 1/E)^m (the coupon-collector
-        # per-expert occupancy). Floor at 1.0: the worst chip always loads >= its
-        # one hottest expert when m > 0.
-        per_expert_active = 1.0 - (1.0 - 1.0 / num_regular_experts) ** m
-        return max(1.0, num_colocated_experts * per_expert_active)
-    # Skewed routing (rho > 1, s > 0). Build the Zipf normalizer over all E
-    # experts: H_{E,s} = sum_{k=1..E} k^{-s}, so the per-expert probability is
-    # p_k = k^{-s} / H_{E,s} (k = 1 the hottest).
-    h_es = 0.0
-    for k in range(1, num_regular_experts + 1):
-        h_es += k ** (-s)
-    # Sum the activation probabilities of the c hottest experts (k = 1..c), the
-    # set the worst chip is assumed to host. Expert k is active (hit by >= 1 of
-    # the m draws) w.p. 1 - (1 - p_k)^m; the sum is the expected distinct-active
-    # count on that chip.
-    total = 0.0
-    for k in range(1, num_colocated_experts + 1):
-        p_k = (k ** (-s)) / h_es
-        total += 1.0 - (1.0 - p_k) ** m
-    # Floor at 1.0: as a worst-case bound the straggler always reads at least its
-    # single hottest expert.
-    return max(1.0, total)
-
-
 def _zipf_active_experts_the_hottest_plus_random(
     *,
     num_regular_experts: int,
@@ -325,35 +266,29 @@ def _zipf_active_experts_the_hottest_plus_random(
 ) -> float:
     """Expected distinct active experts on the straggler under *random* placement.
 
-    The realistic counterpart to :func:`_zipf_active_experts_top_c_hottest`. Under
-    load-agnostic (random/hash) placement the worst-loaded chip holds the single
-    hottest expert (#1, placement-invariant — it is hot wherever it lands) plus
-    ``c - 1`` experts sampled from the *tail* of the global Zipf, rather than the
-    ``c`` globally hottest. With ``a_k = 1 - (1 - p_k)^m`` the expected distinct
-    active count is
+    Under load-agnostic (random/hash) placement the worst-loaded chip holds the
+    single hottest expert (#1, placement-invariant — it is hot wherever it lands)
+    plus ``c - 1`` experts sampled from the *tail* of the global Zipf, rather than
+    the ``c`` globally hottest. With ``a_k = 1 - (1 - p_k)^m`` the expected
+    distinct active count is
 
         E_active_chip = a_1 + (c - 1) * mean_{k=2..E} a_k
 
     i.e. one hottest expert plus ``c - 1`` average tail experts. The fillers use
-    the cold-tail mean ``mean a_{2..E}`` (not the next-hottest ``a_2..a_c``), so
-    the result is strictly below the top-``c`` bound in the interior ``1<c<E``.
+    the cold-tail mean ``mean a_{2..E}`` (not the next-hottest ``a_2..a_c``).
 
-    No ``max(1.0, ...)`` floor (the key difference from
-    :func:`_zipf_active_experts_top_c_hottest`). That function is an *upper
-    bound*: it assumes the straggler hosts the hottest expert, and a bound on
-    such a chip should never claim fewer than that one expert's weight read, so it
-    floors at 1.0. This function is instead an *expectation* over random
-    placement and routing, so a value below 1.0 is the honest answer: at small
-    ``m`` even the hottest expert is hit with probability ``a_1 = 1 - (1 -
-    p_1)^m ≈ m·p_1 < 1``, and the tail fillers are smaller still, so the expected
-    distinct-active count is genuinely fractional (the straggler reads less than
-    one full expert's weights per step on average). Flooring at 1.0 would force a
-    full per-expert HBM read every step in that regime, over-counting weight
-    traffic and inflating decode step time at small batch / low top-k. Leaving it
-    unfloored keeps the correct small-``m`` asymptote (linear in ``m``) while
-    still rising to the full Zipf active count as ``m`` grows.
+    ``E_active`` is left unfloored: this is an *expectation* over random placement
+    and routing, so a value below 1.0 is the honest answer. At small ``m`` even
+    the hottest expert is hit with probability ``a_1 = 1 - (1 - p_1)^m ≈ m·p_1 <
+    1``, and the tail fillers are smaller still, so the expected distinct-active
+    count is genuinely fractional (the straggler reads less than one full expert's
+    weights per step on average). Flooring at 1.0 would force a full per-expert
+    HBM read every step in that regime, over-counting weight traffic and inflating
+    decode step time at small batch / low top-k. Leaving it unfloored keeps the
+    correct small-``m`` asymptote (linear in ``m``) while still rising to the full
+    Zipf active count as ``m`` grows.
 
-    Corners (match the top-``c`` model exactly):
+    Corners:
       c = 1     : a_1
       c = E     : a_1 + (E-1)·mean_{k≥2} a_k = sum_{k=1..E} a_k (full Zipf count)
       rho = 1   : all a_k equal ⇒ plain coupon collector (c·a)
@@ -409,19 +344,14 @@ def compute_expert_activation_cardinality(
     """Compute the active-expert quantity used for the per-chip weight-read
     multiplier under ``RESIDENT_ACTIVE_SUBSET``.
 
-      bottleneck_group_collector (per-chip worst-group distinct count, skew
-      aware, correct asymptote and correct c=1 behavior):
+      bottleneck_group_collector_random (expected straggler under random
+      placement; holds hottest #1 + (c-1) random tail experts, unfloored):
           p_k       = k^{-s} / H_{E,s},  s solved from E / H_{E,s} = rho
-          E_active  = max(1, sum_{k=1..c} (1 - (1 - p_k)^m))  (worst chip = c
-                      hottest experts; floor = its single hottest always loads)
+          a_k       = 1 - (1 - p_k)^m
+          E_active  = a_1 + (c - 1) * mean_{k=2..E} a_k
           frac      = E_active / c
-
-      bottleneck_group_collector_random (the realistic / expected counterpart;
-      straggler holds hottest #1 + (c-1) random tail experts, no floor):
-          E_active  = a_1 + (c - 1) * mean_{k=2..E} a_k,   a_k = 1 - (1 - p_k)^m
-          frac      = E_active / c
-      Strictly below the worst-case bound in the interior, corner-exact against
-      it, and an expectation (so unfloored). See `_zipf_active_experts_the_hottest_plus_random`.
+      An expectation (so unfloored); corner-exact at c=1, c=E, and rho=1.
+      See `_zipf_active_experts_the_hottest_plus_random`.
 
     Why coupon collector. ``m = tokens_per_set * num_selected_experts`` is the
     number of routing "draws" (token->expert assignments) that hit one full
@@ -442,13 +372,13 @@ def compute_expert_activation_cardinality(
       physically-grounded choice. The memory model multiplies resident weight
       by ``frac``; since ``frac = E_active / c`` this equals
       ``E_active * (w / TP_MoE)``, exposing the per-shard read so 2D TP_MoE
-      (finer sharding) shrinks an outlier's bottleneck. At c=1 it returns 1.0
-      for any m > 0 (the chip's single expert must be loaded). At c=E it
+      (finer sharding) shrinks an outlier's bottleneck. At c=1 it returns
+      ``a_1`` (the hottest expert's hit probability, < 1 at small m). At c=E it
       becomes the full Zipf active count (within-chip skew preserved).
 
     ``rho = expert_imbalance`` is the **raw** (un-damped) per-expert
     max/mean routing-load ratio at single-expert placement (SC26 §II-D). The
-    bottleneck path uses raw ``rho`` because the top-c selection captures
+    bottleneck path uses raw ``rho`` because the straggler model captures
     worst-group concentration directly (no ``rho_eff`` damping).
 
     Returned fields:
@@ -488,13 +418,9 @@ def compute_expert_activation_cardinality(
     # Distinct active experts on the straggler chip. Dividing by c makes the
     # memory model's `resident * frac` equal `e_active * (w/TP_MoE)`, exposing the
     # per-shard weight read so finer sharding (2D TP_MoE) shrinks the outlier
-    # bottleneck. The two models differ in which experts the straggler is assumed
-    # to hold:
-    #   - worst case (bound): the c globally hottest, floored at 1.0;
-    #   - random (expectation): hottest #1 + (c-1) tail experts, no floor.
+    # bottleneck. Under random placement the straggler holds the hottest expert
+    # (#1) plus c-1 cold-tail-average fillers (expectation, unfloored).
     match routing_distribution:
-        case ExpertRoutingDistribution.BOTTLENECK_GROUP_COLLECTOR:
-            active_experts_estimator = _zipf_active_experts_top_c_hottest
         case ExpertRoutingDistribution.BOTTLENECK_GROUP_COLLECTOR_RANDOM:
             active_experts_estimator = _zipf_active_experts_the_hottest_plus_random
         case _:
@@ -521,28 +447,25 @@ def compute_expert_activation_cardinality(
     )
 
 
-def _attenuate_expert_imbalance(
-    *,
-    expert_imbalance: float,
-    num_regular_experts: int,
-    num_colocated_experts: int,
-    beta: float,
+def dilute_expert_imbalance(
+    *, expert_imbalance: float, num_regular_experts: int, num_colocated_experts: int
 ) -> float:
-    """Shared colocation-attenuation core for the expert-imbalance laws.
+    """Damp expert imbalance as colocation increases (dilute / single-outlier law).
 
-    All colocation-damping laws used here are members of the one-parameter family
+    The one straggler law used on the token path. Under a Zipf load the worst
+    chip is driven by one dominant expert diluted by ``c - 1`` cold fillers, so
+    the surviving imbalance attenuates as ``1/c``:
 
-        effective_imbalance = 1 + (rho - 1) * A(c)^beta,
-        A(c) = (E - c) / (c * (E - 1))
+        effective_imbalance = 1 + (rho - 1) * A(c),   A(c) = (E - c) / (c * (E - 1))
 
     where E is total regular experts and c is colocated experts per XPU (clamped
-    to ``[1, E]``). ``beta`` selects the law:
-    - ``beta = 1/2`` -> SC26 Eq. (2) variance/CLT law (:func:`damp_expert_imbalance`).
-    - ``beta = 1``   -> dominant-outlier / Zipf-exact law (:func:`dilute_expert_imbalance`).
+    to ``[1, E]``). This is analytically exact for the spike+uniform
+    (dominant-outlier) load and is the correct exponent for Zipf routing.
 
-    Endpoints are ``beta``-independent: ``c = 1 -> A = 1`` (no attenuation,
-    effective imbalance = ``expert_imbalance``); ``c = E -> A = 0`` (full
-    attenuation, effective imbalance = 1).
+    Properties:
+    - c = 1  -> A = 1 -> effective imbalance = expert_imbalance
+    - c = E  -> A = 0 -> effective imbalance = 1
+    - monotonic and continuous for 1 <= c <= E
     """
     if num_regular_experts <= 1:
         return 1.0
@@ -551,72 +474,7 @@ def _attenuate_expert_imbalance(
     e = int(num_regular_experts)
     base = max(0.0, float(expert_imbalance) - 1.0)
     a = max(0.0, (e - c) / (c * (e - 1)))
-    return 1.0 + base * (a**beta)
-
-
-def damp_expert_imbalance(
-    *, expert_imbalance: float, num_regular_experts: int, num_colocated_experts: int
-) -> float:
-    """Continuously damp expert imbalance as colocation increases.
-
-    The ``beta = 1/2`` (variance/CLT) member of the
-    :func:`_attenuate_expert_imbalance` family.
-
-    Statistical interpretation:
-    - Treat each expert's routed token load as a finite population of size E with variance sigma^2.
-    - Colocating c experts means each XPU sees the average of c expert loads sampled without replacement.
-    - The variance of that average is:
-        Var(mean_c) = (sigma^2 / c) * ((E - c) / (E - 1))
-      so the standard deviation shrinks by:
-        attenuation = sqrt(((E - c) / (E - 1)) / c) = A(c)^(1/2)
-
-    We apply this attenuation to the excess over uniform load:
-        effective_imbalance = 1 + (expert_imbalance - 1) * attenuation
-    where E is total regular experts and c is colocated experts per XPU (clamped to [1, E]).
-
-    Properties:
-    - c = 1    -> attenuation = 1, effective imbalance = expert_imbalance
-    - c = E    -> attenuation = 0, effective imbalance = 1
-    - monotonic and continuous for 1 <= c <= E
-    """
-    return _attenuate_expert_imbalance(
-        expert_imbalance=expert_imbalance,
-        num_regular_experts=num_regular_experts,
-        num_colocated_experts=num_colocated_experts,
-        beta=0.5,
-    )
-
-
-def dilute_expert_imbalance(
-    *, expert_imbalance: float, num_regular_experts: int, num_colocated_experts: int
-) -> float:
-    """Damp expert imbalance via the ``beta = 1`` (dilute / single-outlier) law.
-
-    The heavy-tail counterpart to :func:`damp_expert_imbalance` (the SC26
-    ``beta = 1/2`` variance law ``rho_eff``); both are members of the
-    :func:`_attenuate_expert_imbalance` family. Under a Zipf load the straggler is
-    driven by one dominant expert diluted by ``c - 1`` cold fillers, so the
-    surviving imbalance attenuates as ``1/c`` rather than ``1/sqrt(c)``:
-
-        effective_imbalance = 1 + (rho - 1) * (E - c) / (c * (E - 1))
-
-    i.e. the ``beta = 1`` member of ``1 + (rho - 1) * A(c)^beta`` with
-    ``A(c) = (E - c) / (c * (E - 1))``. This is analytically exact for the
-    spike+uniform (dominant-outlier) load and is the correct exponent for Zipf
-    routing (``conf26_followup/routing_skew_scaling_laws.md`` §4; selection is
-    documented in ``modeling_improvements_todo.md`` §6.quinque).
-
-    Boundaries are identical to :func:`damp_expert_imbalance`:
-    - c = 1  -> A = 1 -> effective imbalance = expert_imbalance
-    - c = E  -> A = 0 -> effective imbalance = 1
-    and it attenuates strictly faster in the interior ``1 < c < E`` (``rho > 1``).
-    """
-    return _attenuate_expert_imbalance(
-        expert_imbalance=expert_imbalance,
-        num_regular_experts=num_regular_experts,
-        num_colocated_experts=num_colocated_experts,
-        beta=1.0,
-    )
+    return 1.0 + base * a
 
 
 def infer_expert_placement_per_xpu(
@@ -738,25 +596,11 @@ def infer_expert_placement_per_xpu(
         )
     num_complete_expert_sets = ep_chips_per_pp_stage // full_expert_set_xpu_count
 
-    # Regular expert traffic multiplier with colocation-aware damping. The
-    # straggler law is gated on the routing-distribution selector so the token
-    # path stays consistent with the weight-read path:
-    #   - bottleneck_group_collector         -> rho_eff (beta=1/2, SC26-compat).
-    #     This is the default for every existing config, so the published panel /
-    #     Table II baseline is reproduced exactly (no numeric change).
-    #   - bottleneck_group_collector_random  -> beta=1 dilute law, matching the
-    #     random-placement weight-read model (one coherent straggler law across
-    #     weight + token paths).
-    match moe_v2.expert_routing_distribution:
-        case ExpertRoutingDistribution.BOTTLENECK_GROUP_COLLECTOR:
-            imbalance_law = damp_expert_imbalance
-        case ExpertRoutingDistribution.BOTTLENECK_GROUP_COLLECTOR_RANDOM:
-            imbalance_law = dilute_expert_imbalance
-        case _:
-            raise ValueError(
-                f"Unsupported routing_distribution: {moe_v2.expert_routing_distribution}"
-            )
-    effective_imbalance = imbalance_law(
+    # Regular expert traffic multiplier with colocation-aware damping. The token
+    # path always uses the dilute (1/c, Zipf-exact) straggler law, independent of
+    # the routing-distribution selector: the dominant-outlier attenuation is the
+    # better-justified exponent for skewed routing.
+    effective_imbalance = dilute_expert_imbalance(
         expert_imbalance=moe_v2.expert_imbalance,
         num_regular_experts=num_regular,
         num_colocated_experts=num_colocated_experts,

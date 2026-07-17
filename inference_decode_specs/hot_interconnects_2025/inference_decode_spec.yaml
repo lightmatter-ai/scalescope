@@ -44,8 +44,8 @@ dp_spec:
 moe_spec_v2:
   num_colocated_experts: 1      # Number of experts hosted per XPU (expert colocation)
   expert_imbalance: 1.5         # Routed token skew multiplier (>= 1.0) affecting MoE a2a and compute
-  expert_weight_residency_policy: resident_full_set
-  expert_routing_distribution: bottleneck_group_collector
+  expert_weight_residency_policy: resident_active_subset
+  expert_routing_distribution: bottleneck_group_collector_random
 
 pp_spec:
   variant: GPIPE                 # Pipeline-parallel strategy
