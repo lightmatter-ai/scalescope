@@ -13,11 +13,6 @@
 #     precision in the official weights.
 #
 # Caveats not modelled by ScaleScope today:
-#   - **Alternating sliding-window / full attention layers** (sliding window
-#     = 128 tokens every other layer). For long-context decode this means
-#     half the layers' KV-cache traffic is bounded by 128 tokens of history
-#     rather than the full ISL+OSL. ScaleScope assumes uniform full
-#     attention, so KV-traffic predictions are upper bounds at long OSL.
 #   - **Attention bias** (`attention_bias: true`). Small absolute weight
 #     contribution (~num_heads × head_dim per layer); negligible at this
 #     scale.
@@ -35,6 +30,12 @@ mlp_ratio: 1.0
 mlp_kind: gated_3matrix
 max_sequence_length: 131072
 vocab_size: 201088
+
+# Alternating sliding-window / full attention: sliding window = 128 tokens
+# on every other layer (HF config `sliding_window: 128`, layer_types
+# alternate sliding_attention / full_attention).
+sliding_window_size: 128
+swa_layer_fraction: 0.5
 
 # MoE: fine-grained, top-4
 num_regular_experts: 128

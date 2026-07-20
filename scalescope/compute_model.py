@@ -11,6 +11,7 @@ import math
 import warnings
 
 from scalescope.model_spec import (
+    attention_layer_classes,
     attn_params_per_xpu,
     expert_params_per_xpu,
     TransformerConfig,
@@ -99,10 +100,22 @@ def _calculate_prefill_attention_attn_compute(
     # GQA, K/V are broadcast back to `num_heads` so the FLOPS count is the
     # same as MHA at q_proj_out_dim = num_heads * head_dim. This is the
     # post-Q-projection activation dim, NOT d_model (they differ for wide-Q).
-    kqv_flops = n_batch * matmul_flops(n_seq, q_proj_out_dim, q_proj_out_dim, n_seq)  # Q @ K.T
-    kqv_flops += n_batch * matmul_flops(n_seq, n_seq, n_seq, q_proj_out_dim)  # Attn @ V
-
-    total_flops = kqv_flops
+    #
+    # Blended across attention layer classes. The full-attention class keeps
+    # the dense n_seq × n_seq score region (no causal-triangle discount, per
+    # the dense-matmul convention used throughout). The sliding-window class
+    # uses the consistent analogue: a rectangle clipped to the window,
+    # n_seq × min(window, n_seq).
+    total_flops = 0.0
+    for layer_class in attention_layer_classes(transformer_config):
+        score_width = layer_class.kv_len(n_seq)
+        kqv_flops = n_batch * matmul_flops(
+            n_seq, q_proj_out_dim, q_proj_out_dim, score_width
+        )  # Q @ K.T
+        kqv_flops += n_batch * matmul_flops(
+            n_seq, score_width, score_width, q_proj_out_dim
+        )  # Attn @ V
+        total_flops += layer_class.layer_fraction * kqv_flops
     n_chips = tp_attn_topology.num_chips
     flops_per_chip = total_flops / n_chips
     node = tp_attn_topology.physical_topology.node_definition
@@ -402,13 +415,17 @@ def _calculate_decode_attention_attn_compute(
     # (B, 1, head_dim) @ (B, head_dim, S_cache) replicated across num_heads
     # heads; for GQA the cached K is broadcast back to num_heads so the
     # FLOPS count is q_proj_out_dim across the reduction.
-    qkt_flops = matmul_flops(n_batch * 1, q_proj_out_dim, q_proj_out_dim, n_seq_so_far)
-
-    # KV cache: Attends to V cache
-    # Attention-V multiplication: (Attn @ V) -> (B, 1, S_cache) @ (B, S_cache, q_proj_out_dim).
-    att_v_flops = matmul_flops(n_batch * 1, n_seq_so_far, n_seq_so_far, q_proj_out_dim)
-
-    total_flops = qkt_flops + att_v_flops
+    #
+    # Costs are blended across attention layer classes (full vs sliding
+    # window): sliding-window layers attend to at most `window_size` cached
+    # tokens, so their KV-cache GEMMs are capped at that length.
+    total_flops = 0.0
+    for layer_class in attention_layer_classes(transformer_config):
+        kv_len = layer_class.kv_len(n_seq_so_far)
+        qkt_flops = matmul_flops(n_batch * 1, q_proj_out_dim, q_proj_out_dim, kv_len)
+        # Attention-V multiplication: (Attn @ V) -> (B, 1, S_kv) @ (B, S_kv, q_proj_out_dim).
+        att_v_flops = matmul_flops(n_batch * 1, kv_len, kv_len, q_proj_out_dim)
+        total_flops += layer_class.layer_fraction * (qkt_flops + att_v_flops)
     n_chips = attn_tp_topology.num_chips
     flops_per_chip = total_flops / n_chips
     node = attn_tp_topology.physical_topology.node_definition
@@ -571,18 +588,23 @@ def _calculate_backward_attention_attn_compute(
     # attention compute, so the backward FLOPS — including dK and dV — are
     # at that broadcast level (gradient reduction back to num_kv_heads is
     # an O(1) sum, not in the matmul FLOPS count).
-    K_grad_flops = n_batch * (
-        matmul_flops(n_seq, q_proj_out_dim, q_proj_out_dim, n_seq)
-        + matmul_flops(n_seq, n_seq, n_seq, q_proj_out_dim)
-    )
-    Q_grad_flops = n_batch * (
-        matmul_flops(n_seq, q_proj_out_dim, q_proj_out_dim, n_seq)
-        + matmul_flops(n_seq, n_seq, n_seq, q_proj_out_dim)
-    )
-    V_grad_flops = n_batch * matmul_flops(n_seq, n_seq, n_seq, q_proj_out_dim)
-    core_attn_grads = K_grad_flops + Q_grad_flops + V_grad_flops
-
-    total_flops = core_attn_grads
+    #
+    # Blended across attention layer classes: sliding-window layers have a
+    # score region clipped to n_seq × min(window, n_seq) (same windowed-
+    # rectangle convention as the forward prefill path).
+    total_flops = 0.0
+    for layer_class in attention_layer_classes(transformer_config):
+        score_width = layer_class.kv_len(n_seq)
+        K_grad_flops = n_batch * (
+            matmul_flops(n_seq, q_proj_out_dim, q_proj_out_dim, score_width)
+            + matmul_flops(n_seq, score_width, score_width, q_proj_out_dim)
+        )
+        Q_grad_flops = n_batch * (
+            matmul_flops(n_seq, q_proj_out_dim, q_proj_out_dim, score_width)
+            + matmul_flops(n_seq, score_width, score_width, q_proj_out_dim)
+        )
+        V_grad_flops = n_batch * matmul_flops(n_seq, score_width, score_width, q_proj_out_dim)
+        total_flops += layer_class.layer_fraction * (K_grad_flops + Q_grad_flops + V_grad_flops)
     n_chips = tp_attn_topology.num_chips
     flops_per_chip = total_flops / n_chips
     node = tp_attn_topology.physical_topology.node_definition

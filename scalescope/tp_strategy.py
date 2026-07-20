@@ -8,7 +8,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from scalescope.decode_layout_trace import NULL_LAYOUT_TRACE
-from scalescope.model_spec import resolve_kv_heads_per_partition, TransformerConfig
+from scalescope.model_spec import (
+    attention_layer_classes,
+    resolve_kv_heads_per_partition,
+    TransformerConfig,
+)
 from scalescope.network_topology_model import (
     hockney_model_all_gather_on_nd_topology,
     hockney_model_all_reduce_on_nd_topology,
@@ -1194,33 +1198,50 @@ class TP2DAttnStrategy(TensorParallelStrategy):
 
         context_len = getattr(workload_spec, "prefill_seq_len", 1)
         heads_local = n_heads // tp_x_attn
-        layout_trace.record(
-            "kv_cache_read",
-            "Read KV-cache for current context",
-            TensorRecord(
-                "KV_cache", {"Dkv": kv_dim, "Ctx": context_len}, {}, dtype_bytes=float_size
-            ),
-            note=(
-                f"actual: {kv_per_x} KV-heads × ctx={context_len} × d_head={d_head}. "
-                f"Per rank = {kv_per_x * context_len * d_head * float_size} B"
-            ),
-        )
-        layout_trace.record(
-            "attention_scores",
-            "QK^T + online softmax (FlashDecoding)",
-            TensorRecord(
-                "scores",
-                {"H": n_heads, "B": s, "Ctx": context_len},
-                {"H": P("sharded", ("X",))},
-                dtype_bytes=float_size,
-            ),
-            note=(
-                f"actual: [{heads_local}, {s}, {context_len}] per rank. "
-                f"GQA: {heads_local} Q-heads share {kv_per_x} KV-head(s) "
-                f"(ratio {heads_local // max(1, kv_per_x)}:1). "
-                f"Online softmax: streaming."
-            ),
-        )
+        # One kv_cache_read / attention_scores record per attention layer
+        # class (full vs sliding window); mirrors the expected trace in
+        # `decode_layout_trace._trace_attention_stages`.
+        attn_classes = attention_layer_classes(transformer_config)
+        for layer_class in attn_classes:
+            ctx_cls = layer_class.kv_len(context_len)
+            if len(attn_classes) == 1:
+                name_suffix = ""
+                class_note = ""
+            else:
+                name_suffix = f"[{layer_class.kind.value}]"
+                class_note = (
+                    f" [{layer_class.kind.value}: {layer_class.layer_fraction:.0%} of layers]"
+                )
+            layout_trace.record(
+                "kv_cache_read",
+                "Read KV-cache for current context",
+                TensorRecord(
+                    f"KV_cache{name_suffix}",
+                    {"Dkv": kv_dim, "Ctx": ctx_cls},
+                    {},
+                    dtype_bytes=float_size,
+                ),
+                note=(
+                    f"actual: {kv_per_x} KV-heads × ctx={ctx_cls} × d_head={d_head}. "
+                    f"Per rank = {kv_per_x * ctx_cls * d_head * float_size} B{class_note}"
+                ),
+            )
+            layout_trace.record(
+                "attention_scores",
+                "QK^T + online softmax (FlashDecoding)",
+                TensorRecord(
+                    f"scores{name_suffix}",
+                    {"H": n_heads, "B": s, "Ctx": ctx_cls},
+                    {"H": P("sharded", ("X",))},
+                    dtype_bytes=float_size,
+                ),
+                note=(
+                    f"actual: [{heads_local}, {s}, {ctx_cls}] per rank. "
+                    f"GQA: {heads_local} Q-heads share {kv_per_x} KV-head(s) "
+                    f"(ratio {heads_local // max(1, kv_per_x)}:1). "
+                    f"Online softmax: streaming.{class_note}"
+                ),
+            )
         layout_trace.record(
             "attn_v_output",
             "Attention × V partial sums (per Y-shard)",

@@ -1,9 +1,12 @@
 name: "CONF26_4096_Torus_16x16x16"
 node_definition_ref: "PASSAGE_NODE_8TB_ALTERNATIVE"
 
+# All three dimensions use the torus third-budget fabrics (fast_fabric_x0,
+# fast_fabric_y0, fast_fabric_y1) so the per-XPU bandwidth totals the full
+# transceiver budget.
 dimensions:
   - name: "DomainX"
-    interconnect_name: "fast_fabric_x"
+    interconnect_name: "fast_fabric_x0"
     topology_type: "ring"
     size: 16
 

@@ -113,7 +113,7 @@ KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER: dict[str, float] = {
     "llama3_1_405b": 45e-6,
     "llama3_1_8b": 24e-6,
     "minimax_m2_5": 90e-6,
-    "gpt_oss_120b": 33e-6,
+    "gpt_oss_120b": 32e-6,
 }
 
 # FP4 model_ids explicitly promoted into the canonical panel despite the

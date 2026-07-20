@@ -81,7 +81,11 @@ from scalescope.memory_model import (
     LayerMemoryTraffic,
     MemoryFootprint,
 )
-from scalescope.model_spec import resolve_kv_heads_per_partition, TransformerConfig
+from scalescope.model_spec import (
+    attention_layer_classes,
+    resolve_kv_heads_per_partition,
+    TransformerConfig,
+)
 from scalescope.pp_strategy import get_pp_strategy
 from scalescope.stats import CommStats
 from scalescope.sweep_dsl import (
@@ -905,6 +909,8 @@ def _emit_decode_layout_trace(
             s=1,
             dtype_bytes=workload_spec.float_size_bytes,
             context_len=context_len,
+            sliding_window_size=model_spec.sliding_window_size,
+            swa_layer_fraction=model_spec.swa_layer_fraction,
             moe_tp_x=params["moe_tp_x"],
             moe_tp_yz=params["moe_tp_yz"],
         )
@@ -1867,23 +1873,30 @@ def get_model_stats(
                 kv_heads_sharded, _kv_rep = resolve_kv_heads_per_partition(
                     num_kv_heads=num_kv_heads, tp_x=resolved.tp_x
                 )
-                kv_len_per_shard = int(np.ceil(kv_len / resolved.tp_yz))
+                kv_seq_shard = resolved.tp_yz
             case TensorParallelVariant.NONE | TensorParallelVariant.SHARD_WEIGHTS_1D:
                 kv_heads_sharded, _kv_rep = resolve_kv_heads_per_partition(
                     num_kv_heads=num_kv_heads, tp_x=attn_tp_size
                 )
-                kv_len_per_shard = kv_len
+                kv_seq_shard = 1
             case _:
                 raise ValueError(
                     f"Unsupported attention TP variant for KV-cache footprint: {attn_tp_variant}"
                 )
-        kv_bytes_per_layer_per_xpu = (
-            2
-            * batch_size_per_dp
-            * kv_len_per_shard
-            * (kv_heads_sharded * head_dim)
-            * workload_spec.float_size_bytes
-        )
+        # Persistent KV residency per layer class: sliding-window layers only
+        # retain the last `window_size` tokens, so their footprint is capped.
+        # Blended by layer fractions (per-layer footprint × n_layers elsewhere).
+        kv_bytes_per_layer_per_xpu = 0.0
+        for layer_class in attention_layer_classes(model_spec):
+            kv_len_per_shard_cls = int(np.ceil(layer_class.kv_len(kv_len) / kv_seq_shard))
+            kv_bytes_per_layer_per_xpu += (
+                layer_class.layer_fraction
+                * 2
+                * batch_size_per_dp
+                * kv_len_per_shard_cls
+                * (kv_heads_sharded * head_dim)
+                * workload_spec.float_size_bytes
+            )
         attn_footprint.kv_cache = int(kv_bytes_per_layer_per_xpu)
 
     # Verify memory capacities per tier

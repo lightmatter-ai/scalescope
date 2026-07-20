@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 from scalescope.model_spec import (
+    attention_layer_classes,
     attn_params_per_xpu,
     expert_params_per_xpu,
     resolve_kv_heads_per_partition,
@@ -532,6 +533,18 @@ def calculate_ffn_moe_saved_activations_memory_footprint(
 
 
 # Transient memory
+def _max_attn_kv_span(transformer_config: TransformerConfig, n_seq: int) -> int:
+    """Largest KV span visible to any attention layer class.
+
+    Transient peaks are a max across layers (not a sum), so the peak is set
+    by the layer class with the widest score region. With any full-attention
+    layers present this is `n_seq`; only a pure-SWA model shrinks the peak.
+    """
+    return max(
+        layer_class.kv_len(n_seq) for layer_class in attention_layer_classes(transformer_config)
+    )
+
+
 def calculate_attn_forward_transient_peak_memory_footprint_tp1d(
     transformer_config: TransformerConfig, workload_spec: WorkloadSpec, tp_size: int
 ) -> int:
@@ -542,7 +555,7 @@ def calculate_attn_forward_transient_peak_memory_footprint_tp1d(
         * transformer_config.num_heads
         / tp_size
         * workload_spec.seq_length
-        * workload_spec.seq_length
+        * _max_attn_kv_span(transformer_config, workload_spec.seq_length)
         * float_size
     )
 
@@ -591,12 +604,12 @@ def calculate_attn_forward_transient_peak_memory_footprint_tp2d(
     match pass_mode:
         case PassMode.TRAINING | PassMode.INFERENCE_PREFILL:
             step_seq = workload_spec.seq_length
-            kv_len_local = step_seq / attn_tp_size_yz
+            kv_len_local = _max_attn_kv_span(transformer_config, step_seq) / attn_tp_size_yz
         case PassMode.INFERENCE_DECODE:
             step_seq = 1
             if kv_total_len is None:
                 raise ValueError("TP-2D decode transient peak requires kv_total_len.")
-            kv_len_local = kv_total_len / attn_tp_size_yz
+            kv_len_local = _max_attn_kv_span(transformer_config, kv_total_len) / attn_tp_size_yz
         case _:
             raise ValueError(f"Unsupported pass_mode for TP-2D transient peak: {pass_mode}")
 
@@ -861,12 +874,33 @@ def _forward_pass_prefill_attention_attn_tp_1d_memory_traffic(
     traffic.activations.bytes_read += q_out_sharded + kv_out_sharded
 
     if save_kv_cache:
-        traffic.kv_cache.bytes_written += (
-            2 * n_batch * n_seq * (num_kv_heads_attn * head_dim) * float_size
-        )
+        # Sliding-window layers only retain the last `window_size` tokens,
+        # so their KV write is capped; blended per layer class.
+        kv_write = 0.0
+        for layer_class in attention_layer_classes(transformer_config):
+            kv_write += (
+                layer_class.layer_fraction
+                * 2
+                * n_batch
+                * layer_class.kv_len(n_seq)
+                * (num_kv_heads_attn * head_dim)
+                * float_size
+            )
+        traffic.kv_cache.bytes_written += kv_write
 
-    # Attention scores.
-    attn_scores_sharded = n_batch * num_q_heads_attn * n_seq * n_seq * float_size
+    # Attention scores. Full-attention layers use the dense n_seq × n_seq
+    # buffer; sliding-window layers clip the score region to
+    # n_seq × min(window, n_seq). Blended per layer class.
+    attn_scores_sharded = 0.0
+    for layer_class in attention_layer_classes(transformer_config):
+        attn_scores_sharded += (
+            layer_class.layer_fraction
+            * n_batch
+            * num_q_heads_attn
+            * n_seq
+            * layer_class.kv_len(n_seq)
+            * float_size
+        )
     traffic.activations.bytes_written += attn_scores_sharded
     traffic.activations.bytes_read += attn_scores_sharded
 
@@ -967,10 +1001,20 @@ def _decode_attention_attn_tp_1d_memory_traffic(
         num_kv_heads=num_kv_heads, tp_x=attn_tp_size
     )
 
-    # KV cache: read local history + append new K/V.
-    traffic.kv_cache.bytes_read += (
-        2 * n_batch * n_seq_so_far * (num_kv_heads_attn * head_dim) * float_size
-    )
+    # KV cache: read local history + append new K/V. History reads are
+    # blended across attention layer classes: sliding-window layers read at
+    # most `window_size` cached tokens.
+    kv_read_history = 0.0
+    for layer_class in attention_layer_classes(transformer_config):
+        kv_read_history += (
+            layer_class.layer_fraction
+            * 2
+            * n_batch
+            * layer_class.kv_len(n_seq_so_far)
+            * (num_kv_heads_attn * head_dim)
+            * float_size
+        )
+    traffic.kv_cache.bytes_read += kv_read_history
     traffic.kv_cache.bytes_written += 2 * n_batch * 1 * (num_kv_heads_attn * head_dim) * float_size
 
     # Read the new Q, K, V activations for the attention calculation.
@@ -979,8 +1023,19 @@ def _decode_attention_attn_tp_1d_memory_traffic(
     traffic.activations.bytes_read += q_out_new_sharded + kv_out_new_sharded
 
     # Attention scores + context (layout follows attention TP domain).
+    # Score-row length is the visible KV span (+1 for the new token),
+    # blended per layer class.
     num_q_heads_attn = num_heads // attn_tp_size
-    attn_scores_sharded = n_batch * num_q_heads_attn * 1 * (n_seq_so_far + 1) * float_size
+    attn_scores_sharded = 0.0
+    for layer_class in attention_layer_classes(transformer_config):
+        attn_scores_sharded += (
+            layer_class.layer_fraction
+            * n_batch
+            * num_q_heads_attn
+            * 1
+            * (layer_class.kv_len(n_seq_so_far) + 1)
+            * float_size
+        )
     traffic.activations.bytes_written += attn_scores_sharded
     traffic.activations.bytes_read += attn_scores_sharded
     attn_context_sharded = n_batch * 1 * (num_q_heads_attn * head_dim) * float_size
@@ -1293,7 +1348,6 @@ def _forward_pass_prefill_attention_attn_tp_2d_memory_traffic(
     shard_attn = attn_tp_size_x * attn_tp_size_yz
 
     step_seq = n_seq
-    kv_len_local = n_seq / attn_tp_size_yz
 
     # KV heads per X rank: allow duplication when attn_tp_size_x > num_kv_heads.
     if not attn_tp_size_x:
@@ -1317,15 +1371,35 @@ def _forward_pass_prefill_attention_attn_tp_2d_memory_traffic(
     qkv_output_sharded_size = n_batch * step_seq * qkv_out_elems / shard_proj * float_size
     traffic.activations.bytes_read += int(qkv_output_sharded_size)
 
-    # KV cache side effects (prefill only).
+    # KV cache side effects (prefill only). Sliding-window layers only
+    # retain the last `window_size` tokens; blended per layer class.
     if save_kv_cache:
-        traffic.kv_cache.bytes_written += int(
-            2 * n_batch * (n_seq / attn_tp_size_yz) * (kv_heads_per_x * head_dim) * float_size
-        )
+        kv_write = 0.0
+        for layer_class in attention_layer_classes(transformer_config):
+            kv_write += (
+                layer_class.layer_fraction
+                * 2
+                * n_batch
+                * (layer_class.kv_len(n_seq) / attn_tp_size_yz)
+                * (kv_heads_per_x * head_dim)
+                * float_size
+            )
+        traffic.kv_cache.bytes_written += int(kv_write)
 
     # Attention scores for local KV segment (sequence sharded on YZ).
-    # (Non-fused / explicit buffer model)
-    attn_score_sharded_size = n_batch * heads_per_x * kv_len_local * n_seq * float_size
+    # (Non-fused / explicit buffer model) Sliding-window layers clip the
+    # score region to n_seq × min(window, n_seq); blended per layer class.
+    attn_score_sharded_size = 0.0
+    for layer_class in attention_layer_classes(transformer_config):
+        kv_len_local_cls = layer_class.kv_len(n_seq) / attn_tp_size_yz
+        attn_score_sharded_size += (
+            layer_class.layer_fraction
+            * n_batch
+            * heads_per_x
+            * kv_len_local_cls
+            * n_seq
+            * float_size
+        )
     traffic.activations.bytes_written += int(attn_score_sharded_size)
     traffic.activations.bytes_read += int(attn_score_sharded_size)
 
@@ -1425,7 +1499,6 @@ def _decode_attention_attn_tp_2d_memory_traffic(
     qkv_output_sharded_size = n_batch * step_seq * qkv_out_elems / shard_proj * float_size
 
     # KV cache sharding follows attention TP.
-    kv_len_local = n_seq_so_far / attn_tp_size_yz
     # KV heads per X rank: allow duplication when attn_tp_size_x > num_kv_heads.
     if not attn_tp_size_x:
         kv_heads_per_x_attn = num_kv_heads
@@ -1441,9 +1514,22 @@ def _decode_attention_attn_tp_2d_memory_traffic(
                 f"TP-X ({attn_tp_size_x}) must be divisible by num_kv_heads ({num_kv_heads}) for KV duplication"
             )
         kv_heads_per_x_attn = 1
-    traffic.kv_cache.bytes_read += int(
-        2 * n_batch * kv_len_local * (kv_heads_per_x_attn * head_dim) * float_size
-    )
+    # Visible KV span per layer class (sliding-window layers cap at window),
+    # sequence-sharded on YZ; blended by layer fractions.
+    kv_read_history = 0.0
+    blended_kv_len_local = 0.0
+    for layer_class in attention_layer_classes(transformer_config):
+        kv_len_local_cls = layer_class.kv_len(n_seq_so_far) / attn_tp_size_yz
+        blended_kv_len_local += layer_class.layer_fraction * kv_len_local_cls
+        kv_read_history += (
+            layer_class.layer_fraction
+            * 2
+            * n_batch
+            * kv_len_local_cls
+            * (kv_heads_per_x_attn * head_dim)
+            * float_size
+        )
+    traffic.kv_cache.bytes_read += int(kv_read_history)
     traffic.kv_cache.bytes_written += int(
         2 * n_batch * 1 * (kv_heads_per_x_attn * head_dim) * float_size
     )
@@ -1454,7 +1540,10 @@ def _decode_attention_attn_tp_2d_memory_traffic(
     # - HBM traffic for these scalars is omitted here (assumed register/shared-memory).
     traffic.activations.bytes_read += int(qkv_output_sharded_size)
     heads_per_x_attn = num_heads // attn_tp_size_x if attn_tp_size_x else num_heads
-    attn_score_sharded_size = n_batch * heads_per_x_attn * step_seq * kv_len_local * float_size
+    # Score buffer is linear in the local KV span, so the blended span is exact here.
+    attn_score_sharded_size = (
+        n_batch * heads_per_x_attn * step_seq * blended_kv_len_local * float_size
+    )
     traffic.activations.bytes_written += int(attn_score_sharded_size)
     traffic.activations.bytes_read += int(attn_score_sharded_size)
 
@@ -1827,7 +1916,17 @@ def _backward_attn_tp_1d_memory_traffic(
         q_proj_output_per_tp = q_proj_out_dim_per_tp * n_batch * n_seq * float_size
         kv_proj_output_per_tp = 2 * (num_kv_heads_per_tp * head_dim) * n_batch * n_seq * float_size
         traffic.activations.bytes_read += q_proj_output_per_tp + kv_proj_output_per_tp
-        traffic.activations.bytes_read += n_batch * heads_per_tp * n_seq * n_seq * float_size
+        # Attention scores re-read: sliding-window layers have a score
+        # region clipped to n_seq × min(window, n_seq); blended per class.
+        for layer_class in attention_layer_classes(transformer_config):
+            traffic.activations.bytes_read += (
+                layer_class.layer_fraction
+                * n_batch
+                * heads_per_tp
+                * n_seq
+                * layer_class.kv_len(n_seq)
+                * float_size
+            )
         # Read context (input to output proj): dim = q_proj_out_dim/tp.
         traffic.activations.bytes_read += n_batch * n_seq * q_proj_out_dim_per_tp * float_size
     # Gradient write for the post-output-proj activation: dim = d_model/tp.
@@ -1871,7 +1970,18 @@ def _backward_attn_tp_2d_memory_traffic(
         qkv_proj_output = (
             n_batch * n_seq * qkv_out_elems / (attn_tp_size_x * attn_tp_size_yz) * float_size
         )
-        attn_scores = n_batch * heads_per_x * n_seq * n_seq * float_size
+        # Sliding-window layers clip the score region to
+        # n_seq × min(window, n_seq); blended per layer class.
+        attn_scores = 0.0
+        for layer_class in attention_layer_classes(transformer_config):
+            attn_scores += (
+                layer_class.layer_fraction
+                * n_batch
+                * heads_per_x
+                * n_seq
+                * layer_class.kv_len(n_seq)
+                * float_size
+            )
         # `final_proj_in` is the input to the output projection — the
         # post-attention activation, dim = q_proj_out_dim (NOT d_model
         # under wide-Q layouts).

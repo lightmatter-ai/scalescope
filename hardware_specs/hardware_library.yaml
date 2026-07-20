@@ -82,22 +82,28 @@ components:
       name: "Passage_8TB/s_Interconnect"
       type: "Passage"
       num_links: 1
-      bandwidth_nominal: 4032e9 # 2 * 36 * 112 * 1e9 / 2 = 4032e9 (approx 4 TB/s outgoing)
-      latency_sec: 150e-9
+      bandwidth_nominal: 4032e9 # 2 * 36 * 112 * 1e9 / 2 (approx 4 TB/s outgoing)
+      latency_sec: 500e-9 # per-hop alpha (HW link + link layer)
       efficiency: 0.8
+    # 2D-fabric per-dimension budget: the full per-XPU total split 50/50
+    # between the X and Y dimensions (bound as fast_fabric_x/fast_fabric_y
+    # on the node). Used by all HyperX and 2D-torus topologies; a sweep over
+    # alternative X/Y splits confirmed 50/50 is near-optimal.
     PASSAGE_INTERCONNECT_8TB_HALF:
       name: "Passage_8TB/s_Interconnect_Half"
       type: "Passage"
       num_links: 1
-      bandwidth_nominal: 2016e9 # 4032e9 / 2
-      latency_sec: 150e-9
+      bandwidth_nominal: 2016e9 # half of PASSAGE_INTERCONNECT_8TB
+      latency_sec: 500e-9 # per-hop alpha (HW link + link layer)
       efficiency: 0.8
+    # 3D-torus per-dimension budget: the full per-XPU total split equally
+    # across the three torus dimensions (X0, Y0, Y1).
     PASSAGE_INTERCONNECT_8TB_THIRD:
       name: "Passage_8TB/s_Interconnect_Third"
       type: "Passage"
       num_links: 1
-      bandwidth_nominal: 1344e9 # 4032e9 / 3
-      latency_sec: 150e-9
+      bandwidth_nominal: 1344e9 # one third of PASSAGE_INTERCONNECT_8TB
+      latency_sec: 500e-9 # per-hop alpha (HW link + link layer)
       efficiency: 0.8
 
     # Chip-Specific Interconnects
@@ -192,9 +198,18 @@ nodes:
       xpu_memory: "ALTERNATIVE_MEMORY"
       remote_memory: "ALTERNATIVE_MEMORY_REMOTE"
     device_interconnects:
+      # The per-XPU transceiver budget is fixed (PASSAGE_INTERCONNECT_8TB);
+      # each topology family splits it across its dimensions without
+      # exceeding the budget.
+      # 1D fabrics (FC, ring, switched): full budget on one fabric.
       "fast_fabric": "PASSAGE_INTERCONNECT_8TB"
+      # 2D fabrics (HyperX 8x128 / 32x128, torus 32x128): 1/2 + 1/2.
       "fast_fabric_x": "PASSAGE_INTERCONNECT_8TB_HALF"
       "fast_fabric_y": "PASSAGE_INTERCONNECT_8TB_HALF"
+      # 3D torus (X0 x Y0 x Y1): equal thirds, 1/3 + 1/3 + 1/3.
+      # Torus topologies must use fast_fabric_x0 (not fast_fabric_x, which
+      # is the 2D half-budget mapping and would overshoot the total).
+      "fast_fabric_x0": "PASSAGE_INTERCONNECT_8TB_THIRD"
       "fast_fabric_y0": "PASSAGE_INTERCONNECT_8TB_THIRD"
       "fast_fabric_y1": "PASSAGE_INTERCONNECT_8TB_THIRD"
       "cluster_fabric": "DP_INTERCONNECT_INFINIBAND"

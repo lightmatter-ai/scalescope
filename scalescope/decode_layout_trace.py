@@ -21,6 +21,7 @@ from functools import reduce
 from operator import mul
 from typing import ClassVar, Dict, List, Optional, Sequence, Tuple
 
+from scalescope.model_spec import build_attention_layer_classes
 from scalescope.stats import CommStats
 
 logger = logging.getLogger(__name__)
@@ -564,6 +565,8 @@ def _trace_attention_stages(
     s: int,
     dtype_bytes: int,
     context_len: int = 1,
+    sliding_window_size: int | None = None,
+    swa_layer_fraction: float | None = None,
 ) -> None:
     # `d_head` is the per-head attention dimension straight from the model spec
     # (NOT d_model // n_heads — those are unequal under wide-Q layouts such as
@@ -648,40 +651,53 @@ def _trace_attention_stages(
     # ---- Attention core stages (rank-local, no communication) ----
 
     heads_local = n_heads // tp_x
-    # KV-cache read: each X-rank reads its local KV heads × full context
-    trace.record(
-        "kv_cache_read",
-        "Read KV-cache for current context",
-        TensorRecord(
-            name="KV_cache",
-            global_shape={"Dkv": kv_dim, "Ctx": context_len},
-            partitions={},
-            dtype_bytes=dtype_bytes,
-        ),
-        note=(
-            f"rank-local. Each X-rank: {kv_heads_per_x} KV-heads × ctx={context_len} × "
-            f"d_head={d_head}. Total per rank = "
-            f"{kv_heads_per_x * context_len * d_head * dtype_bytes} B"
-        ),
-    )
+    # KV-cache read + attention scores, once per attention layer class.
+    # Sliding-window layers see at most `sliding_window_size` cached tokens;
+    # full-attention layers see the whole context.
+    attn_classes = build_attention_layer_classes(sliding_window_size, swa_layer_fraction)
+    for layer_class in attn_classes:
+        ctx_cls = layer_class.kv_len(context_len)
+        if len(attn_classes) == 1:
+            name_suffix = ""
+            class_note = ""
+        else:
+            name_suffix = f"[{layer_class.kind.value}]"
+            class_note = f" [{layer_class.kind.value}: {layer_class.layer_fraction:.0%} of layers]"
 
-    # Attention scores: Q·K^T — [heads_local, s, context_len] per rank
-    trace.record(
-        "attention_scores",
-        "QK^T + online softmax (FlashDecoding)",
-        TensorRecord(
-            name="scores",
-            global_shape={"H": n_heads, "B": s, "Ctx": context_len},
-            partitions={"H": P("sharded", ("X",))},
-            dtype_bytes=dtype_bytes,
-        ),
-        note=(
-            f"rank-local compute. [{heads_local}, {s}, {context_len}] per rank. "
-            f"GQA: {heads_local} Q-heads share {kv_heads_per_x} KV-head(s) "
-            f"(ratio {heads_local // max(1, kv_heads_per_x)}:1). "
-            f"Online softmax: streaming, never fully materialized."
-        ),
-    )
+        # KV-cache read: each X-rank reads its local KV heads × visible context
+        trace.record(
+            "kv_cache_read",
+            "Read KV-cache for current context",
+            TensorRecord(
+                name=f"KV_cache{name_suffix}",
+                global_shape={"Dkv": kv_dim, "Ctx": ctx_cls},
+                partitions={},
+                dtype_bytes=dtype_bytes,
+            ),
+            note=(
+                f"rank-local. Each X-rank: {kv_heads_per_x} KV-heads × ctx={ctx_cls} × "
+                f"d_head={d_head}. Total per rank = "
+                f"{kv_heads_per_x * ctx_cls * d_head * dtype_bytes} B{class_note}"
+            ),
+        )
+
+        # Attention scores: Q·K^T — [heads_local, s, ctx_cls] per rank
+        trace.record(
+            "attention_scores",
+            "QK^T + online softmax (FlashDecoding)",
+            TensorRecord(
+                name=f"scores{name_suffix}",
+                global_shape={"H": n_heads, "B": s, "Ctx": ctx_cls},
+                partitions={"H": P("sharded", ("X",))},
+                dtype_bytes=dtype_bytes,
+            ),
+            note=(
+                f"rank-local compute. [{heads_local}, {s}, {ctx_cls}] per rank. "
+                f"GQA: {heads_local} Q-heads share {kv_heads_per_x} KV-head(s) "
+                f"(ratio {heads_local // max(1, kv_heads_per_x)}:1). "
+                f"Online softmax: streaming, never fully materialized.{class_note}"
+            ),
+        )
 
     # Attention output before AR(Y): V-weighted sum per Y-shard
     trace.record(
@@ -1126,6 +1142,8 @@ def build_decode_2dtp_trace(
     s: int = 1,
     dtype_bytes: int = 2,
     context_len: int = 1,
+    sliding_window_size: int | None = None,
+    swa_layer_fraction: float | None = None,
     moe_tp_x: int | None = None,
     moe_tp_yz: int | None = None,
 ) -> LayoutTrace:
@@ -1156,6 +1174,8 @@ def build_decode_2dtp_trace(
     s : sequence length (1 for decode)
     dtype_bytes : bytes per element (default 2 for bf16/fp16)
     context_len : KV-cache context length (prefill_seq_len)
+    sliding_window_size : SWA window in tokens; None for full attention
+    swa_layer_fraction : fraction of layers using SWA; set with sliding_window_size
     moe_tp_x : MoE X-axis TP degree (defaults to tp_x if None)
     moe_tp_yz : MoE YZ-axis TP degree (defaults to tp_y//g if None)
     """
@@ -1177,6 +1197,8 @@ def build_decode_2dtp_trace(
         s=s,
         dtype_bytes=dtype_bytes,
         context_len=context_len,
+        sliding_window_size=sliding_window_size,
+        swa_layer_fraction=swa_layer_fraction,
     )
     _trace_moe_stages(
         trace,
