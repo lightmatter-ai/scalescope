@@ -6,6 +6,7 @@ and intentionally abstracts away workload settings, topology,
 and parallelization policy, which are defined in other specs.
 """
 
+import math
 import os
 from dataclasses import dataclass
 from enum import Enum
@@ -103,37 +104,49 @@ class AttentionLayerClass:
                 return min(self.window_size, n_seq_so_far)
 
 
-def build_attention_layer_classes(
-    sliding_window_size: Optional[int], swa_layer_fraction: Optional[float]
-) -> list[AttentionLayerClass]:
-    """Build attention layer classes from raw SWA parameters.
+class AttentionLayerClassSpec(BaseModel):
+    """One entry of a model spec's explicit ``attention_layers`` list.
 
-    Fractions sum to 1.0. ``sliding_window_size=None`` yields a single FULL
-    class; otherwise a SLIDING_WINDOW class plus, when
-    ``swa_layer_fraction < 1``, a FULL class for the remaining layers.
+    Every model spec must declare its attention layer classes explicitly:
+    the kind of each class, the fraction of layers it covers, and any
+    kind-specific parameters (``window_size`` for sliding-window attention).
     """
-    if (sliding_window_size is None) != (swa_layer_fraction is None):
-        raise ValueError(
-            "sliding_window_size and swa_layer_fraction must be set together: "
-            f"got sliding_window_size={sliding_window_size}, "
-            f"swa_layer_fraction={swa_layer_fraction}"
-        )
-    if sliding_window_size is None:
-        return [AttentionLayerClass(AttentionKind.FULL, 1.0, None)]
-    assert swa_layer_fraction is not None
-    classes = [
-        AttentionLayerClass(AttentionKind.SLIDING_WINDOW, swa_layer_fraction, sliding_window_size)
-    ]
-    if swa_layer_fraction < 1.0:
-        classes.append(AttentionLayerClass(AttentionKind.FULL, 1.0 - swa_layer_fraction, None))
-    return classes
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: AttentionKind = Field(..., description="Attention variant of this layer class.")
+    fraction: float = Field(
+        ...,
+        gt=0,
+        le=1,
+        description="Fraction of the model's layers belonging to this class.",
+    )
+    window_size: Optional[PositiveInt] = Field(
+        default=None,
+        description=(
+            "Sliding-window size in tokens. Required for kind=sliding_window; "
+            "must be omitted for kind=full."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def check_kind_params(self) -> Self:
+        match self.kind:
+            case AttentionKind.FULL:
+                if self.window_size is not None:
+                    raise ValueError("window_size must not be set for kind=full")
+            case AttentionKind.SLIDING_WINDOW:
+                if self.window_size is None:
+                    raise ValueError("window_size is required for kind=sliding_window")
+        return self
 
 
 def attention_layer_classes(transformer_config: "TransformerConfig") -> list[AttentionLayerClass]:
     """Partition the model's layers into attention layer classes."""
-    return build_attention_layer_classes(
-        transformer_config.sliding_window_size, transformer_config.swa_layer_fraction
-    )
+    return [
+        AttentionLayerClass(spec.kind, spec.fraction, spec.window_size)
+        for spec in transformer_config.attention_layers
+    ]
 
 
 def resolve_kv_heads_per_partition(*, num_kv_heads: int, tp_x: int) -> tuple[int, int]:
@@ -201,23 +214,17 @@ class TransformerConfig(BaseModel):
     max_sequence_length: PositiveInt = Field(..., description="Maximum sequence length")
     vocab_size: PositiveInt = Field(..., description="Vocabulary size")
 
-    # Sliding-window attention (optional feature; both fields set together)
-    sliding_window_size: Optional[PositiveInt] = Field(
-        default=None,
+    # Attention layer classes (required; every spec declares its attention
+    # types and the blend between them explicitly).
+    attention_layers: list[AttentionLayerClassSpec] = Field(
+        ...,
+        min_length=1,
         description=(
-            "Sliding-window attention window in tokens. None means full "
-            "attention on every layer (default). When set, "
-            "swa_layer_fraction must also be set."
-        ),
-    )
-    swa_layer_fraction: Optional[float] = Field(
-        default=None,
-        gt=0,
-        le=1,
-        description=(
-            "Fraction of layers using sliding-window attention (e.g. 0.5 "
-            "for gpt-oss's alternating SWA/full pattern). Requires "
-            "sliding_window_size to be set."
+            "Explicit partition of the model's layers into attention layer "
+            "classes. Fractions must sum to 1.0. A vanilla model declares a "
+            "single {kind: full, fraction: 1.0} entry; e.g. gpt-oss declares "
+            "{kind: sliding_window, fraction: 0.5, window_size: 128} plus "
+            "{kind: full, fraction: 0.5}."
         ),
     )
 
@@ -244,13 +251,10 @@ class TransformerConfig(BaseModel):
 
     # Validators
     @model_validator(mode="after")
-    def check_sliding_window_fields(self) -> Self:
-        if (self.sliding_window_size is None) != (self.swa_layer_fraction is None):
-            raise ValueError(
-                "sliding_window_size and swa_layer_fraction must be set together: "
-                f"got sliding_window_size={self.sliding_window_size}, "
-                f"swa_layer_fraction={self.swa_layer_fraction}"
-            )
+    def check_attention_layers(self) -> Self:
+        fraction_sum = sum(spec.fraction for spec in self.attention_layers)
+        if not math.isclose(fraction_sum, 1.0, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError(f"attention_layers fractions must sum to 1.0, got {fraction_sum}")
         return self
 
     @model_validator(mode="after")

@@ -10,6 +10,7 @@ Usage
         d_model=12288, d_ff=4096, n_heads=96, n_kv_heads=8, head_dim=128,
         n_experts=128, top_k=2, tp_x=32, tp_y=32, g=8, c=16,
         attn_domains_per_full_expert_set=1, full_expert_sets_per_attn_domain=1,
+        attention_layers=attention_layer_classes(transformer_config),
         router_mode="sharded",
     )
     print(trace.format_table())
@@ -21,7 +22,7 @@ from functools import reduce
 from operator import mul
 from typing import ClassVar, Dict, List, Optional, Sequence, Tuple
 
-from scalescope.model_spec import build_attention_layer_classes
+from scalescope.model_spec import AttentionLayerClass
 from scalescope.stats import CommStats
 
 logger = logging.getLogger(__name__)
@@ -564,9 +565,8 @@ def _trace_attention_stages(
     g: int,
     s: int,
     dtype_bytes: int,
+    attention_layers: list[AttentionLayerClass],
     context_len: int = 1,
-    sliding_window_size: int | None = None,
-    swa_layer_fraction: float | None = None,
 ) -> None:
     # `d_head` is the per-head attention dimension straight from the model spec
     # (NOT d_model // n_heads — those are unequal under wide-Q layouts such as
@@ -652,9 +652,9 @@ def _trace_attention_stages(
 
     heads_local = n_heads // tp_x
     # KV-cache read + attention scores, once per attention layer class.
-    # Sliding-window layers see at most `sliding_window_size` cached tokens;
+    # Sliding-window layers see at most `window_size` cached tokens;
     # full-attention layers see the whole context.
-    attn_classes = build_attention_layer_classes(sliding_window_size, swa_layer_fraction)
+    attn_classes = attention_layers
     for layer_class in attn_classes:
         ctx_cls = layer_class.kv_len(context_len)
         if len(attn_classes) == 1:
@@ -1138,12 +1138,11 @@ def build_decode_2dtp_trace(
     c: int,
     attn_domains_per_full_expert_set: int,
     full_expert_sets_per_attn_domain: int,
+    attention_layers: list[AttentionLayerClass],
     router_mode: str = "sharded",
     s: int = 1,
     dtype_bytes: int = 2,
     context_len: int = 1,
-    sliding_window_size: int | None = None,
-    swa_layer_fraction: float | None = None,
     moe_tp_x: int | None = None,
     moe_tp_yz: int | None = None,
 ) -> LayoutTrace:
@@ -1174,8 +1173,9 @@ def build_decode_2dtp_trace(
     s : sequence length (1 for decode)
     dtype_bytes : bytes per element (default 2 for bf16/fp16)
     context_len : KV-cache context length (prefill_seq_len)
-    sliding_window_size : SWA window in tokens; None for full attention
-    swa_layer_fraction : fraction of layers using SWA; set with sliding_window_size
+    attention_layers : the model's attention layer classes (from
+        `attention_layer_classes(transformer_config)`); KV-dependent stages
+        are emitted once per class
     moe_tp_x : MoE X-axis TP degree (defaults to tp_x if None)
     moe_tp_yz : MoE YZ-axis TP degree (defaults to tp_y//g if None)
     """
@@ -1196,9 +1196,8 @@ def build_decode_2dtp_trace(
         g=g,
         s=s,
         dtype_bytes=dtype_bytes,
+        attention_layers=attention_layers,
         context_len=context_len,
-        sliding_window_size=sliding_window_size,
-        swa_layer_fraction=swa_layer_fraction,
     )
     _trace_moe_stages(
         trace,

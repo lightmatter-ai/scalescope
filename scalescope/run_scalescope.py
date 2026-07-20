@@ -909,8 +909,7 @@ def _emit_decode_layout_trace(
             s=1,
             dtype_bytes=workload_spec.float_size_bytes,
             context_len=context_len,
-            sliding_window_size=model_spec.sliding_window_size,
-            swa_layer_fraction=model_spec.swa_layer_fraction,
+            attention_layers=attention_layer_classes(model_spec),
             moe_tp_x=params["moe_tp_x"],
             moe_tp_yz=params["moe_tp_yz"],
         )

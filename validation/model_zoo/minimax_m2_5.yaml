@@ -36,6 +36,9 @@ n_layers: 62
 num_heads: 48
 num_kv_heads: 8
 head_dim: 128
+attention_layers:
+  - kind: full
+    fraction: 1.0
 mlp_ratio: 0.5
 mlp_kind: gated_3matrix
 max_sequence_length: 196608

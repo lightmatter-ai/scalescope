@@ -2,6 +2,9 @@ d_model: 12288
 n_layers: 120
 num_heads: 128
 head_dim: 96
+attention_layers:
+  - kind: full
+    fraction: 1.0
 mlp_ratio: 1.0
 mlp_kind: dense_2matrix
 max_sequence_length: 131072
