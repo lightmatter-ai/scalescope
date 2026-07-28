@@ -1140,9 +1140,8 @@ def calculate_moe_comm_hierarchical_total_exchange(
     # the within-attention-domain remote share from the cross-attention-
     # domain remote share (which only matters for cross-rack fabric
     # accounting). For the intra-rack centralized-pool path the two formulas
-    # pick the same physical fabric — only the volume scales differ. We
-    # keep the current product form for now so historical baselines are
-    # preserved.
+    # pick the same physical fabric — only the volume scales differ. The
+    # product form is kept pending the refinement below.
     #
     # TODO: refine into separate within-attention-domain and cross-attention-
     # domain fractions so cross-rack centralized pools (full_expert_set spans

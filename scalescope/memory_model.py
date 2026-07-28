@@ -24,6 +24,7 @@ from scalescope.workload_spec import (
     InferenceDecodeSpec,
     MoERouterSyncMode,
     TensorParallelVariant,
+    TP2DProjAxisRole,
     TrainSpec,
     WorkloadSpec,
 )
@@ -566,10 +567,19 @@ def calculate_attn_forward_transient_peak_memory_footprint_tp2d(
     workload_spec: WorkloadSpec,
     attn_tp_size_x: int,
     attn_tp_size_yz: int,
+    proj_tp_size_x: int,
+    proj_tp_size_yz: int,
     pass_mode: PassMode,
     kv_total_len: int | None = None,
 ) -> int:
     """Forward transient peak for TP-2D attention, stage-aware and phase-aware.
+
+    Domain split: phase 1/3 staging buffers (QKV projection output, out-proj
+    input/partial, weight panels, role staging) belong to the *projection* TP
+    domain and shard by `proj_tp_size_*`; the phase 2 score buffer belongs to
+    the *attention* domain and shards by `attn_tp_size_*`. The two domains
+    match in most specs but differ under projection groups (g > 1), where the
+    projection view is g-times smaller.
 
     This is intentionally a *simple max-of-major-buffers* estimate to make the footprint logic
     easy to audit and consistent with the TP-2D traffic model's Phase 1/2/3 sizing.
@@ -583,11 +593,25 @@ def calculate_attn_forward_transient_peak_memory_footprint_tp2d(
 
     What this does NOT include:
     - KV cache itself (modeled as persistent `MemoryFootprint.kv_cache`)
+    - at-rest projection weights: those are persistent and accounted in
+      `MemoryFootprint.weights` (see the role-aware `attn_weight_tp_size`
+      logic in `run_scalescope.py`). Only *staged copies* of weights show up
+      here — e.g. the YZ-gathered weight panel under yz=circulate_weights.
+      Conversely, under yz=shard_weights no weight buffer appears here at all
+      (weights never move); the transient cost is the full-sequence
+      *activation* staging buffers instead. Transient vs persistent is about
+      the buffer's lifetime (exists only within a layer's forward pass vs
+      resident across the pass), not about whether it holds weights or
+      activations.
     - small online-softmax stats scalars (m, ℓ); see comments in traffic model
     """
     if attn_tp_size_x <= 0 or attn_tp_size_yz <= 0:
         raise ValueError(
             "TP-2D transient peak requires positive attn_tp_size_x and attn_tp_size_yz."
+        )
+    if proj_tp_size_x <= 0 or proj_tp_size_yz <= 0:
+        raise ValueError(
+            "TP-2D transient peak requires positive proj_tp_size_x and proj_tp_size_yz."
         )
 
     d_model = transformer_config.d_model
@@ -598,13 +622,59 @@ def calculate_attn_forward_transient_peak_memory_footprint_tp2d(
     float_size = workload_spec.float_size_bytes
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
 
-    shard = attn_tp_size_x * attn_tp_size_yz
+    proj_shard = proj_tp_size_x * proj_tp_size_yz
     heads_per_x = num_heads // attn_tp_size_x
+
+    # Role-dependent staging buffers for the projection schedule
+    # (prefill/training only):
+    # - circulate_weights: each layer all-gathers its X-shard weight panel
+    #   along YZ before the GEMM; the gathered panel (W / proj_tp_size_x)
+    #   transiently coexists with the activation buffers.
+    # - shard_weights (weight-stationary): the pre-reduce-scatter QKV
+    #   partials and the YZ-gathered attention output are full-sequence
+    #   activation buffers of shape [B, S, feature_dim / proj_tp_size_x] —
+    #   feature-sharded on X only, NOT sequence-sharded on YZ — so each is a
+    #   factor proj_tp_size_yz larger than the resident sequence-sharded
+    #   slabs [B, S / proj_tp_size_yz, feature_dim / proj_tp_size_x].
+    weight_panel_peak = 0.0
+    role_staging_peak = 0.0
 
     match pass_mode:
         case PassMode.TRAINING | PassMode.INFERENCE_PREFILL:
             step_seq = workload_spec.seq_length
             kv_len_local = _max_attn_kv_span(transformer_config, step_seq) / attn_tp_size_yz
+            roles = workload_spec.tp2d_proj_axis_roles
+            if roles is None:
+                raise ValueError(
+                    "TP-2D prefill/train transient peak requires tp2d_proj_axis_roles "
+                    "on the workload spec (TrainSpec / InferencePrefillSpec)."
+                )
+            match roles.yz:
+                case TP2DProjAxisRole.SHARD_TOKENS:
+                    pass  # weights replicated on YZ: no role staging buffers
+                case TP2DProjAxisRole.CIRCULATE_WEIGHTS:
+                    kv_proj_out_dim = num_kv_heads * head_dim
+                    w_qkv_panel = (
+                        d_model
+                        * (q_proj_out_dim + 2 * kv_proj_out_dim)
+                        / proj_tp_size_x
+                        * float_size
+                    )
+                    w_o_panel = q_proj_out_dim * d_model / proj_tp_size_x * float_size
+                    weight_panel_peak = max(w_qkv_panel, w_o_panel)
+                case TP2DProjAxisRole.SHARD_WEIGHTS:
+                    kv_proj_out_dim = num_kv_heads * head_dim
+                    qkv_partial = (
+                        n_batch
+                        * step_seq
+                        * (q_proj_out_dim + 2 * kv_proj_out_dim)
+                        / proj_tp_size_x
+                        * float_size
+                    )
+                    o_gathered = n_batch * step_seq * q_proj_out_dim / proj_tp_size_x * float_size
+                    role_staging_peak = max(qkv_partial, o_gathered)
+                case _:
+                    raise ValueError(f"Unsupported tp2d_proj_axis_roles.yz: {roles.yz}")
         case PassMode.INFERENCE_DECODE:
             step_seq = 1
             if kv_total_len is None:
@@ -614,21 +684,42 @@ def calculate_attn_forward_transient_peak_memory_footprint_tp2d(
             raise ValueError(f"Unsupported pass_mode for TP-2D transient peak: {pass_mode}")
 
     # Phase 1: QKV projection output (GQA-aware: K/V use num_kv_heads, Q uses num_heads × head_dim).
+    # Projection-domain buffer: sharded across the projection X*YZ grid.
     qkv_out_elems = q_proj_out_dim + 2 * (num_kv_heads * head_dim)
-    qkv_proj_out = n_batch * step_seq * qkv_out_elems / shard * float_size
+    qkv_proj_out = n_batch * step_seq * qkv_out_elems / proj_shard * float_size
 
     # Phase 2: attention scores for local KV segment (non-fused, explicit buffer)
     attn_scores = n_batch * heads_per_x * step_seq * kv_len_local * float_size
 
     # Phase 3: output projection staging
-    # `gathered_for_out_proj` is the attention output (input to output proj),
-    # which has shape (B, S, num_heads * head_dim) = q_proj_out_dim. Under
-    # "wide-Q" layouts this is larger than d_model. `partial_out` is the
-    # post-output-proj activation (B, S, d_model) sharded along YZ.
-    gathered_for_out_proj = n_batch * step_seq * q_proj_out_dim / attn_tp_size_x * float_size
-    partial_out = n_batch * step_seq * d_model / attn_tp_size_yz * float_size  # ~E/YZ
+    # `attn_out_for_out_proj` is the attention output (input to output proj),
+    # whose feature dim is num_heads * head_dim = q_proj_out_dim. Under
+    # "wide-Q" layouts this is larger than d_model. In decode it is gathered
+    # along YZ (size q_proj_out_dim/X for the single step token); in
+    # prefill/training the sequence-sharded schedule keeps it local
+    # ((S/YZ) tokens x q_proj_out_dim/X features — no YZ activation gather).
+    # `partial_out` is the pre-reduce output-proj activation: full d_model
+    # for the local tokens, i.e. (B, S/YZ, d_model) in prefill/training and
+    # equivalently (B, step_seq, d_model/YZ) in decode.
+    match pass_mode:
+        case PassMode.TRAINING | PassMode.INFERENCE_PREFILL:
+            attn_out_for_out_proj = n_batch * step_seq * q_proj_out_dim / proj_shard * float_size
+        case _:
+            attn_out_for_out_proj = (
+                n_batch * step_seq * q_proj_out_dim / proj_tp_size_x * float_size
+            )
+    partial_out = n_batch * step_seq * d_model / proj_tp_size_yz * float_size  # ~E/YZ
 
-    return int(max(qkv_proj_out, attn_scores, gathered_for_out_proj, partial_out))
+    return int(
+        max(
+            qkv_proj_out,
+            attn_scores,
+            attn_out_for_out_proj,
+            partial_out,
+            weight_panel_peak,
+            role_staging_peak,
+        )
+    )
 
 
 def calculate_ffn_moe_forward_transient_peak_memory_footprint_tp1d(
@@ -780,8 +871,9 @@ def _forward_pass_prefill_attention_tp_1d_memory_traffic(
     - projection (QKV + output projection)
     - attention-core (scores + context + optional KV-cache write)
 
-    For now, callers should pass `proj_tp_size == attn_tp_size` to preserve the current
-    integrated model behavior. The split is to enable a future proj/attn TP separation.
+    `proj_tp_size` is the projection TP domain size and `attn_tp_size` the attention
+    domain size; they differ under projection groups (g > 1), where the projection
+    view is g-times smaller.
     """
     _forward_pass_prefill_attention_projection_tp_1d_memory_traffic(
         traffic=traffic,
@@ -1224,8 +1316,9 @@ def _forward_pass_prefill_attention_tp_2d_memory_traffic(
     - projection (phase 1 + phase 3 + weights)
     - attention-core (phase 2 + optional KV-cache write)
 
-    For now, callers should pass `proj_tp_size_* == attn_tp_size_*` to preserve the
-    current integrated model behavior. The split enables a future proj/attn TP separation.
+    `proj_tp_size_*` are the projection TP domain splits and `attn_tp_size_*` the
+    attention domain splits; they differ under projection groups (g > 1), where the
+    projection view is g-times smaller.
     """
     _forward_pass_prefill_attention_projection_tp_2d_memory_traffic(
         traffic=traffic,
@@ -1269,54 +1362,97 @@ def _forward_pass_prefill_attention_projection_tp_2d_memory_traffic(
     head_dim = transformer_config.head_dim
     q_proj_out_dim = num_heads * head_dim
 
-    # Weights: read once per forward pass, sharded in 2D.
-    # GQA-aware: Q proj is (d_model -> num_heads * head_dim), K/V proj are (d_model -> num_kv_heads*head_dim).
+    # Weights: read once per forward pass. What each rank reads depends on
+    # the YZ projection-axis role (X always shards weights):
+    # - shard_weights (weight-stationary): local shard W/(X*YZ).
+    # - shard_tokens: weights replicated across YZ; each rank reads its full
+    #   X shard W/X.
+    # - circulate_weights: the GEMM consumes the gathered X-shard panel W/X;
+    #   the received (W/X - W/(X*YZ)) panel bytes are additionally staged
+    #   (written) to HBM before the GEMM reads them.
     q_weight_bytes = d_model * q_proj_out_dim * float_size
     kv_weight_bytes = 2 * (d_model * num_kv_heads * head_dim) * float_size
     out_weight_bytes = q_proj_out_dim * d_model * float_size
+    total_weight_bytes = q_weight_bytes + kv_weight_bytes + out_weight_bytes
     shard_proj = proj_tp_size_x * proj_tp_size_yz
-    traffic.weights.bytes_read += (
-        q_weight_bytes + kv_weight_bytes + out_weight_bytes
-    ) // shard_proj
+    roles = workload_spec.tp2d_proj_axis_roles
+    if roles is None:
+        raise ValueError(
+            "TP-2D prefill/train projection traffic requires tp2d_proj_axis_roles "
+            "on the workload spec (TrainSpec / InferencePrefillSpec)."
+        )
+    match roles.yz:
+        case TP2DProjAxisRole.SHARD_TOKENS:
+            traffic.weights.bytes_read += total_weight_bytes // proj_tp_size_x
+        case TP2DProjAxisRole.CIRCULATE_WEIGHTS:
+            traffic.weights.bytes_read += total_weight_bytes // proj_tp_size_x
+            traffic.weights.bytes_written += (
+                total_weight_bytes // proj_tp_size_x - total_weight_bytes // shard_proj
+            )
+        case TP2DProjAxisRole.SHARD_WEIGHTS:
+            # Weight-stationary: each rank reads only its pinned X x YZ panel.
+            traffic.weights.bytes_read += total_weight_bytes // shard_proj
+        case _:
+            raise ValueError(f"Unsupported tp2d_proj_axis_roles.yz: {roles.yz}")
 
     # Prefill/training processes full sequence.
     step_seq = n_seq
 
+    # Sequence-sharded schedule (matches `TP2DAttnStrategy` prefill/train comm):
+    # tokens live as [B, S/YZ, *] slabs on every rank throughout the layer.
+    #
     # -------------------------
     # Phase 1: input projection
     # -------------------------
-    # Input activation read (sharded on X*YZ for the channel/embedding dimension).
-    traffic.activations.bytes_read += int(n_batch * step_seq * d_model / shard_proj * float_size)
+    # The QKV GEMM consumes the full-d_model token slab for the local
+    # sequence shard (reconstructed by the Megatron-SP all-gather along X):
+    # [B, S/YZ, d_model], i.e. S*d/YZ bytes.
+    traffic.activations.bytes_read += int(
+        n_batch * step_seq * d_model / proj_tp_size_yz * float_size
+    )
 
-    # QKV projection output (sharded on X*YZ).
-    # GQA-aware: Q output is num_heads * head_dim; K/V output is num_kv_heads*head_dim.
+    # QKV projection output. GQA-aware: Q output is num_heads * head_dim;
+    # K/V output is num_kv_heads * head_dim.
+    # - shard_tokens / circulate_weights: local tokens (S/YZ), output
+    #   features sharded on X -> [B, S/YZ, qkv/X].
+    # - shard_weights (weight-stationary): the GEMM emits the full-sequence
+    #   partial [B, S, qkv/X] (a factor YZ larger), which the YZ
+    #   reduce-scatter then shrinks back to the sequence shard.
     qkv_out_elems = q_proj_out_dim + 2 * (num_kv_heads * head_dim)
-    qkv_output_sharded_size = n_batch * step_seq * qkv_out_elems / shard_proj * float_size
-    traffic.activations.bytes_written += int(qkv_output_sharded_size)
+    match roles.yz:
+        case TP2DProjAxisRole.SHARD_WEIGHTS:
+            qkv_output_written = n_batch * step_seq * qkv_out_elems / proj_tp_size_x * float_size
+        case TP2DProjAxisRole.SHARD_TOKENS | TP2DProjAxisRole.CIRCULATE_WEIGHTS:
+            qkv_output_written = n_batch * step_seq * qkv_out_elems / shard_proj * float_size
+        case _:
+            raise ValueError(f"Unsupported tp2d_proj_axis_roles.yz: {roles.yz}")
+    traffic.activations.bytes_written += int(qkv_output_written)
 
     # --------------------------
     # Phase 3: output projection
     # --------------------------
-    # Explicit (non-fused) output projection model (matches 2D TP algorithm):
-    # - Input is A^{i,j} of size [B, step_seq, E_in/(X*YZ)] where E_in =
-    #   num_heads * head_dim = q_proj_out_dim (the attention output dim, NOT
-    #   d_model — they differ under wide-Q layouts).
-    # - All-gather on YZ reconstructs A^i of size [B, step_seq, E_in/X]
-    #   (not modeled as HBM traffic here).
-    # - Local matmul produces partial output O_partial of size [B, step_seq,
-    #   d_model/YZ] in the projection TP domain.
-    # - Reduce-scatter on X produces final output shard O^{i,j} of size
-    #   [B, step_seq, d_model/(X*YZ)].
-    #
-    # We account for the key activation buffers involved in the matmul + reduction staging.
+    # - Input is the attention output, [*, E_in/X] where E_in = num_heads *
+    #   head_dim = q_proj_out_dim (the attention output dim, NOT d_model —
+    #   they differ under wide-Q layouts). For shard_tokens /
+    #   circulate_weights it is the local sequence shard [B, S/YZ, E_in/X]
+    #   (no YZ activation gather); for shard_weights (weight-stationary) it
+    #   is YZ-gathered to the full sequence [B, S, E_in/X] before the W_O
+    #   panel GEMM.
+    # - Local matmul produces the partial output O_partial of size
+    #   [B, S/YZ, d_model] (equivalently [B, S, d_model/YZ] under
+    #   shard_weights — same bytes), written and re-read for the X
+    #   reduce-scatter.
+    # - Reduce-scatter on X produces the final output shard.
     shard_attn = attn_tp_size_x * attn_tp_size_yz
-    attn_out_in_shard = n_batch * step_seq * q_proj_out_dim / shard_attn * float_size
-    traffic.activations.bytes_read += int(attn_out_in_shard)
-    # Activation read for matmul after the YZ all-gather (A^i) in the projection TP domain.
-    traffic.activations.bytes_read += int(
-        n_batch * step_seq * q_proj_out_dim / proj_tp_size_x * float_size
-    )
-    # Partial output (post-output-proj) written and read for reduce-scatter in the projection TP domain.
+    match roles.yz:
+        case TP2DProjAxisRole.SHARD_WEIGHTS:
+            attn_out_in_read = n_batch * step_seq * q_proj_out_dim / attn_tp_size_x * float_size
+        case TP2DProjAxisRole.SHARD_TOKENS | TP2DProjAxisRole.CIRCULATE_WEIGHTS:
+            attn_out_in_read = n_batch * step_seq * q_proj_out_dim / shard_attn * float_size
+        case _:
+            raise ValueError(f"Unsupported tp2d_proj_axis_roles.yz: {roles.yz}")
+    traffic.activations.bytes_read += int(attn_out_in_read)
+    # Partial output (post-output-proj) written and read for the X reduce-scatter.
     partial_out = n_batch * step_seq * d_model / proj_tp_size_yz * float_size
     traffic.activations.bytes_written += int(partial_out)
     traffic.activations.bytes_read += int(partial_out)
@@ -1709,148 +1845,12 @@ def _forward_pass_prefill_moe_ffn_tp_2d_memory_traffic(
         traffic.activations.bytes_written += num_colocated * int(ffn2_out)
 
 
-def forward_memory_traffic_per_layer(
-    attn_tp_topology,
-    moe_tp_topology,
-    transformer_config,
-    moe_config,
-    n_seq,
-    tp_variant,
-    tp_size_x,
-    tp_size_yz,
-    pass_mode: PassMode,
-    name: str,
-    device_for: dict[str, str],
-    node,
-    workload_spec,
-):
-    """
-    Calculate memory traffic for the forward pass of a single layer
-    using a match/case statement for control flow.
-    """
-    attn_tp_size = attn_tp_topology.num_chips if attn_tp_topology else 1
-    moe_tp_size = moe_tp_topology.num_chips if moe_tp_topology else 1
-    memory_traffic = LayerMemoryTraffic(name=name, device_for=device_for, node=node)
-
-    match tp_variant:
-        case TensorParallelVariant.NONE | TensorParallelVariant.SHARD_WEIGHTS_1D:
-            # Unified logic for both NONE and 1D parallelism.
-            # For NONE, tp_size=1, making sharding calculations no-ops.
-
-            match pass_mode:
-
-                case PassMode.TRAINING:
-                    _forward_pass_prefill_attention_tp_1d_memory_traffic(
-                        memory_traffic,
-                        transformer_config,
-                        n_seq,
-                        proj_tp_size=attn_tp_size,
-                        attn_tp_size=attn_tp_size,
-                        save_kv_cache=False,
-                        workload_spec=workload_spec,
-                    )
-                case PassMode.INFERENCE_PREFILL:
-                    _forward_pass_prefill_attention_tp_1d_memory_traffic(
-                        memory_traffic,
-                        transformer_config,
-                        n_seq,
-                        proj_tp_size=attn_tp_size,
-                        attn_tp_size=attn_tp_size,
-                        save_kv_cache=True,
-                        workload_spec=workload_spec,
-                    )
-                case PassMode.INFERENCE_DECODE:
-                    _decode_attention_tp_1d_memory_traffic(
-                        traffic=memory_traffic,
-                        transformer_config=transformer_config,
-                        n_seq_so_far=n_seq,
-                        proj_tp_size=attn_tp_size,
-                        attn_tp_size=attn_tp_size,
-                        workload_spec=workload_spec,
-                    )
-
-            # n_seq should be 1 for the inference decode phase
-            if pass_mode == PassMode.INFERENCE_DECODE:
-                n_seq = 1  # For prefill, we only process one token at a time.
-
-            # moe_config determines if this is a standard FFN or MoE.
-            _forward_pass_prefill_moe_ffn_tp_1d_memory_traffic(
-                memory_traffic,
-                transformer_config,
-                n_seq,
-                moe_config,
-                moe_tp_size=moe_tp_size,
-                workload_spec=workload_spec,
-            )
-
-        case TensorParallelVariant.SHARD_WEIGHTS_2D:
-            match pass_mode:
-                case PassMode.TRAINING:
-                    _forward_pass_prefill_attention_tp_2d_memory_traffic(
-                        memory_traffic,
-                        transformer_config,
-                        n_seq,
-                        proj_tp_size_x=tp_size_x,
-                        proj_tp_size_yz=tp_size_yz,
-                        attn_tp_size_x=tp_size_x,
-                        attn_tp_size_yz=tp_size_yz,
-                        save_kv_cache=False,
-                        workload_spec=workload_spec,
-                    )
-                case PassMode.INFERENCE_PREFILL:
-                    _forward_pass_prefill_attention_tp_2d_memory_traffic(
-                        memory_traffic,
-                        transformer_config,
-                        n_seq,
-                        proj_tp_size_x=tp_size_x,
-                        proj_tp_size_yz=tp_size_yz,
-                        attn_tp_size_x=tp_size_x,
-                        attn_tp_size_yz=tp_size_yz,
-                        save_kv_cache=True,
-                        workload_spec=workload_spec,
-                    )
-                case PassMode.INFERENCE_DECODE:
-                    _decode_attention_tp_2d_memory_traffic(
-                        memory_traffic,
-                        transformer_config,
-                        n_seq_so_far=n_seq,
-                        proj_tp_size_x=tp_size_x,
-                        proj_tp_size_yz=tp_size_yz,
-                        attn_tp_size_x=tp_size_x,
-                        attn_tp_size_yz=tp_size_yz,
-                        workload_spec=workload_spec,
-                    )
-                case _:
-                    raise ValueError(
-                        f"Unsupported pass_mode for 2D attention forward traffic: {pass_mode}"
-                    )
-            # For decode, MoE/FFN is per-token (n_seq=1) just like 1D paths.
-            if pass_mode == PassMode.INFERENCE_DECODE:
-                n_seq_moe = 1
-            else:
-                n_seq_moe = n_seq
-            _forward_pass_prefill_moe_ffn_tp_2d_memory_traffic(
-                memory_traffic,
-                transformer_config,
-                n_seq_moe,
-                moe_tp_size_x=tp_size_x,
-                moe_tp_size_yz=tp_size_yz,
-                workload_spec=workload_spec,
-                moe_config=moe_config,
-            )
-
-        case _:
-            # Default case for any other variants not explicitly handled.
-            raise NotImplementedError(f"Logic for {tp_variant} is not implemented.")
-
-    return memory_traffic
-
-
 def _backward_attn_tp_1d_memory_traffic(
     name: str,
     transformer_config: TransformerConfig,
     workload_spec,
-    tp_size: int,
+    proj_tp_size: int,
+    attn_tp_size: int,
     activation_checkpointing: bool,
     device_for: dict[str, str],
     node,
@@ -1859,19 +1859,25 @@ def _backward_attn_tp_1d_memory_traffic(
     Compute backward-pass memory traffic for the attention sub-block under NONE/1D TP.
 
     Notes
-    - Factored out of the previously-unified backward TP-1D traffic for clarity. K/V weight
-      and activation terms are GQA-aware (d_model x (num_kv_heads * head_dim)); Q/O terms are
-      wide-Q-aware (d_model x q_proj_out_dim). For MHA models (num_kv_heads == num_heads,
-      q_proj_out_dim == d_model) totals collapse to the legacy d_model x d_model form.
+    - K/V weight and activation terms are GQA-aware (d_model x (num_kv_heads * head_dim));
+      Q/O terms are wide-Q-aware (d_model x q_proj_out_dim). For MHA models
+      (num_kv_heads == num_heads, q_proj_out_dim == d_model) totals collapse to
+      d_model x d_model.
     - Sizes are derived from `transformer_config` and `workload_spec` to avoid duplicating
       arguments upstream.
+    - Domain split mirrors the forward 1D path: projection-owned terms (weights, weight
+      gradients, QKV projection outputs, out-proj input/output activations) shard by
+      `proj_tp_size`; the attention-core score re-read shards by `attn_tp_size`. The two
+      domains differ under projection groups (g > 1), where the projection view is
+      g-times smaller.
 
     Args:
         name: A descriptive name for the traffic accumulator instance.
         transformer_config: Model transformer configuration (provides `d_model`, `num_heads`,
             `num_kv_heads`, `head_dim`).
         workload_spec: Workload spec used to infer `batch_size_per_dp`, `seq_length`, `float_size_bytes`.
-        tp_size: Size of the tensor-parallel attention domain (1 for NONE, >1 for 1D shard).
+        proj_tp_size: Size of the projection TP domain (1 for NONE, >1 for 1D shard).
+        attn_tp_size: Size of the attention TP domain (1 for NONE, >1 for 1D shard).
         activation_checkpointing: Whether activation checkpointing is enabled.
         device_for: Mapping of memory components to device tiers.
         node: Hardware node definition (provides memory tier details).
@@ -1885,19 +1891,18 @@ def _backward_attn_tp_1d_memory_traffic(
     num_kv_heads = transformer_config.num_kv_heads
     head_dim = transformer_config.head_dim
     q_proj_out_dim = num_heads * head_dim
-    d_model_per_tp = d_model // tp_size if tp_size > 1 else d_model
-    q_proj_out_dim_per_tp = q_proj_out_dim // tp_size if tp_size > 1 else q_proj_out_dim
-    heads_per_tp = num_heads // tp_size if tp_size > 1 else num_heads
-    # K/V heads per TP rank: handles the KV-replication regime (tp_size > num_kv_heads)
-    # the same way the forward 1D projection path does.
-    num_kv_heads_per_tp, _kv_rep = resolve_kv_heads_per_partition(
-        num_kv_heads=num_kv_heads, tp_x=tp_size
+    heads_per_attn = num_heads // attn_tp_size
+    # K/V heads per projection TP rank: handles the KV-replication regime
+    # (proj_tp_size > num_kv_heads) the same way the forward 1D projection path does.
+    num_kv_heads_per_proj, _kv_rep = resolve_kv_heads_per_partition(
+        num_kv_heads=num_kv_heads, tp_x=proj_tp_size
     )
     # Resolve batch/sequence and dtype size from workload config
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     n_seq = workload_spec.seq_length
     float_size = workload_spec.float_size_bytes
-    # Read attention weights (Q, K/V, Out) and write corresponding gradients (sharded by TP).
+    # Read attention weights (Q, K/V, Out) and write corresponding gradients
+    # (sharded by the projection TP domain — these are the projection weights).
     # GQA-aware K/V sizing matches the forward 1D path
     # (`_forward_pass_prefill_attention_projection_tp_1d_memory_traffic`) and the
     # 2D backward path (`_backward_attn_tp_2d_memory_traffic`). Q uses
@@ -1907,30 +1912,33 @@ def _backward_attn_tp_1d_memory_traffic(
     q_weight_size = d_model * q_proj_out_dim
     kv_weight_size = 2 * (d_model * num_kv_heads * head_dim)
     attn_out_weight_size = q_proj_out_dim * d_model
-    total_w = ((q_weight_size + kv_weight_size + attn_out_weight_size) * float_size) / tp_size
+    total_w = ((q_weight_size + kv_weight_size + attn_out_weight_size) * float_size) / proj_tp_size
     traffic.weights.bytes_read += total_w
     traffic.gradients.bytes_written += total_w
     if not activation_checkpointing:
         # Read QKV projection outputs (GQA-aware; mirrors q_out_sharded + kv_out_sharded
-        # in the forward 1D path).
-        q_proj_output_per_tp = q_proj_out_dim_per_tp * n_batch * n_seq * float_size
-        kv_proj_output_per_tp = 2 * (num_kv_heads_per_tp * head_dim) * n_batch * n_seq * float_size
-        traffic.activations.bytes_read += q_proj_output_per_tp + kv_proj_output_per_tp
-        # Attention scores re-read: sliding-window layers have a score
-        # region clipped to n_seq × min(window, n_seq); blended per class.
+        # in the forward 1D path, sharded by the projection TP domain).
+        q_proj_output = n_batch * n_seq * q_proj_out_dim * float_size / proj_tp_size
+        kv_proj_output = 2 * (num_kv_heads_per_proj * head_dim) * n_batch * n_seq * float_size
+        traffic.activations.bytes_read += q_proj_output + kv_proj_output
+        # Attention scores re-read (attention-core buffer, sharded by the attention
+        # TP domain): sliding-window layers have a score region clipped to
+        # n_seq × min(window, n_seq); blended per class.
         for layer_class in attention_layer_classes(transformer_config):
             traffic.activations.bytes_read += (
                 layer_class.layer_fraction
                 * n_batch
-                * heads_per_tp
+                * heads_per_attn
                 * n_seq
                 * layer_class.kv_len(n_seq)
                 * float_size
             )
-        # Read context (input to output proj): dim = q_proj_out_dim/tp.
-        traffic.activations.bytes_read += n_batch * n_seq * q_proj_out_dim_per_tp * float_size
-    # Gradient write for the post-output-proj activation: dim = d_model/tp.
-    traffic.gradients.bytes_written += n_batch * n_seq * d_model_per_tp * float_size
+        # Read context (input to output proj): dim = q_proj_out_dim/proj_tp.
+        traffic.activations.bytes_read += (
+            n_batch * n_seq * q_proj_out_dim * float_size / proj_tp_size
+        )
+    # Gradient write for the post-output-proj activation: dim = d_model/proj_tp.
+    traffic.gradients.bytes_written += n_batch * n_seq * d_model * float_size / proj_tp_size
     return traffic
 
 
@@ -1939,12 +1947,22 @@ def _backward_attn_tp_2d_memory_traffic(
     name: str,
     transformer_config: TransformerConfig,
     workload_spec,
+    proj_tp_size_x: int,
+    proj_tp_size_yz: int,
     attn_tp_size_x: int,
     attn_tp_size_yz: int,
     activation_checkpointing: bool,
     device_for: dict[str, str],
     node,
 ) -> LayerMemoryTraffic:
+    """Backward attention traffic under TP-2D.
+
+    Domain split mirrors the forward 2D path: projection-owned terms (weights,
+    weight gradients, QKV projection outputs, out-proj input/output activations)
+    shard across the *projection* X*YZ grid; the attention-core score re-read
+    shards by the *attention* X (heads). The two domains differ under projection
+    groups (g > 1), where the projection view is g-times smaller.
+    """
     traffic = LayerMemoryTraffic(name=name, device_for=device_for, node=node)
     d_model = transformer_config.d_model
     num_heads = transformer_config.num_heads
@@ -1952,24 +1970,22 @@ def _backward_attn_tp_2d_memory_traffic(
     n_seq = workload_spec.seq_length
     float_size = workload_spec.float_size_bytes
 
-    # Weights (QKV + Out), sharded in 2D. GQA-aware sizing.
+    # Weights (QKV + Out), sharded across the projection 2D grid. GQA-aware sizing.
     head_dim = transformer_config.head_dim
     q_proj_out_dim = num_heads * head_dim
     q_w = d_model * q_proj_out_dim * float_size
     kv_w = 2 * (d_model * transformer_config.num_kv_heads * head_dim) * float_size
     out_w = q_proj_out_dim * d_model * float_size
-    shard = attn_tp_size_x * attn_tp_size_yz
-    total_w = (q_w + kv_w + out_w) // shard
+    proj_shard = proj_tp_size_x * proj_tp_size_yz
+    total_w = (q_w + kv_w + out_w) // proj_shard
     traffic.weights.bytes_read += total_w
     traffic.gradients.bytes_written += total_w
 
     if not activation_checkpointing:
-        heads_per_x = num_heads // attn_tp_size_x if attn_tp_size_x else num_heads
+        heads_per_x = num_heads // attn_tp_size_x
         # Read QKV proj output, attention scores, and context/output intermediates (GQA-aware QKV size).
         qkv_out_elems = q_proj_out_dim + 2 * (transformer_config.num_kv_heads * head_dim)
-        qkv_proj_output = (
-            n_batch * n_seq * qkv_out_elems / (attn_tp_size_x * attn_tp_size_yz) * float_size
-        )
+        qkv_proj_output = n_batch * n_seq * qkv_out_elems / proj_shard * float_size
         # Sliding-window layers clip the score region to
         # n_seq × min(window, n_seq); blended per layer class.
         attn_scores = 0.0
@@ -1985,15 +2001,12 @@ def _backward_attn_tp_2d_memory_traffic(
         # `final_proj_in` is the input to the output projection — the
         # post-attention activation, dim = q_proj_out_dim (NOT d_model
         # under wide-Q layouts).
-        final_proj_in = (
-            n_batch * n_seq * q_proj_out_dim / (attn_tp_size_x * attn_tp_size_yz) * float_size
-        )
+        final_proj_in = n_batch * n_seq * q_proj_out_dim / proj_shard * float_size
         traffic.activations.bytes_read += int(qkv_proj_output + attn_scores + final_proj_in)
 
-    # Gradient write for final output (post-output-proj activation, dim = d_model, sharded across X*YZ).
-    traffic.gradients.bytes_written += (
-        n_batch * n_seq * d_model / (attn_tp_size_x * attn_tp_size_yz) * float_size
-    )
+    # Gradient write for final output (post-output-proj activation, dim = d_model,
+    # sharded across the projection X*YZ grid).
+    traffic.gradients.bytes_written += n_batch * n_seq * d_model / proj_shard * float_size
     return traffic
 
 
@@ -2011,8 +2024,6 @@ def _backward_moe_tp_1d_memory_traffic(
     Compute backward-pass memory traffic for the MoE/FFN sub-block under NONE/1D TP.
 
     Notes
-    - The computation preserves byte-for-byte parity with the previous unified (non-split)
-      implementation. It only factors the MoE/FFN portion out for clarity.
     - Uses EP topology (`tp_moe_topology`) to determine how intermediate MoE activations are sharded.
     - Sizes are derived from `transformer_config` and `workload_spec` to reduce parameter clutter.
 
@@ -2171,115 +2182,6 @@ def _backward_moe_tp_2d_memory_traffic(
     return traffic
 
 
-def backward_memory_traffic_per_layer(
-    attn_tp_topology,
-    moe_tp_topology,
-    transformer_config,
-    moe_config,
-    tp_variant,
-    tp_size,
-    tp_size_x,
-    tp_size_yz,
-    activation_checkpointing,
-    name: str,
-    device_for: dict[str, str],
-    node,
-    workload_spec,
-):
-    """
-    Calculates memory traffic for the backward pass of a single layer.
-    """
-    memory_traffic = LayerMemoryTraffic(name=name, device_for=device_for, node=node)
-
-    # Handle activation checkpointing
-    # This logic is applied first, as it changes the nature of subsequent reads.
-    if activation_checkpointing:
-        # If checkpointing, we recompute the forward pass. This adds all the reads
-        # and writes of a forward pass to the backward pass's memory traffic.
-        # Use workload_spec to derive sizes for recompute path
-        n_seq = workload_spec.seq_length
-        fwd_traffic = forward_memory_traffic_per_layer(
-            attn_tp_topology,
-            moe_tp_topology,
-            transformer_config,
-            moe_config,
-            n_seq,
-            tp_variant,
-            tp_size_x,
-            tp_size_yz,
-            PassMode.TRAINING,
-            name="fwd_recompute",
-            device_for=device_for,
-            node=node,
-            workload_spec=workload_spec,
-        )
-        # Note: For recomputation, we add forward reads and writes to the total traffic.
-        memory_traffic.activations.bytes_read += (
-            fwd_traffic.activations.bytes_read + fwd_traffic.activations.bytes_written
-        )
-        memory_traffic.weights.bytes_read += fwd_traffic.weights.bytes_read
-
-    # Backward pass traffic
-
-    match tp_variant:
-        case TensorParallelVariant.NONE | TensorParallelVariant.SHARD_WEIGHTS_1D:
-            # Use split helpers matching the unified implementation
-            attn_traffic = _backward_attn_tp_1d_memory_traffic(
-                name=f"{name}_attn_bwd",
-                transformer_config=transformer_config,
-                workload_spec=workload_spec,
-                tp_size=tp_size,
-                activation_checkpointing=activation_checkpointing,
-                device_for=device_for,
-                node=node,
-            )
-
-            moe_traffic = _backward_moe_tp_1d_memory_traffic(
-                name=f"{name}_moe_bwd",
-                transformer_config=transformer_config,
-                moe_config=moe_config,
-                moe_tp_topology=moe_tp_topology,
-                workload_spec=workload_spec,
-                activation_checkpointing=activation_checkpointing,
-                device_for=device_for,
-                node=node,
-            )
-
-            memory_traffic = memory_traffic + attn_traffic + moe_traffic
-
-        case TensorParallelVariant.SHARD_WEIGHTS_2D:
-            # Use split helpers for 2D backward to match forward structure
-            attn_bwd = _backward_attn_tp_2d_memory_traffic(
-                name=f"{name}_attn_bwd_2d",
-                transformer_config=transformer_config,
-                workload_spec=workload_spec,
-                attn_tp_size_x=tp_size_x,
-                attn_tp_size_yz=tp_size_yz,
-                activation_checkpointing=activation_checkpointing,
-                device_for=device_for,
-                node=node,
-            )
-
-            moe_bwd = _backward_moe_tp_2d_memory_traffic(
-                name=f"{name}_moe_bwd_2d",
-                transformer_config=transformer_config,
-                moe_config=moe_config,
-                workload_spec=workload_spec,
-                moe_tp_size_x=tp_size_x,
-                moe_tp_size_yz=tp_size_yz,
-                activation_checkpointing=activation_checkpointing,
-                device_for=device_for,
-                node=node,
-            )
-
-            memory_traffic = memory_traffic + attn_bwd + moe_bwd
-
-        case _:
-            raise NotImplementedError(f"Logic for {tp_variant} is not implemented.")
-
-    return memory_traffic
-
-
 def get_transformer_mem_stats_per_layer(
     attn_tp_topology,
     moe_tp_topology,
@@ -2295,9 +2197,10 @@ def get_transformer_mem_stats_per_layer(
     moe_yz_dims: list[int] | None,
     pass_mode,
     float_size,
-    proj_tp_topology=None,
-    proj_x_dims: list[int] | None = None,
-    proj_yz_dims: list[int] | None = None,
+    *,
+    proj_tp_topology,
+    proj_x_dims: list[int] | None,
+    proj_yz_dims: list[int] | None,
     activation_checkpointing=False,
     device_for: dict[str, str] | None = None,
     workload_spec=None,
@@ -2336,11 +2239,13 @@ def get_transformer_mem_stats_per_layer(
         return p
 
     # Resolve TP sizes for projection, attention, and MoE independently.
-    # If proj_tp_topology is not provided, default to attention TP domain (legacy behavior).
+    # The caller resolves the projection TP domain (run_scalescope reuses the
+    # attention view when the spec has no explicit TP_Proj); no fallback here.
     if proj_tp_topology is None:
-        proj_tp_topology = attn_tp_topology
-        proj_x_dims = attn_x_dims
-        proj_yz_dims = attn_yz_dims
+        raise ValueError(
+            "get_transformer_mem_stats_per_layer requires a resolved proj_tp_topology; "
+            "the caller must pass the projection TP view explicitly."
+        )
 
     attn_shape = getattr(attn_tp_topology, "shape", [])
     proj_shape = getattr(proj_tp_topology, "shape", [])
@@ -2355,7 +2260,7 @@ def get_transformer_mem_stats_per_layer(
             tp_size_proj == proj_tp_topology.num_chips
         ), f"Proj TP size mismatch: {tp_size_proj} != {proj_tp_topology.num_chips}"
     else:
-        tp_size_proj = proj_tp_topology.num_chips if proj_tp_topology else 1
+        tp_size_proj = proj_tp_topology.num_chips
         tp_size_x_proj = None
         tp_size_yz_proj = None
 
@@ -2522,6 +2427,7 @@ def get_transformer_mem_stats_per_layer(
                     fwd_recompute,
                     transformer_config,
                     n_seq,
+                    proj_tp_size=tp_size_proj,
                     attn_tp_size=tp_size_attn,
                     save_kv_cache=False,
                     workload_spec=workload_spec,
@@ -2531,6 +2437,8 @@ def get_transformer_mem_stats_per_layer(
                     fwd_recompute,
                     transformer_config,
                     n_seq,
+                    proj_tp_size_x=tp_size_x_proj,
+                    proj_tp_size_yz=tp_size_yz_proj,
                     attn_tp_size_x=tp_size_x_attn,
                     attn_tp_size_yz=tp_size_yz_attn,
                     save_kv_cache=False,
@@ -2570,7 +2478,8 @@ def get_transformer_mem_stats_per_layer(
                     name="attn_bwd",
                     transformer_config=transformer_config,
                     workload_spec=workload_spec,
-                    tp_size=tp_size_attn,
+                    proj_tp_size=tp_size_proj,
+                    attn_tp_size=tp_size_attn,
                     activation_checkpointing=activation_checkpointing,
                     device_for=device_for,
                     node=node,
@@ -2580,6 +2489,8 @@ def get_transformer_mem_stats_per_layer(
                     name="attn_bwd_2d",
                     transformer_config=transformer_config,
                     workload_spec=workload_spec,
+                    proj_tp_size_x=tp_size_x_proj,
+                    proj_tp_size_yz=tp_size_yz_proj,
                     attn_tp_size_x=tp_size_x_attn,
                     attn_tp_size_yz=tp_size_yz_attn,
                     activation_checkpointing=activation_checkpointing,

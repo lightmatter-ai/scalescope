@@ -1,6 +1,4 @@
-"""New sweep system (DSL) for ScaleScope.
-
-This module intentionally does NOT support the legacy sweep format.
+"""Sweep system (DSL) for ScaleScope.
 
 Design:
 - A sweep config contains:
@@ -56,11 +54,7 @@ def _model_fields_data(obj: BaseModel) -> dict[str, Any]:
 
 
 def _set_nested_attr_pydantic(obj: BaseModel, attr_path: str, value: Any) -> BaseModel:
-    """Recursively creates a new Pydantic model instance with a nested attribute updated.
-
-    This is the only shared helper we need from the legacy sweep system; we inline it here
-    so the old sweep modules can be removed cleanly.
-    """
+    """Recursively creates a new Pydantic model instance with a nested attribute updated."""
     parts = attr_path.split(".", 1)
     current_attr = parts[0]
     if not hasattr(obj, current_attr):

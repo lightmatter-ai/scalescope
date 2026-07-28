@@ -59,6 +59,95 @@ class MoERouterSyncMode(StrEnum):
     SHARDED_ROUTER = "sharded_router"
 
 
+class TP2DProjAxisRole(StrEnum):
+    """What a TP-2D projection axis shards *at rest* in prefill/training.
+
+    Applies to the attention projection GEMMs (W_qkv, W_O) only; the
+    attention core (phase 2) is always sequence-sharded on YZ in
+    prefill/training. Decode has its own fixed schedule and does not
+    consult these roles.
+
+    Values:
+    - `shard_weights`: classic Megatron / weight-stationary — the axis
+      shards weight columns/rows and the weights never move; activations
+      are gathered/reduce-scattered across the axis around each GEMM
+      (S-proportional volume); weight memory divides by the axis size. On
+      YZ this is the decode-style regime: cheapest for short sequences,
+      loses to `circulate_weights` beyond B*S ~ W_panel/d_model tokens.
+    - `shard_tokens`: sequence/context parallelism — the axis shards
+      tokens; weights are fully replicated across the axis (no GEMM
+      collectives, but weight footprint does NOT divide by the axis size).
+    - `circulate_weights`: FSDP/SUMMA-style — both weights and tokens are
+      sharded at rest; each layer all-gathers its weight panel across the
+      axis (S-independent volume), applies it to the local tokens, and
+      discards it. Weight footprint divides by the axis size; a transient
+      panel buffer appears at the gather peak.
+    """
+
+    SHARD_WEIGHTS = "shard_weights"
+    SHARD_TOKENS = "shard_tokens"
+    CIRCULATE_WEIGHTS = "circulate_weights"
+
+
+class SeqParallelAttnMode(StrEnum):
+    """Sequence-parallel schedule for the prefill/training attention core
+    (phase 2) on the YZ axis of TP-2D attention.
+
+    - `ring`: RingAttention-style KV circulation, priced as an all-gather
+      proxy of the K/V buffers along YZ. Every rank receives the full
+      sequence's K/V, so per-rank volume scales with the whole context S
+      and stays roughly constant as the YZ group grows.
+    - `ulysses`: DeepSpeed-Ulysses — two all-to-all collectives reshard
+      Q/K/V from sequence-sharded to head-sharded and the attention output
+      back. Each rank exchanges only its local S/YZ token shard (all Q/K/V/O
+      heads), so per-rank volume shrinks as the YZ group grows — cheaper
+      than ring once YZ exceeds ~num_heads/num_kv_heads + 1. Requires
+      enough query heads per (X, YZ) shard.
+    - `hybrid`: USP-style composition (arXiv:2405.07719) — the YZ axis
+      factors as P_ulysses x P_ring via a tag partition
+      (`seq_parallel_ulysses_tags` names the Ulysses subgroup tags; the
+      remaining yz tags form the ring axis). Ulysses a2a runs inside each
+      P_ulysses subgroup, ring circulation across the P_ring subgroups with
+      the circulated KV shrunk by P_ulysses. Only the Ulysses factor is
+      head-count-bounded.
+    """
+
+    RING = "ring"
+    ULYSSES = "ulysses"
+    HYBRID = "hybrid"
+
+
+class TP2DProjAxisRoles(BaseModel):
+    """Per-axis operand roles for the TP-2D projection legs (prefill/train)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    x: TP2DProjAxisRole = Field(..., description="Role of the X (head-sharding) axis.")
+    yz: TP2DProjAxisRole = Field(..., description="Role of the YZ (sequence-sharding) axis.")
+
+    _parse_x = field_validator("x", mode="before")(parse_enum_by_name_or_value(TP2DProjAxisRole))
+    _parse_yz = field_validator("yz", mode="before")(parse_enum_by_name_or_value(TP2DProjAxisRole))
+
+    @model_validator(mode="after")
+    def _validate_supported_combination(self) -> "TP2DProjAxisRoles":
+        # X shards heads for the attention core, so the projection GEMMs
+        # must keep weights sharded (columns/rows) on X. Token sharding or
+        # circulation on X is not modeled.
+        if self.x != TP2DProjAxisRole.SHARD_WEIGHTS:
+            raise ValueError(
+                f"tp2d_proj_axis_roles.x must be 'shard_weights' (got '{self.x}'); "
+                "head sharding on X requires weight-sharded projections on X."
+            )
+        # All three roles are valid on YZ. The attention core stays
+        # sequence-sharded on YZ in every case:
+        # - shard_tokens / circulate_weights: tokens are sequence-sharded at
+        #   rest on YZ.
+        # - shard_weights (weight-stationary, decode-style): the residual
+        #   stream is feature-sharded on YZ at rest; phase 1 reduce-scatters
+        #   the QKV partials over the *sequence* dim, so phase 2 sees the
+        #   same sequence-sharded layout.
+        return self
+
+
 class MoEA2ACommMode(StrEnum):
     HIERARCHICAL_SPLIT = "hierarchical_split"
     FUSED_ND = "fused_nd"
@@ -531,6 +620,40 @@ class TrainSpec(WorkloadSpec):
         train_steps = self.total_train_tokens // tokens_per_batch
         return train_steps, tokens_per_batch
 
+    tp2d_proj_axis_roles: TP2DProjAxisRoles | None = Field(
+        default=None,
+        description=(
+            "Per-axis operand roles for the TP-2D projection legs. Required when "
+            "the projection TP variant is SHARD_WEIGHTS_2D; must be omitted otherwise."
+        ),
+    )
+    seq_parallel_attn_mode: SeqParallelAttnMode | None = Field(
+        default=None,
+        description=(
+            "Sequence-parallel schedule for the attention core on YZ (ring, "
+            "ulysses, or hybrid). Required when the attention TP variant is "
+            "SHARD_WEIGHTS_2D; must be omitted otherwise."
+        ),
+    )
+    seq_parallel_ulysses_tags: list[str] | None = Field(
+        default=None,
+        description=(
+            "For seq_parallel_attn_mode=hybrid only: the attention yz_tags that "
+            "form the Ulysses subgroup (P_ulysses = product of their sizes). The "
+            "remaining yz_tags form the ring axis. Must be a non-empty proper "
+            "subset of tp_attn_spec.split_2d.yz_tags."
+        ),
+    )
+
+    _parse_seq_parallel_attn_mode = field_validator("seq_parallel_attn_mode", mode="before")(
+        parse_enum_by_name_or_value(SeqParallelAttnMode)
+    )
+
+    @model_validator(mode="after")
+    def _validate_tp2d_prefill_train_fields(self) -> "TrainSpec":
+        _validate_tp2d_prefill_train_schedule_fields(self)
+        return self
+
 
 class InferencePrefillSpec(WorkloadSpec):
     """
@@ -548,6 +671,108 @@ class InferencePrefillSpec(WorkloadSpec):
             raise ValueError("micro_batch_size is not set. Please set it explicitly.")
 
     seq_length: int = Field(..., gt=0, description="The context length to run prefill.")
+
+    tp2d_proj_axis_roles: TP2DProjAxisRoles | None = Field(
+        default=None,
+        description=(
+            "Per-axis operand roles for the TP-2D projection legs. Required when "
+            "the projection TP variant is SHARD_WEIGHTS_2D; must be omitted otherwise."
+        ),
+    )
+    seq_parallel_attn_mode: SeqParallelAttnMode | None = Field(
+        default=None,
+        description=(
+            "Sequence-parallel schedule for the attention core on YZ (ring, "
+            "ulysses, or hybrid). Required when the attention TP variant is "
+            "SHARD_WEIGHTS_2D; must be omitted otherwise."
+        ),
+    )
+    seq_parallel_ulysses_tags: list[str] | None = Field(
+        default=None,
+        description=(
+            "For seq_parallel_attn_mode=hybrid only: the attention yz_tags that "
+            "form the Ulysses subgroup (P_ulysses = product of their sizes). The "
+            "remaining yz_tags form the ring axis. Must be a non-empty proper "
+            "subset of tp_attn_spec.split_2d.yz_tags."
+        ),
+    )
+
+    _parse_seq_parallel_attn_mode = field_validator("seq_parallel_attn_mode", mode="before")(
+        parse_enum_by_name_or_value(SeqParallelAttnMode)
+    )
+
+    @model_validator(mode="after")
+    def _validate_tp2d_prefill_train_fields(self) -> "InferencePrefillSpec":
+        _validate_tp2d_prefill_train_schedule_fields(self)
+        return self
+
+
+def _validate_tp2d_prefill_train_schedule_fields(spec: WorkloadSpec) -> None:
+    """Require the TP-2D prefill/train schedule fields exactly when TP-2D is used.
+
+    `tp2d_proj_axis_roles` governs the projection legs (proj TP domain);
+    `seq_parallel_attn_mode` governs the attention core (attn TP domain).
+    Both are meaningless under 1D TP, so their presence there is rejected to
+    keep specs honest.
+    """
+    proj_is_2d = spec.get_proj_tp_spec().variant == TensorParallelVariant.SHARD_WEIGHTS_2D
+    attn_is_2d = spec.get_attn_tp_spec().variant == TensorParallelVariant.SHARD_WEIGHTS_2D
+
+    roles = spec.tp2d_proj_axis_roles
+    if proj_is_2d and roles is None:
+        raise ValueError(
+            "tp2d_proj_axis_roles is required when the projection TP variant is "
+            "SHARD_WEIGHTS_2D (prefill/training)."
+        )
+    if not proj_is_2d and roles is not None:
+        raise ValueError(
+            "tp2d_proj_axis_roles must be omitted unless the projection TP variant "
+            "is SHARD_WEIGHTS_2D."
+        )
+
+    mode = spec.seq_parallel_attn_mode
+    if attn_is_2d and mode is None:
+        raise ValueError(
+            "seq_parallel_attn_mode is required when the attention TP variant is "
+            "SHARD_WEIGHTS_2D (prefill/training)."
+        )
+    if not attn_is_2d and mode is not None:
+        raise ValueError(
+            "seq_parallel_attn_mode must be omitted unless the attention TP variant "
+            "is SHARD_WEIGHTS_2D."
+        )
+
+    ulysses_tags = spec.seq_parallel_ulysses_tags
+    if mode == SeqParallelAttnMode.HYBRID:
+        if ulysses_tags is None:
+            raise ValueError(
+                "seq_parallel_ulysses_tags is required when seq_parallel_attn_mode "
+                "is 'hybrid' (it names the yz_tags forming the Ulysses subgroup)."
+            )
+        if len(ulysses_tags) == 0:
+            raise ValueError("seq_parallel_ulysses_tags must be non-empty.")
+        if len(set(ulysses_tags)) != len(ulysses_tags):
+            raise ValueError(f"seq_parallel_ulysses_tags contains duplicates: {ulysses_tags}")
+        attn_split = spec.get_attn_tp_spec().split_2d
+        # split_2d presence is already guaranteed by TensorParallelSpecV2 for 2D.
+        yz_tags = set(attn_split.yz_tags)
+        unknown = set(ulysses_tags) - yz_tags
+        if unknown:
+            raise ValueError(
+                f"seq_parallel_ulysses_tags contains tags not in "
+                f"tp_attn_spec.split_2d.yz_tags: {sorted(unknown)}"
+            )
+        if set(ulysses_tags) == yz_tags:
+            raise ValueError(
+                "seq_parallel_ulysses_tags must be a proper subset of yz_tags: with "
+                "all yz tags in the Ulysses subgroup there is no ring axis — use "
+                "seq_parallel_attn_mode: ulysses instead."
+            )
+    elif ulysses_tags is not None:
+        raise ValueError(
+            "seq_parallel_ulysses_tags must be omitted unless seq_parallel_attn_mode "
+            "is 'hybrid'."
+        )
 
 
 class InferenceDecodeSpec(WorkloadSpec):

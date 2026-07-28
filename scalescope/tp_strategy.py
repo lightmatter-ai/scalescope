@@ -18,12 +18,15 @@ from scalescope.network_topology_model import (
     hockney_model_all_reduce_on_nd_topology,
     hockney_model_reduce_on_nd_topology,
     hockney_model_reduce_scatter_on_nd_topology,
+    hockney_model_total_exchange_on_nd_topology,
 )
 from scalescope.stats import CommStats
-from scalescope.topology_spec import LogicalTopology
+from scalescope.topology_spec import LogicalTopology, PhysicalTopology1DType
 from scalescope.workload_spec import (
     MoERouterSyncMode,
+    SeqParallelAttnMode,
     TensorParallelVariant,
+    TP2DProjAxisRole,
     TP2DSplitSpec,
 )
 
@@ -95,13 +98,282 @@ def resolve_tp2d_split(
 # ---- TP-2D attention comm helpers (explicit stage separation) ----
 
 
-def _tp2d_attn_comm_phase1_input_proj(
-    *, tp_topology: LogicalTopology, volume_bytes: float, tp_x: int, float_size_bytes: float
-) -> CommStats:
-    """Phase 1: input projection comm proxy (keep formula unchanged)."""
-    return hockney_model_all_reduce_on_nd_topology(
-        tp_topology, volume_bytes / tp_x, float_size_bytes=float_size_bytes
+@dataclass(frozen=True)
+class _TP2DProjWeightBytes:
+    """Full (model-level) attention projection weight sizes, in bytes.
+
+    One field per projection GEMM: `w_qkv` for the fused QKV projection,
+    `w_o` for the output projection. These are the *logical* matrix sizes
+    with no TP sharding applied; callers divide by the relevant TP factors
+    (e.g. `weights.w_qkv / tp_x_proj`) to get the per-rank shard or the
+    panel size a collective actually moves.
+    """
+
+    w_qkv: float
+    w_o: float
+
+
+def _tp2d_proj_weight_bytes(
+    transformer_config: TransformerConfig, float_size_bytes: float
+) -> _TP2DProjWeightBytes:
+    d_model = transformer_config.d_model
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = transformer_config.num_heads * head_dim
+    kv_proj_out_dim = transformer_config.num_kv_heads * head_dim
+    w_qkv = float_size_bytes * d_model * (q_proj_out_dim + 2 * kv_proj_out_dim)
+    w_o = float_size_bytes * q_proj_out_dim * d_model
+    return _TP2DProjWeightBytes(w_qkv=w_qkv, w_o=w_o)
+
+
+def _tp2d_proj_activation_bytes(
+    transformer_config: TransformerConfig,
+    *,
+    n_batch: int,
+    n_seq: int,
+    tp_x_proj: int,
+    float_size_bytes: float,
+) -> tuple[float, float]:
+    """Full-sequence projection activation buffers for the local X shard.
+
+    Used by the weight-stationary (`yz: shard_weights`) YZ legs, whose
+    collectives move activations over the sequence dim:
+    - QKV partials: [B, S, (q_out + 2*kv_out)/tp_x]
+    - attention output: [B, S, q_out/tp_x]
+    """
+    head_dim = transformer_config.head_dim
+    q_proj_out_dim = transformer_config.num_heads * head_dim
+    kv_proj_out_dim = transformer_config.num_kv_heads * head_dim
+    qkv_act = (
+        float_size_bytes * n_batch * n_seq * (q_proj_out_dim + 2 * kv_proj_out_dim) / tp_x_proj
     )
+    o_act = float_size_bytes * n_batch * n_seq * q_proj_out_dim / tp_x_proj
+    return qkv_act, o_act
+
+
+def _tp2d_attn_proj_comm_prefill_train_forward(
+    *,
+    transformer_config: TransformerConfig,
+    workload_spec,
+    n_seq: int,
+    proj_x_topology: LogicalTopology,
+    proj_yz_topology: LogicalTopology,
+    tp_x_proj: int,
+    seq_shard: int,
+    float_size_bytes: float,
+) -> tuple[CommStats, CommStats]:
+    """Forward projection-leg comm (phases 1 and 3) as a per-axis-role walk.
+
+    Phase numbering refers to the three-stage TP-2D attention layer pass:
+    phase 1 = QKV input projections, phase 2 = attention core, phase 3 =
+    output projection. This helper prices only the projection legs (1 and 3);
+    the attention core (2) — the ring/Ulysses/USP exchange — is priced by
+    `_tp2d_attn_comm_phase2_prefill_train`, and the caller assembles all
+    three into `AttnForwardCommPhases`.
+
+    Starting layout (prefill/training): each rank holds a slice of the
+    residual stream cut along two axes at once — the sequence dim across YZ
+    (`seq_shard` ranks) and the feature dim (d_model) across X. Per rank:
+    [B, S/seq_shard, d_model/X].
+
+    X legs — identical in every role. X always shards weights (validated in
+    `TP2DProjAxisRoles`), and the projection GEMMs contract over d_model, so
+    each rank needs the full d_model — but only for its own S/seq_shard
+    tokens (the GEMM is independent across tokens, so the sequence stays
+    partitioned). Phase 1 all-gathers the token slab along X before the QKV
+    GEMM ([B, S/seq_shard, d_model/X] -> [B, S/seq_shard, d_model]); phase 3
+    reduce-scatters the W_O output along X (Megatron-SP).
+    Both collectives carry the same payload: the [B, S/seq_shard, d_model]
+    residual slab of the rank's local sequence shard. The attention-output
+    activation (feature dim q_proj_out_dim) never crosses the wire on X —
+    even under wide-Q layouts where q_proj_out_dim > d_model.
+
+    YZ legs — decided by the role:
+    - `shard_tokens`: weights are replicated across YZ. Nothing moves on YZ.
+    - `circulate_weights`: weights are sharded across YZ at rest, so each
+      layer all-gathers the local X-shard weight panel along YZ before the
+      GEMM (FSDP/ZeRO-3 style). Volume depends on model size only — it is
+      independent of sequence length.
+    - `shard_weights` (weight-stationary, decode-style): weight panels stay
+      pinned (sharded X x YZ) and *activations* move instead. Phase 1
+      reduce-scatters the full-sequence QKV partial sums along YZ over the
+      sequence dim, landing tokens in exactly the sequence-sharded layout
+      phase 2 expects; phase 3 all-gathers the attention output along YZ
+      before the W_O panel GEMM. Both volumes are proportional to S: this
+      regime wins at short sequences (and decode) and loses to panel
+      circulation at long context. One layout wrinkle: at rest the residual
+      stream is feature-sharded on YZ ([B, S, d_model/YZ]) rather than
+      sequence-sharded — but that slab has the same byte count, so the X
+      legs above are unchanged.
+    """
+    d_model = transformer_config.d_model
+    n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
+    roles = workload_spec.tp2d_proj_axis_roles
+    if roles is None:
+        raise ValueError(
+            "TP-2D prefill/train projection comm requires tp2d_proj_axis_roles on the "
+            "workload spec (TrainSpec / InferencePrefillSpec)."
+        )
+
+    # Full token slab (residual stream) for the local sequence shard.
+    token_slab_bytes = float_size_bytes * n_batch * (n_seq / seq_shard) * d_model
+    weights = _tp2d_proj_weight_bytes(transformer_config, float_size_bytes)
+    qkv_act_bytes, o_act_bytes = _tp2d_proj_activation_bytes(
+        transformer_config,
+        n_batch=n_batch,
+        n_seq=n_seq,
+        tp_x_proj=tp_x_proj,
+        float_size_bytes=float_size_bytes,
+    )
+
+    phase1 = hockney_model_all_gather_on_nd_topology(
+        proj_x_topology, token_slab_bytes, float_size_bytes=float_size_bytes
+    )
+    phase3 = hockney_model_reduce_scatter_on_nd_topology(
+        proj_x_topology, token_slab_bytes, float_size_bytes=float_size_bytes
+    )
+
+    match roles.yz:
+        case TP2DProjAxisRole.SHARD_TOKENS:
+            pass  # weights replicated on YZ: no weight legs
+        case TP2DProjAxisRole.CIRCULATE_WEIGHTS:
+            phase1 += hockney_model_all_gather_on_nd_topology(
+                proj_yz_topology, weights.w_qkv / tp_x_proj, float_size_bytes=float_size_bytes
+            )
+            phase3 += hockney_model_all_gather_on_nd_topology(
+                proj_yz_topology, weights.w_o / tp_x_proj, float_size_bytes=float_size_bytes
+            )
+        case TP2DProjAxisRole.SHARD_WEIGHTS:
+            phase1 += hockney_model_reduce_scatter_on_nd_topology(
+                proj_yz_topology, qkv_act_bytes, float_size_bytes=float_size_bytes
+            )
+            phase3 += hockney_model_all_gather_on_nd_topology(
+                proj_yz_topology, o_act_bytes, float_size_bytes=float_size_bytes
+            )
+        case _:
+            raise ValueError(f"Unsupported tp2d_proj_axis_roles.yz: {roles.yz}")
+
+    return phase1, phase3
+
+
+def _tp2d_attn_proj_comm_train_backward(
+    *,
+    transformer_config: TransformerConfig,
+    workload_spec,
+    n_seq: int,
+    proj_x_topology: LogicalTopology,
+    proj_yz_topology: LogicalTopology,
+    tp_x_proj: int,
+    seq_shard: int,
+    float_size_bytes: float,
+) -> tuple[CommStats, CommStats]:
+    """Backward projection-leg comm (phases 1 and 3), mirroring the forward walk.
+
+    Same phase numbering and structure as
+    `_tp2d_attn_proj_comm_prefill_train_forward`; the attention-core
+    backward (phase 2) is priced separately. The general rule: every forward
+    collective mirrors into its dual (all-gather <-> reduce-scatter) at
+    equal volume, and the backward pass adds one genuinely new term — the
+    weight-gradient (dW) reduction, whose form depends on how weights are
+    laid out on YZ.
+
+    X legs — identical in every role, mirroring forward at equal volume:
+    the forward all-gather of the token slab becomes a reduce-scatter of
+    the input gradients, and the forward reduce-scatter of the W_O output
+    becomes an all-gather of the output gradients. Payload is the same
+    [B, S/seq_shard, d_model] residual slab as forward.
+
+    YZ legs — decided by the role (mirrored activation/panel legs first,
+    then the dW reduction):
+    - `shard_tokens`: no forward YZ comm, so nothing mirrors. dW: each rank
+      computed a partial dW from its own sequence shard, so the full local
+      (X-sharded) weight grad is all-reduced along YZ.
+    - `circulate_weights`: the weight panels are re-gathered along YZ for
+      the backward GEMMs (same all-gather as forward). dW: panel gradients
+      are reduce-scattered back to their YZ owners. Together that is 2x the
+      forward panel volume.
+    - `shard_weights` (weight-stationary): the forward activation legs
+      mirror at equal volume — the forward reduce-scatter of the QKV
+      partials becomes an all-gather of dQKV (needed for the input-grad
+      GEMM), and the forward all-gather of the attention output becomes a
+      reduce-scatter of its gradient back to the sequence shard. dW: each
+      rank's dW panel is a partial sum over its local sequence slice, so
+      the panel-sized (X x YZ-sharded) weight grad is all-reduced along YZ.
+    """
+    d_model = transformer_config.d_model
+    n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
+    roles = workload_spec.tp2d_proj_axis_roles
+    if roles is None:
+        raise ValueError(
+            "TP-2D train backward projection comm requires tp2d_proj_axis_roles on the "
+            "workload spec (TrainSpec)."
+        )
+
+    token_slab_bytes = float_size_bytes * n_batch * (n_seq / seq_shard) * d_model
+    weights = _tp2d_proj_weight_bytes(transformer_config, float_size_bytes)
+    qkv_act_bytes, o_act_bytes = _tp2d_proj_activation_bytes(
+        transformer_config,
+        n_batch=n_batch,
+        n_seq=n_seq,
+        tp_x_proj=tp_x_proj,
+        float_size_bytes=float_size_bytes,
+    )
+
+    phase1 = hockney_model_reduce_scatter_on_nd_topology(
+        proj_x_topology, token_slab_bytes, float_size_bytes=float_size_bytes
+    )
+    phase3 = hockney_model_all_gather_on_nd_topology(
+        proj_x_topology, token_slab_bytes, float_size_bytes=float_size_bytes
+    )
+
+    match roles.yz:
+        case TP2DProjAxisRole.SHARD_TOKENS:
+            # No forward YZ comm to mirror. Both legs below are the new dW
+            # term: each rank's weight grad is a partial sum over its own
+            # sequence shard, all-reduced along YZ (full X-sharded dW).
+            phase1 += hockney_model_all_reduce_on_nd_topology(
+                proj_yz_topology, weights.w_qkv / tp_x_proj, float_size_bytes=float_size_bytes
+            )
+            phase3 += hockney_model_all_reduce_on_nd_topology(
+                proj_yz_topology, weights.w_o / tp_x_proj, float_size_bytes=float_size_bytes
+            )
+        case TP2DProjAxisRole.CIRCULATE_WEIGHTS:
+            # AG = re-gather the weight panel for the backward GEMMs (mirror
+            # of the forward panel gather); RS = the new dW term — panel
+            # gradients reduce-scattered back to their YZ owners.
+            phase1 += hockney_model_all_gather_on_nd_topology(
+                proj_yz_topology, weights.w_qkv / tp_x_proj, float_size_bytes=float_size_bytes
+            ) + hockney_model_reduce_scatter_on_nd_topology(
+                proj_yz_topology, weights.w_qkv / tp_x_proj, float_size_bytes=float_size_bytes
+            )
+            phase3 += hockney_model_all_gather_on_nd_topology(
+                proj_yz_topology, weights.w_o / tp_x_proj, float_size_bytes=float_size_bytes
+            ) + hockney_model_reduce_scatter_on_nd_topology(
+                proj_yz_topology, weights.w_o / tp_x_proj, float_size_bytes=float_size_bytes
+            )
+        case TP2DProjAxisRole.SHARD_WEIGHTS:
+            tp_yz_proj = proj_yz_topology.num_chips
+            # Activation legs mirror forward (AG of dQKV / RS of the
+            # attention-output grad); the all-reduce is the new dW term —
+            # each rank's pinned panel grad (W/(X*YZ)) is a partial sum over
+            # its local sequence slice, all-reduced along YZ.
+            phase1 += hockney_model_all_gather_on_nd_topology(
+                proj_yz_topology, qkv_act_bytes, float_size_bytes=float_size_bytes
+            ) + hockney_model_all_reduce_on_nd_topology(
+                proj_yz_topology,
+                weights.w_qkv / (tp_x_proj * tp_yz_proj),
+                float_size_bytes=float_size_bytes,
+            )
+            phase3 += hockney_model_reduce_scatter_on_nd_topology(
+                proj_yz_topology, o_act_bytes, float_size_bytes=float_size_bytes
+            ) + hockney_model_all_reduce_on_nd_topology(
+                proj_yz_topology,
+                weights.w_o / (tp_x_proj * tp_yz_proj),
+                float_size_bytes=float_size_bytes,
+            )
+        case _:
+            raise ValueError(f"Unsupported tp2d_proj_axis_roles.yz: {roles.yz}")
+
+    return phase1, phase3
 
 
 def _tp2d_attn_comm_phase3_output_proj(
@@ -133,8 +405,8 @@ def _tp2d_attn_comm_phase3_output_proj(
     Caller must supply both `input_volume_bytes` (= B·n_seq·q_proj_out_dim·float_size)
     and `output_volume_bytes` (= B·n_seq·d_model·float_size) explicitly so the
     two distinct collectives are priced on their actual payloads. The two are
-    equal whenever num_heads · head_dim == d_model (i.e. non-wide-Q), so this
-    collapses to the legacy single-volume pricing in the MHA / non-wide-Q case.
+    equal whenever num_heads · head_dim == d_model (i.e. non-wide-Q), in which
+    case both collectives price the same volume.
     """
     if x_topology.num_chips <= 1 and yz_topology.num_chips <= 1:
         return CommStats()
@@ -263,8 +535,11 @@ def _tp2d_attn_comm_phase2_prefill_ring_kv_exchange(
     Payload modeled:
     - We gather K and V for the full sequence (length `n_seq`) for the *local head shard* on X.
     - GQA-aware: K/V payload uses `num_kv_heads` (not `num_heads`).
-    - Per-rank full-buffer size after the conceptual all-gather:
-        KV_full_bytes = 2 * B * n_seq * (H_kv/tp_x) * d_h * b
+    - Sliding-window layers only need the window preceding each query block,
+      so their circulated KV is capped at `window_size` tokens; costs are
+      blended per attention layer class.
+    - Per-rank full-buffer size after the conceptual all-gather (per class):
+        KV_full_bytes = 2 * B * kv_len(n_seq) * (H_kv/tp_x) * d_h * b
     """
     if yz_topology.num_chips <= 1:
         return CommStats()
@@ -274,10 +549,288 @@ def _tp2d_attn_comm_phase2_prefill_ring_kv_exchange(
     head_dim = transformer_config.head_dim
 
     kv_heads_per_x, _kv_rep = resolve_kv_heads_per_partition(num_kv_heads=num_kv_heads, tp_x=tp_x)
-    kv_full_bytes = float_size_bytes * (2 * n_batch * n_seq * (kv_heads_per_x * head_dim))
-    return hockney_model_all_gather_on_nd_topology(
-        yz_topology, kv_full_bytes, float_size_bytes=float_size_bytes
+    comm = CommStats()
+    for layer_class in attention_layer_classes(transformer_config):
+        kv_full_bytes = float_size_bytes * (
+            2 * n_batch * layer_class.kv_len(n_seq) * (kv_heads_per_x * head_dim)
+        )
+        comm += layer_class.layer_fraction * hockney_model_all_gather_on_nd_topology(
+            yz_topology, kv_full_bytes, float_size_bytes=float_size_bytes
+        )
+    return comm
+
+
+def _tp2d_attn_comm_phase2_prefill_ulysses_exchange(
+    *,
+    yz_topology: LogicalTopology,
+    transformer_config: TransformerConfig,
+    workload_spec,
+    n_seq: int,
+    tp_x: int,
+    float_size_bytes: float,
+) -> CommStats:
+    """Phase 2 (prefill/train): DeepSpeed-Ulysses all-to-all resharding on YZ.
+
+    Schedule (arXiv:2309.14509):
+    1) Q/K/V are produced sequence-sharded on YZ (S/P tokens per rank, all
+       local heads). A total-exchange along YZ reshards them to head-sharded
+       (all S tokens, local-heads/P heads per rank).
+    2) Attention core runs fully locally (each rank owns whole heads over the
+       full sequence) — no per-step communication, unlike the ring proxy.
+    3) The attention output O is total-exchanged back from head-sharded to
+       sequence-sharded for the output projection.
+
+    Per-rank send-buffer sizes (the hockney total-exchange helper takes the
+    local buffer and applies the (P-1)/P factor internally):
+      a2a #1: B * (S/P) * (H/tp_x + 2 * H_kv/tp_x) * d_h * b   (Q + K + V)
+      a2a #2: B * (S/P) * (H/tp_x) * d_h * b                    (O)
+
+    Note the S/P in both buffers: per-rank a2a volume scales with the
+    *local* token shard and shrinks as P grows. Ring instead delivers the
+    full sequence's K/V to every rank — per-rank volume ~ B*S*2*(H_kv/tp_x)
+    * d_h * b, roughly constant in P. The ratio ring/Ulysses works out to
+    P*H_kv/(H + H_kv), so Ulysses wins once P > ~H/H_kv + 1 (e.g. P > 9
+    for an 8:1 GQA model; P > 2 for MHA).
+
+    Constraints (fail fast, not silently degraded):
+    - Q heads must split across (tp_x, P): heads_per_x % P == 0.
+    - KV heads per X shard must cover P ranks (kv_heads_per_x >= P);
+      KV-head duplication under Ulysses is not modeled.
+
+    SWA note: sliding-window layers still exchange their full Q/K/V slabs —
+    the a2a reshards activations regardless of the attention mask — so no
+    layer-class blending applies here.
+    """
+    if yz_topology.num_chips <= 1:
+        return CommStats()
+
+    p_seq = yz_topology.num_chips
+    n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
+    num_heads = transformer_config.num_heads
+    num_kv_heads = transformer_config.num_kv_heads
+    head_dim = transformer_config.head_dim
+
+    heads_per_x = num_heads // tp_x
+    if heads_per_x % p_seq != 0:
+        raise ValueError(
+            f"Ulysses sequence parallelism requires query heads per X shard "
+            f"({heads_per_x}) to be divisible by the YZ degree ({p_seq})."
+        )
+    kv_heads_per_x, kv_rep = resolve_kv_heads_per_partition(num_kv_heads=num_kv_heads, tp_x=tp_x)
+    if kv_rep > 1 or kv_heads_per_x < p_seq:
+        raise NotImplementedError(
+            f"Ulysses with KV-head duplication is not modeled: kv_heads_per_x="
+            f"{kv_heads_per_x} (replication {kv_rep}) < YZ degree {p_seq}. "
+            f"Use seq_parallel_attn_mode: ring for this layout."
+        )
+
+    qkv_slab_bytes = (
+        float_size_bytes
+        * n_batch
+        * (n_seq / p_seq)
+        * ((heads_per_x + 2 * kv_heads_per_x) * head_dim)
     )
+    o_slab_bytes = float_size_bytes * n_batch * (n_seq / p_seq) * (heads_per_x * head_dim)
+
+    return hockney_model_total_exchange_on_nd_topology(
+        yz_topology, qkv_slab_bytes, float_size_bytes=float_size_bytes
+    ) + hockney_model_total_exchange_on_nd_topology(
+        yz_topology, o_slab_bytes, float_size_bytes=float_size_bytes
+    )
+
+
+def _validate_subgroup_collective_pricing(view: LogicalTopology, leg_desc: str) -> None:
+    """Safeguard: reject collective pricing on subgroups of a physical ring.
+
+    Views are priced with the 1D collective primitives selected by the
+    *physical* dimension's topology type. That is exact for fully-connected
+    and switched fabrics (any subset of an FC group is itself fully
+    connected), but wrong for a strict subgroup of a physical RING dimension:
+    the subgroup's members are strided/interleaved on the ring rather than
+    neighbors, so a "ring" collective among them would actually hop across
+    non-member ranks (and an FC-priced collective has no direct links at
+    all). This model has no representation of that, so fail fast instead of
+    silently mispricing. Applied to the phase-2 YZ view in all
+    seq-parallel modes (ring, Ulysses, and both hybrid sub-views).
+
+    A logical dimension that spans its physical ring completely
+    (`logical size == physical size`) is contiguous by construction and
+    passes.
+    """
+    for dim in view.dimensions:
+        tag = _tag_to_str(dim.logical_tag)
+        phys = view.get_physical_dimension_for_tag(tag)
+        if phys.topology_type == PhysicalTopology1DType.RING and dim.size != phys.size:
+            raise ValueError(
+                f"Cannot price the {leg_desc} exchange on logical dimension "
+                f"'{tag}' (size {dim.size}): it is a strict subgroup of physical "
+                f"RING dimension '{phys.name}' (size {phys.size}). Subgroup "
+                f"members of a ring are not neighbors, so neither ring nor "
+                f"fully-connected collective pricing applies. Map this tag onto "
+                f"a fully-connected/switched physical dimension, or size it to "
+                f"span the full ring."
+            )
+
+
+def _tp2d_attn_comm_phase2_prefill_hybrid_exchange(
+    *,
+    yz_topology: LogicalTopology,
+    transformer_config: TransformerConfig,
+    workload_spec,
+    n_seq: int,
+    tp_x: int,
+    float_size_bytes: float,
+    backward: bool,
+) -> CommStats:
+    """Phase 2 (prefill/train): USP-style hybrid — Ulysses x ring on YZ.
+
+    The YZ axis factors as `P = P_u x P_r` via a tag partition
+    (`seq_parallel_ulysses_tags` on the workload spec names the Ulysses
+    subgroup tags; the remaining yz tags form the ring axis). Schedule
+    (arXiv:2405.07719):
+
+    1) Ulysses a2a inside each `P_u` subgroup converts part of the sequence
+       sharding into head sharding: each rank ends with the subgroup's
+       combined chunk (`S/P_r` tokens) for `heads_per_x/P_u` heads.
+    2) Ring circulation across the `P_r` subgroups covers the remaining
+       sequence extent for that head slice — the circulated KV shrinks by
+       `P_u` relative to pure ring.
+    3) The inverse a2a returns to fully sequence-sharded.
+
+    Pricing reuses the pure-mode functions with shifted arguments:
+    - Ulysses leg: priced on the Ulysses sub-view with the *hybrid* local
+      token count (`n_seq/P_r` fed in, so slabs use `S/(P_u·P_r)` tokens).
+      Its head-divisibility and KV-duplication constraints then bind only
+      the `P_u` factor, as USP requires.
+    - Ring leg: priced on the ring sub-view with effective head parallelism
+      `tp_x·P_u` (the transient head sharding during the attention core),
+      which shrinks the circulated KV heads per rank accordingly. SWA
+      layer-class blending is inherited.
+
+    Direction: one call prices one direction, selected by the `backward`
+    flag — this is never a combined forward+backward total. The two
+    directions share this function because backward runs the same two legs
+    over the same views, only weighted differently: the ring leg costs 2x
+    forward (K/V are re-circulated for the backward kernels, and dK/dV
+    circulate back to their owners), while the Ulysses leg costs 1x (its
+    two a2a's mirror at equal volume).
+    """
+    ulysses_tags = workload_spec.seq_parallel_ulysses_tags
+    if ulysses_tags is None:
+        raise ValueError(
+            "seq_parallel_attn_mode=hybrid requires seq_parallel_ulysses_tags on "
+            "the workload spec (TrainSpec / InferencePrefillSpec)."
+        )
+    dim_tags = [_tag_to_str(d.logical_tag) for d in yz_topology.dimensions]
+    unknown = set(ulysses_tags) - set(dim_tags)
+    if unknown:
+        raise ValueError(
+            f"seq_parallel_ulysses_tags {sorted(unknown)} not present in the "
+            f"attention YZ view dimensions {dim_tags}."
+        )
+    ring_tags = [t for t in dim_tags if t not in set(ulysses_tags)]
+    if not ring_tags:
+        raise ValueError(
+            "seq_parallel_ulysses_tags covers the entire YZ axis; use "
+            "seq_parallel_attn_mode: ulysses instead."
+        )
+
+    sharing = getattr(yz_topology, "global_sharing_context", "max_exclusive")
+    ulysses_view = yz_topology.create_view(
+        view_name="TP_Attn_YZ_Ulysses_View",
+        relevant_tags=list(ulysses_tags),
+        global_sharing_context=sharing,
+    )
+    ring_view = yz_topology.create_view(
+        view_name="TP_Attn_YZ_Ring_View",
+        relevant_tags=ring_tags,
+        global_sharing_context=sharing,
+    )
+    _validate_subgroup_collective_pricing(ulysses_view, "hybrid Ulysses (a2a)")
+    _validate_subgroup_collective_pricing(ring_view, "hybrid ring (KV circulation)")
+
+    p_u = ulysses_view.num_chips
+    p_r = ring_view.num_chips
+
+    ulysses_leg = _tp2d_attn_comm_phase2_prefill_ulysses_exchange(
+        yz_topology=ulysses_view,
+        transformer_config=transformer_config,
+        workload_spec=workload_spec,
+        # Local slabs hold S/(P_u * P_r) tokens; the pure-mode function divides
+        # by its own group size (P_u), so pre-divide by P_r here.
+        n_seq=n_seq / p_r,
+        tp_x=tp_x,
+        float_size_bytes=float_size_bytes,
+    )
+    ring_leg = _tp2d_attn_comm_phase2_prefill_ring_kv_exchange(
+        yz_topology=ring_view,
+        transformer_config=transformer_config,
+        workload_spec=workload_spec,
+        n_seq=n_seq,
+        # Effective head parallelism during the attention core is tp_x * P_u.
+        tp_x=tp_x * p_u,
+        float_size_bytes=float_size_bytes,
+    )
+    ring_factor = 2 if backward else 1
+    return ulysses_leg + ring_factor * ring_leg
+
+
+def _tp2d_attn_comm_phase2_prefill_train(
+    *,
+    yz_topology: LogicalTopology,
+    transformer_config: TransformerConfig,
+    workload_spec,
+    n_seq: int,
+    tp_x: int,
+    float_size_bytes: float,
+    backward: bool,
+) -> CommStats:
+    """Phase 2 (prefill/train): dispatch on the spec's seq-parallel mode.
+
+    Backward weighting per mode: ring re-circulates KV and returns dK/dV
+    (2x forward); Ulysses mirrors its two a2a's (1x forward); hybrid applies
+    each factor to its own leg.
+    """
+    mode = workload_spec.seq_parallel_attn_mode
+    if mode is None:
+        raise ValueError(
+            "TP-2D prefill/train attention comm requires seq_parallel_attn_mode on "
+            "the workload spec (TrainSpec / InferencePrefillSpec)."
+        )
+    match mode:
+        case SeqParallelAttnMode.RING:
+            _validate_subgroup_collective_pricing(yz_topology, "ring (KV circulation)")
+            fwd = _tp2d_attn_comm_phase2_prefill_ring_kv_exchange(
+                yz_topology=yz_topology,
+                transformer_config=transformer_config,
+                workload_spec=workload_spec,
+                n_seq=n_seq,
+                tp_x=tp_x,
+                float_size_bytes=float_size_bytes,
+            )
+            return 2 * fwd if backward else fwd
+        case SeqParallelAttnMode.ULYSSES:
+            _validate_subgroup_collective_pricing(yz_topology, "Ulysses (a2a)")
+            return _tp2d_attn_comm_phase2_prefill_ulysses_exchange(
+                yz_topology=yz_topology,
+                transformer_config=transformer_config,
+                workload_spec=workload_spec,
+                n_seq=n_seq,
+                tp_x=tp_x,
+                float_size_bytes=float_size_bytes,
+            )
+        case SeqParallelAttnMode.HYBRID:
+            return _tp2d_attn_comm_phase2_prefill_hybrid_exchange(
+                yz_topology=yz_topology,
+                transformer_config=transformer_config,
+                workload_spec=workload_spec,
+                n_seq=n_seq,
+                tp_x=tp_x,
+                float_size_bytes=float_size_bytes,
+                backward=backward,
+            )
+        case _:
+            raise ValueError(f"Unknown seq_parallel_attn_mode: {mode}")
 
 
 def _tp2d_attn_comm_phase1_qkv_proj_decode(
@@ -402,103 +955,6 @@ def _tp2d_attn_comm_phase1_qkv_proj_decode(
         case _:
             raise ValueError(f"Unknown decode_tp2d_kv_comm_mode: {kv_mode}")
     return comm
-
-
-def _tp2d_attn_comm_prefill_train(
-    *,
-    transformer_config: TransformerConfig,
-    workload_spec,
-    n_seq: int,
-    attn_tp_topology: LogicalTopology,
-    x_topology: LogicalTopology,
-    yz_topology: LogicalTopology,
-    tp_x: int,
-    tp_yz: int,
-) -> CommStats:
-    """TP2D attention comm for training/prefill (no decode-only YZ reductions)."""
-    d_model = transformer_config.d_model
-    num_heads = transformer_config.num_heads
-    head_dim = transformer_config.head_dim
-    q_proj_out_dim = num_heads * head_dim
-    float_size = workload_spec.float_size_bytes
-    n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
-    # Two distinct volumes for the output-projection collectives: AG_YZ
-    # ships the attention-output activation (q_proj_out_dim), RS_X ships
-    # the post-output-proj residual stream (d_model). Equal under non-wide-Q.
-    output_volume_bytes = float_size * n_batch * n_seq * d_model
-    input_volume_bytes = float_size * n_batch * n_seq * q_proj_out_dim
-    comm1 = _tp2d_attn_comm_phase1_input_proj(
-        tp_topology=attn_tp_topology,
-        volume_bytes=output_volume_bytes,
-        tp_x=tp_x,
-        float_size_bytes=float_size,
-    )
-    comm2 = _tp2d_attn_comm_phase2_prefill_ring_kv_exchange(
-        yz_topology=yz_topology,
-        transformer_config=transformer_config,
-        workload_spec=workload_spec,
-        n_seq=n_seq,
-        tp_x=tp_x,
-        float_size_bytes=float_size,
-    )
-    comm3 = _tp2d_attn_comm_phase3_output_proj(
-        x_topology=x_topology,
-        yz_topology=yz_topology,
-        input_volume_bytes=input_volume_bytes,
-        output_volume_bytes=output_volume_bytes,
-        tp_x=tp_x,
-        tp_yz=tp_yz,
-        float_size_bytes=float_size,
-    )
-    return comm1 + comm2 + comm3
-
-
-def _tp2d_attn_comm_decode(
-    *,
-    transformer_config: TransformerConfig,
-    workload_spec,
-    n_seq: int,
-    attn_tp_topology: LogicalTopology,
-    x_topology: LogicalTopology,
-    yz_topology: LogicalTopology,
-    tp_x: int,
-    tp_yz: int,
-) -> CommStats:
-    """TP2D attention comm for decode (includes decode-only YZ reductions)."""
-    d_model = transformer_config.d_model
-    num_heads = transformer_config.num_heads
-    head_dim = transformer_config.head_dim
-    q_proj_out_dim = num_heads * head_dim
-    float_size = workload_spec.float_size_bytes
-    n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
-    output_volume_bytes = float_size * n_batch * n_seq * d_model
-    input_volume_bytes = float_size * n_batch * n_seq * q_proj_out_dim
-    comm1 = _tp2d_attn_comm_phase1_qkv_proj_decode(
-        x_topology=x_topology,
-        yz_topology=yz_topology,
-        transformer_config=transformer_config,
-        workload_spec=workload_spec,
-        tp_x=tp_x,
-        tp_yz=tp_yz,
-        float_size_bytes=float_size,
-    )
-    comm2 = _tp2d_attn_comm_phase2_decode_yz_reductions(
-        yz_topology=yz_topology,
-        transformer_config=transformer_config,
-        workload_spec=workload_spec,
-        tp_x=tp_x,
-        float_size_bytes=float_size,
-    )
-    comm3 = _tp2d_attn_comm_phase3_output_proj(
-        x_topology=x_topology,
-        yz_topology=yz_topology,
-        input_volume_bytes=input_volume_bytes,
-        output_volume_bytes=output_volume_bytes,
-        tp_x=tp_x,
-        tp_yz=tp_yz,
-        float_size_bytes=float_size,
-    )
-    return comm1 + comm2 + comm3
 
 
 class TensorParallelStrategy(ABC):
@@ -978,57 +1434,119 @@ class TP2DAttnStrategy(TensorParallelStrategy):
         proj_yz_topology: LogicalTopology,
         **kwargs,
     ) -> AttnForwardCommPhases:
-        d_model = transformer_config.d_model
-        num_heads = transformer_config.num_heads
-        head_dim = transformer_config.head_dim
-        q_proj_out_dim = num_heads * head_dim
-        float_size = workload_spec.float_size_bytes
-        n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
-        # `output_volume` is the residual-stream volume (d_model-based) used
-        # by the input projection and the output-proj reduce-scatter.
-        # `input_volume` is the attention-output activation volume
-        # (q_proj_out_dim-based) shipped by the output-proj all-gather.
-        # They coincide for non-wide-Q layouts.
-        output_volume = float_size * n_batch * n_seq * d_model
-        input_volume = float_size * n_batch * n_seq * q_proj_out_dim
+        """Prefill/training TP-2D attention comm with a coherent token layout.
 
-        # Attention TP sizes
+        Phases are the three stages of one attention layer pass:
+        phase 1 = QKV input projections, phase 2 = attention core
+        (softmax(QK^T)V), phase 3 = output projection (W_O).
+
+        The whole layer assumes one sequence-sharded layout: tokens live as
+        [B, S/tp_yz, *] slabs on every rank throughout phases 1-3. Phase 1/3
+        collectives are derived from the per-axis projection roles
+        (`tp2d_proj_axis_roles`); phase 2 is the sequence-parallel attention
+        core (`seq_parallel_attn_mode`: ring or Ulysses) on the attention YZ
+        axis.
+        """
+        float_size = workload_spec.float_size_bytes
+
+        # Attention TP sizes (sequence is sharded on the attention YZ axis).
         shape_attn = getattr(attn_tp_topology, "shape", [])
         tp_x_attn = 1
         for idx in x_dims:
             tp_x_attn *= shape_attn[idx]
+        tp_yz_attn = 1
+        for idx in yz_dims:
+            tp_yz_attn *= shape_attn[idx]
 
         # Projection TP sizes
         shape_proj = getattr(proj_tp_topology, "shape", [])
         tp_x_proj = 1
         for idx in proj_x_dims:
             tp_x_proj *= shape_proj[idx]
-        tp_yz_proj = 1
-        for idx in proj_yz_dims:
-            tp_yz_proj *= shape_proj[idx]
 
-        phase1 = _tp2d_attn_comm_phase1_input_proj(
-            tp_topology=proj_tp_topology,
-            volume_bytes=output_volume,
-            tp_x=tp_x_proj,
+        phase1, phase3 = _tp2d_attn_proj_comm_prefill_train_forward(
+            transformer_config=transformer_config,
+            workload_spec=workload_spec,
+            n_seq=n_seq,
+            proj_x_topology=proj_x_topology,
+            proj_yz_topology=proj_yz_topology,
+            tp_x_proj=tp_x_proj,
+            seq_shard=tp_yz_attn,
             float_size_bytes=float_size,
         )
-        phase2 = _tp2d_attn_comm_phase2_prefill_ring_kv_exchange(
+        phase2 = _tp2d_attn_comm_phase2_prefill_train(
             yz_topology=yz_topology,
             transformer_config=transformer_config,
             workload_spec=workload_spec,
             n_seq=n_seq,
             tp_x=tp_x_attn,
             float_size_bytes=float_size,
+            backward=False,
         )
-        phase3 = _tp2d_attn_comm_phase3_output_proj(
-            x_topology=proj_x_topology,
-            yz_topology=proj_yz_topology,
-            input_volume_bytes=input_volume,
-            output_volume_bytes=output_volume,
-            tp_x=tp_x_proj,
-            tp_yz=tp_yz_proj,
+        return AttnForwardCommPhases(
+            phase1_input_proj=phase1, phase2_attn_core=phase2, phase3_output_proj=phase3
+        )
+
+    def backward_comm_training_phases(
+        self,
+        transformer_config: TransformerConfig,
+        moe_config,
+        workload_spec,
+        n_seq: int,
+        attn_tp_topology: LogicalTopology,
+        x_dims: list[int],
+        yz_dims: list[int],
+        x_topology: LogicalTopology,
+        yz_topology: LogicalTopology,
+        proj_tp_topology: LogicalTopology,
+        proj_x_dims: list[int],
+        proj_yz_dims: list[int],
+        proj_x_topology: LogicalTopology,
+        proj_yz_topology: LogicalTopology,
+        **kwargs,
+    ) -> AttnForwardCommPhases:
+        """Training backward comm: mirrored projection collectives + attention core.
+
+        Phase 2 by mode:
+        - ring: K/V are re-circulated for the backward kernels and dK/dV
+          circulate back to their owners — 2x the forward ring volume.
+        - Ulysses: backward mirrors the two forward all-to-alls (dO reshard
+          in, dQ/dK/dV reshard out) at equal volume — 1x the forward cost.
+        - hybrid: each leg gets its own factor (ring 2x, Ulysses 1x).
+        """
+        float_size = workload_spec.float_size_bytes
+
+        shape_attn = getattr(attn_tp_topology, "shape", [])
+        tp_x_attn = 1
+        for idx in x_dims:
+            tp_x_attn *= shape_attn[idx]
+        tp_yz_attn = 1
+        for idx in yz_dims:
+            tp_yz_attn *= shape_attn[idx]
+
+        shape_proj = getattr(proj_tp_topology, "shape", [])
+        tp_x_proj = 1
+        for idx in proj_x_dims:
+            tp_x_proj *= shape_proj[idx]
+
+        phase1, phase3 = _tp2d_attn_proj_comm_train_backward(
+            transformer_config=transformer_config,
+            workload_spec=workload_spec,
+            n_seq=n_seq,
+            proj_x_topology=proj_x_topology,
+            proj_yz_topology=proj_yz_topology,
+            tp_x_proj=tp_x_proj,
+            seq_shard=tp_yz_attn,
             float_size_bytes=float_size,
+        )
+        phase2 = _tp2d_attn_comm_phase2_prefill_train(
+            yz_topology=yz_topology,
+            transformer_config=transformer_config,
+            workload_spec=workload_spec,
+            n_seq=n_seq,
+            tp_x=tp_x_attn,
+            float_size_bytes=float_size,
+            backward=True,
         )
         return AttnForwardCommPhases(
             phase1_input_proj=phase1, phase2_attn_core=phase2, phase3_output_proj=phase3
@@ -1326,63 +1844,24 @@ class TP2DAttnStrategy(TensorParallelStrategy):
         proj_yz_topology: LogicalTopology,
         **kwargs,
     ) -> CommStats:
-        # All topology inputs are required (explicit; no None-default behavior).
-        d_model = transformer_config.d_model
-        num_heads = transformer_config.num_heads
-        head_dim = transformer_config.head_dim
-        q_proj_out_dim = num_heads * head_dim
-        float_size = workload_spec.float_size_bytes
-        n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
-        output_volume = float_size * n_batch * n_seq * d_model
-        input_volume = float_size * n_batch * n_seq * q_proj_out_dim
-
-        # Compute TP sizes separately for attention vs projection domains.
-        shape_attn = getattr(attn_tp_topology, "shape", [])
-        tp_x_attn = 1
-        for idx in x_dims:
-            tp_x_attn *= shape_attn[idx]
-        tp_yz_attn = 1
-        for idx in yz_dims:
-            tp_yz_attn *= shape_attn[idx]
-
-        shape_proj = getattr(proj_tp_topology, "shape", [])
-        tp_x_proj = 1
-        for idx in proj_x_dims:
-            tp_x_proj *= shape_proj[idx]
-        tp_yz_proj = 1
-        for idx in proj_yz_dims:
-            tp_yz_proj *= shape_proj[idx]
-
-        # Phase 1 (projection domain): keep proxy formula unchanged, but price on projection TP.
-        comm1 = _tp2d_attn_comm_phase1_input_proj(
-            tp_topology=proj_tp_topology,
-            volume_bytes=output_volume,
-            tp_x=tp_x_proj,
-            float_size_bytes=float_size,
-        )
-
-        # Phase 2 (attention domain): RingAttention proxy on attention YZ topology.
-        comm2 = _tp2d_attn_comm_phase2_prefill_ring_kv_exchange(
-            yz_topology=yz_topology,
+        # Delegate to the phase-structured method (single source of truth).
+        return self.forward_comm_training_phases(
             transformer_config=transformer_config,
+            moe_config=moe_config,
             workload_spec=workload_spec,
             n_seq=n_seq,
-            tp_x=tp_x_attn,
-            float_size_bytes=float_size,
-        )
-
-        # Phase 3 (projection domain): output projection comm on projection views.
-        comm3 = _tp2d_attn_comm_phase3_output_proj(
-            x_topology=proj_x_topology,
-            yz_topology=proj_yz_topology,
-            input_volume_bytes=input_volume,
-            output_volume_bytes=output_volume,
-            tp_x=tp_x_proj,
-            tp_yz=tp_yz_proj,
-            float_size_bytes=float_size,
-        )
-
-        return comm1 + comm2 + comm3
+            attn_tp_topology=attn_tp_topology,
+            x_dims=x_dims,
+            yz_dims=yz_dims,
+            x_topology=x_topology,
+            yz_topology=yz_topology,
+            proj_tp_topology=proj_tp_topology,
+            proj_x_dims=proj_x_dims,
+            proj_yz_dims=proj_yz_dims,
+            proj_x_topology=proj_x_topology,
+            proj_yz_topology=proj_yz_topology,
+            **kwargs,
+        ).total
 
     def forward_comm_prefill(
         self,
@@ -1520,8 +1999,9 @@ class TP2DAttnStrategy(TensorParallelStrategy):
         yz_dims: list[int] | None = None,
         **kwargs,
     ) -> CommStats:
-        # For now, reuse training forward comm as a proxy (keeps formulas unchanged).
-        return self.forward_comm_training(
+        # Delegate to the phase-structured backward (mirrored projection
+        # collectives + mode-dependent attention-core cost).
+        return self.backward_comm_training_phases(
             transformer_config=transformer_config,
             moe_config=moe_config,
             workload_spec=workload_spec,
@@ -1530,7 +2010,7 @@ class TP2DAttnStrategy(TensorParallelStrategy):
             x_dims=x_dims,
             yz_dims=yz_dims,
             **kwargs,
-        )
+        ).total
 
 
 class TP2DMoEStrategy(TensorParallelStrategy):

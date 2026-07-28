@@ -115,6 +115,7 @@ from scalescope.workload_spec import (
     InferencePrefillSpec,
     MoERouterSyncMode,
     TensorParallelVariant,
+    TP2DProjAxisRole,
     TrainSpec,
     WorkloadSpec,
 )
@@ -602,9 +603,9 @@ def main():
                 "Run artifacts disabled (use --save-run-artifacts to enable per-point YAML files)."
             )
         # Building structured records (`structure_run_results` per row) is a
-        # pure-Python per-row pass that is slow and previously silent for large
-        # sweeps (hundreds of thousands of rows). Always show a progress bar for
-        # this phase, regardless of whether per-point YAML artifacts are written.
+        # pure-Python per-row pass that is slow for large sweeps (hundreds of
+        # thousands of rows). Always show a progress bar for this phase,
+        # regardless of whether per-point YAML artifacts are written.
         artifact_iter = tqdm(
             df.iterrows(),
             total=total_records,
@@ -1687,9 +1688,46 @@ def get_model_stats(
         if pass_mode == PassMode.TRAINING
         else workload_spec.float_size_bytes
     )
+    # Role-aware at-rest sharding for attention (projection) weights. The
+    # attention block's weights are exactly the projection weights (W_q/k/v/o),
+    # so they shard across the *projection* TP domain — which differs from the
+    # attention domain under projection groups (g > 1), where the proj view is
+    # g-times smaller and the weights are replicated across groups. Under
+    # TP-2D prefill/training with yz=shard_tokens the YZ axis carries tokens
+    # and the weights are fully replicated across it, so only the X axis
+    # divides the footprint. shard_weights and circulate_weights both keep
+    # weights sharded across X*YZ at rest.
+    attn_weight_tp_size = proj_tp_topology_view.num_chips
+    if (
+        pass_mode in (PassMode.TRAINING, PassMode.INFERENCE_PREFILL)
+        and attn_tp_variant == TensorParallelVariant.SHARD_WEIGHTS_2D
+    ):
+        roles = workload_spec.tp2d_proj_axis_roles
+        if roles is None:
+            raise ValueError(
+                "TP-2D prefill/train weight footprint requires tp2d_proj_axis_roles "
+                "on the workload spec (TrainSpec / InferencePrefillSpec)."
+            )
+        match roles.yz:
+            case TP2DProjAxisRole.SHARD_TOKENS:
+                if proj_tp_spec.split_2d is None:
+                    raise ValueError(
+                        "TP-2D projection requires a split_2d on the projection TP spec "
+                        "for the weight footprint."
+                    )
+                _resolved_proj_w = resolve_tp2d_split(
+                    tp_view=proj_tp_topology_view,
+                    split_2d=proj_tp_spec.split_2d,
+                    view_name="TP_Proj",
+                )
+                attn_weight_tp_size = _resolved_proj_w.tp_x
+            case TP2DProjAxisRole.CIRCULATE_WEIGHTS | TP2DProjAxisRole.SHARD_WEIGHTS:
+                pass  # weights sharded across X*YZ at rest: full divisor stands
+            case _:
+                raise ValueError(f"Unsupported tp2d_proj_axis_roles.yz: {roles.yz}")
     attn_footprint.weights = calculate_attn_weights_memory_footprint(
         model_spec,
-        attn_tp_size,
+        attn_weight_tp_size,
         attn_dp_size,
         data_parallel_variant,
         weights_fs,
@@ -1703,12 +1741,13 @@ def get_model_stats(
         weights_fs,
     )
 
-    # Gradient buffers (training only): per-parameter gradients in compute dtype
+    # Gradient buffers (training only): per-parameter gradients in compute dtype.
+    # Sharded like the weights at rest (role-aware for TP-2D, see above).
     if pass_mode == PassMode.TRAINING:
         grad_fs = workload_spec.float_size_bytes
         attn_grad_buffers = calculate_attn_weights_memory_footprint(
             model_spec,
-            attn_tp_size,
+            attn_weight_tp_size,
             attn_dp_size,
             data_parallel_variant,
             grad_fs,
@@ -1749,6 +1788,17 @@ def get_model_stats(
             resolved = resolve_tp2d_split(
                 tp_view=attn_tp_topology_view, split_2d=attn_tp_spec.split_2d, view_name="TP_Attn"
             )
+            # Phase 1/3 staging buffers live in the projection TP domain, which
+            # differs from the attention domain under projection groups (g > 1).
+            if proj_tp_spec.split_2d is None:
+                raise ValueError(
+                    "TP-2D attention footprint requires a split_2d on the projection TP spec."
+                )
+            resolved_proj = resolve_tp2d_split(
+                tp_view=proj_tp_topology_view,
+                split_2d=proj_tp_spec.split_2d,
+                view_name="TP_Proj",
+            )
             match pass_mode:
                 case PassMode.INFERENCE_DECODE:
                     assert isinstance(workload_spec, InferenceDecodeSpec)
@@ -1765,6 +1815,8 @@ def get_model_stats(
                     workload_spec=ws_for_footprint,
                     attn_tp_size_x=resolved.tp_x,
                     attn_tp_size_yz=resolved.tp_yz,
+                    proj_tp_size_x=resolved_proj.tp_x,
+                    proj_tp_size_yz=resolved_proj.tp_yz,
                     pass_mode=pass_mode,
                     kv_total_len=kv_total_len,
                 )
@@ -1808,10 +1860,10 @@ def get_model_stats(
 
     if pass_mode == PassMode.TRAINING:
         assert isinstance(workload_spec, TrainSpec)
-        # Optimizer States
+        # Optimizer States (sharded like the weights at rest; role-aware for TP-2D)
         attn_footprint.optimizer_states = calculate_attn_optimizer_states_memory_footprint(
             model_spec,
-            attn_tp_size,
+            attn_weight_tp_size,
             attn_dp_size,
             data_parallel_variant,
             workload_spec.full_precision_param_float_size,
@@ -2994,6 +3046,11 @@ def get_detailed_mem_stats(
 ):
     """Helper to get detailed attn/moe memory traffic."""
 
+    # Projections may be modeled on a different TP domain (e.g., projection_groups).
+    # The caller resolves the projection TP view; no fallback here.
+    if proj_tp_topology_view is None:
+        raise ValueError("get_detailed_mem_stats requires a resolved proj_tp_topology_view.")
+
     def _prod_from_shape(shape, indices):
         p = 1
         for idx in indices:
@@ -3012,11 +3069,6 @@ def get_detailed_mem_stats(
             tp_x_attn = _prod_from_shape(shape_attn, attn_x_dims)
             tp_yz_attn = _prod_from_shape(shape_attn, attn_yz_dims)
 
-            # Projections may be modeled on a different TP domain (e.g., projection_groups).
-            if proj_tp_topology_view is None:
-                proj_tp_topology_view = attn_tp_topology_view
-                proj_x_dims = attn_x_dims
-                proj_yz_dims = attn_yz_dims
             if proj_x_dims is None or proj_yz_dims is None:
                 raise ValueError("TP-2D proj requires proj_x_dims and proj_yz_dims to be defined.")
             shape_proj = proj_tp_topology_view.shape
@@ -3074,22 +3126,14 @@ def get_detailed_mem_stats(
                         traffic=fwd_attn_proj_traffic,
                         transformer_config=model_spec,
                         n_seq=workload_spec.seq_length,
-                        proj_tp_size=(
-                            proj_tp_topology_view.num_chips
-                            if proj_tp_topology_view is not None
-                            else attn_tp_topology_view.num_chips
-                        ),
+                        proj_tp_size=proj_tp_topology_view.num_chips,
                         workload_spec=workload_spec,
                     )
                     _forward_pass_prefill_attention_attn_tp_1d_memory_traffic(
                         traffic=fwd_attn_core_traffic,
                         transformer_config=model_spec,
                         n_seq=workload_spec.seq_length,
-                        proj_tp_size=(
-                            proj_tp_topology_view.num_chips
-                            if proj_tp_topology_view is not None
-                            else attn_tp_topology_view.num_chips
-                        ),
+                        proj_tp_size=proj_tp_topology_view.num_chips,
                         attn_tp_size=attn_tp_topology_view.num_chips,
                         save_kv_cache=(pass_mode == PassMode.INFERENCE_PREFILL),
                         workload_spec=workload_spec,
@@ -3098,22 +3142,14 @@ def get_detailed_mem_stats(
                     _decode_attention_projection_tp_1d_memory_traffic(
                         traffic=fwd_attn_proj_traffic,
                         transformer_config=model_spec,
-                        proj_tp_size=(
-                            proj_tp_topology_view.num_chips
-                            if proj_tp_topology_view is not None
-                            else attn_tp_topology_view.num_chips
-                        ),
+                        proj_tp_size=proj_tp_topology_view.num_chips,
                         workload_spec=workload_spec,
                     )
                     _decode_attention_attn_tp_1d_memory_traffic(
                         traffic=fwd_attn_core_traffic,
                         transformer_config=model_spec,
                         n_seq_so_far=workload_spec.prefill_seq_len,
-                        proj_tp_size=(
-                            proj_tp_topology_view.num_chips
-                            if proj_tp_topology_view is not None
-                            else attn_tp_topology_view.num_chips
-                        ),
+                        proj_tp_size=proj_tp_topology_view.num_chips,
                         attn_tp_size=attn_tp_topology_view.num_chips,
                         workload_spec=workload_spec,
                     )
@@ -3126,7 +3162,7 @@ def get_detailed_mem_stats(
                 f"Unsupported attention TP variant in detailed traffic: {attn_tp_variant}"
             )
 
-    # Combine bookkeeping split back into the legacy "fwd_attn" traffic (backward compatible totals)
+    # Combine the projection/core bookkeeping split into the total "fwd_attn" traffic.
     fwd_attn_traffic = fwd_attn_proj_traffic + fwd_attn_core_traffic
 
     fwd_moe_traffic = LayerMemoryTraffic("fwd_moe", device_for, node)
@@ -3169,13 +3205,22 @@ def get_detailed_mem_stats(
                     raise ValueError(
                         "TP-2D attn requires attn_x_dims and attn_yz_dims to be defined."
                     )
+                if proj_x_dims is None or proj_yz_dims is None:
+                    raise ValueError(
+                        "TP-2D proj requires proj_x_dims and proj_yz_dims to be defined."
+                    )
                 shape = attn_tp_topology_view.shape
                 tp_x = _prod_from_shape(shape, attn_x_dims)
                 tp_yz = _prod_from_shape(shape, attn_yz_dims)
+                shape_proj = proj_tp_topology_view.shape
+                tp_x_proj_bwd = _prod_from_shape(shape_proj, proj_x_dims)
+                tp_yz_proj_bwd = _prod_from_shape(shape_proj, proj_yz_dims)
                 bwd_attn_traffic = _backward_attn_tp_2d_memory_traffic(
                     name="bwd_attn_2d",
                     transformer_config=model_spec,
                     workload_spec=workload_spec,
+                    proj_tp_size_x=tp_x_proj_bwd,
+                    proj_tp_size_yz=tp_yz_proj_bwd,
                     attn_tp_size_x=tp_x,
                     attn_tp_size_yz=tp_yz,
                     activation_checkpointing=activation_checkpointing,
@@ -3187,7 +3232,8 @@ def get_detailed_mem_stats(
                     name="bwd_attn",
                     transformer_config=model_spec,
                     workload_spec=workload_spec,
-                    tp_size=attn_tp_topology_view.num_chips,
+                    proj_tp_size=proj_tp_topology_view.num_chips,
+                    attn_tp_size=attn_tp_topology_view.num_chips,
                     activation_checkpointing=activation_checkpointing,
                     device_for=device_for,
                     node=node,
