@@ -153,6 +153,8 @@ def get_transformer_comm_stats(
     moe_kwargs = {
         "moe_tp_topology": moe_tp_topology,
         "attn_tp_topology": attn_tp_topology,
+        "proj_x_topology": None,
+        "proj_yz_topology": None,
         "layout_trace": layout_trace,
     }
 
@@ -184,6 +186,15 @@ def get_transformer_comm_stats(
                 "yz_topology": resolved_attn.yz_view,
                 "proj_x_dims": resolved_proj.x_dims,
                 "proj_yz_dims": resolved_proj.yz_dims,
+                "proj_x_topology": resolved_proj.x_view,
+                "proj_yz_topology": resolved_proj.yz_view,
+            }
+        )
+        # The MoE consumer needs the projection sub-views to price the
+        # output-projection -> MoE layout handoff.  In decode, output
+        # projection leaves D sharded over TP_Proj_X x TP_Proj_Y_eff.
+        moe_kwargs.update(
+            {
                 "proj_x_topology": resolved_proj.x_view,
                 "proj_yz_topology": resolved_proj.yz_view,
             }

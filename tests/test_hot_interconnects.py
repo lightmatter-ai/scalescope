@@ -138,7 +138,7 @@ def test_alternative_32_experts(tmp_output_dir):
         pass_mode="training",
         output_file_name="scalescope_res_alternative_32_experts.yaml",
     )
-    expected_time_sec = 499900.2636053164
+    expected_time_sec = 504914.546847081
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -154,7 +154,7 @@ def test_passage_32_experts(tmp_output_dir):
         pass_mode="training",
         output_file_name="scalescope_res_passage_32_experts.yaml",
     )
-    expected_time_sec = 318559.96049489663
+    expected_time_sec = 323574.2437366612
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -171,7 +171,7 @@ def test_alternative_64_experts(tmp_output_dir):
         pass_mode="training",
         output_file_name="scalescope_res_alternative_64_experts.yaml",
     )
-    expected_time_sec = 551512.4020756127
+    expected_time_sec = 556526.6853173773
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -187,7 +187,7 @@ def test_passage_64_experts(tmp_output_dir):
         pass_mode="training",
         output_file_name="scalescope_res_passage_64_experts.yaml",
     )
-    expected_time_sec = 319793.6820656783
+    expected_time_sec = 324807.9653074428
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -204,7 +204,7 @@ def test_alternative_128_experts(tmp_output_dir):
         pass_mode="training",
         output_file_name="scalescope_res_alternative_128_experts.yaml",
     )
-    expected_time_sec = 654736.6882336382
+    expected_time_sec = 659750.9714754027
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -220,7 +220,7 @@ def test_passage_128_experts(tmp_output_dir):
         pass_mode="training",
         output_file_name="scalescope_res_passage_128_experts.yaml",
     )
-    expected_time_sec = 322261.15593201626
+    expected_time_sec = 327275.43917378085
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -237,7 +237,7 @@ def test_alternative_256_experts(tmp_output_dir):
         pass_mode="training",
         output_file_name="scalescope_res_alternative_256_experts.yaml",
     )
-    expected_time_sec = 861185.2697671211
+    expected_time_sec = 866199.5530088857
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -253,7 +253,7 @@ def test_passage_256_experts(tmp_output_dir):
         pass_mode="training",
         output_file_name="scalescope_res_passage_256_experts.yaml",
     )
-    expected_time_sec = 327196.1343894671
+    expected_time_sec = 332210.4176312316
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -272,7 +272,7 @@ def test_passage_prefill_32_experts(tmp_output_dir):
         pass_mode="inference_prefill",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.07999825566935967
+    expected_time_sec = 0.08358317099788404
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -288,7 +288,7 @@ def test_passage_prefill_64_experts(tmp_output_dir):
         pass_mode="inference_prefill",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.07979502933707058
+    expected_time_sec = 0.08350176066935967
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -304,7 +304,7 @@ def test_passage_prefill_128_experts(tmp_output_dir):
         pass_mode="inference_prefill",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.0793885779942269
+    expected_time_sec = 0.08333896116006219
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -320,7 +320,7 @@ def test_passage_prefill_256_experts(tmp_output_dir):
         pass_mode="inference_prefill",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.07857567663027396
+    expected_time_sec = 0.08301338328921849
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -339,7 +339,7 @@ def test_alternative_prefill_32_experts(tmp_output_dir):
         pass_mode="inference_prefill",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.15538103370396505
+    expected_time_sec = 0.1588691199065224
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -355,7 +355,7 @@ def test_alternative_prefill_64_experts(tmp_output_dir):
         pass_mode="inference_prefill",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.1726235720899926
+    expected_time_sec = 0.17614820309367935
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -371,7 +371,7 @@ def test_alternative_prefill_128_experts(tmp_output_dir):
         pass_mode="inference_prefill",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.20710864925856806
+    expected_time_sec = 0.21070637581231869
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -387,7 +387,7 @@ def test_alternative_prefill_256_experts(tmp_output_dir):
         pass_mode="inference_prefill",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.27607880399223933
+    expected_time_sec = 0.2798227275939227
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -419,7 +419,7 @@ def test_passage_decode_32_experts(tmp_output_dir):
         pass_mode="inference_decode",
         output_file_name="decode_32_experts_scalescope_res.yaml",
     )
-    expected_time_sec = 0.4313460844056306
+    expected_time_sec = 0.4327841314913449
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -435,7 +435,7 @@ def test_passage_decode_64_experts(tmp_output_dir):
         pass_mode="inference_decode",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.4318038765462215
+    expected_time_sec = 0.43324192363193575
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -451,7 +451,7 @@ def test_passage_decode_128_experts(tmp_output_dir):
         pass_mode="inference_decode",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.43271946162136055
+    expected_time_sec = 0.4341575087070748
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -467,7 +467,7 @@ def test_passage_decode_256_experts(tmp_output_dir):
         pass_mode="inference_decode",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.43455063256526666
+    expected_time_sec = 0.4359886796509809
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 

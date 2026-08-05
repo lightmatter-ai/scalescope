@@ -17,6 +17,7 @@ Usage
 """
 
 import logging
+import textwrap
 from dataclasses import dataclass, field
 from functools import reduce
 from operator import mul
@@ -26,6 +27,54 @@ from scalescope.model_spec import AttentionLayerClass
 from scalescope.stats import CommStats
 
 logger = logging.getLogger(__name__)
+
+_COMM_STAGE_DISPLAY_NAMES: Dict[str, str] = {
+    "phase1_ag_x": "Attention input all-gather (X)",
+    "phase1_ar_yz_q": "Q projection all-reduce (Y)",
+    "phase1_ar_yz_qkv": "QKV projection all-reduce (Y)",
+    "phase1_reduce_yz_kv": "KV reduce-to-cache-owner (Y)",
+    "ln1_stats_ar_yz": "Pre-attention LayerNorm stats",
+    "phase2_ar_y": "Decode attention output merge",
+    "phase3_rs_x": "Output projection reduce-scatter (X)",
+    "phase3_ag_yz": "Output projection all-gather (Y)",
+    "moe_input_ag_proj_x": "MoE input all-gather (projection X)",
+    "moe_input_ag_y": "MoE input Y-quotient all-gather",
+    "moe_a1_ag_x": "MoE routed-input A1 all-gather (X)",
+    "moe_1d_ar_tp": "MoE 1D tensor-parallel all-reduce",
+    "moe_1d_ag_opt": "MoE 1D optimized input all-gather",
+    "ln2_ag_yz": "Pre-MoE LayerNorm/router gather",
+    "ln2_stats_ar_yz": "Pre-MoE LayerNorm stats",
+    "moe_router_ar": "MoE router-logit all-reduce",
+    "moe_c1_ar_yz": "MoE up-projection C1 all-reduce",
+    "moe_c2_rs_x": "MoE down-projection C2 reduce-scatter",
+    "combine_rs_g": "MoE expert-group combine",
+    "combine_ag_cross_set": "MoE cross-set batch all-gather",
+    "combine_ag_u": "MoE projection-replica all-gather",
+    "combine_remap_ag_x": "MoE output remap all-gather (X)",
+    "combine_remap_rs_x": "MoE output remap reduce-scatter (X)",
+}
+
+_LAYOUT_STAGE_DISPLAY_NAMES: Dict[str, str] = {
+    "layer_input": "Layer input",
+    "phase1_x_gathered": "Attention input after X gather",
+    "after_qkv_proj": "After QKV projection",
+    "kv_cache_read": "KV-cache read",
+    "attention_scores": "Attention scores",
+    "attn_v_output": "Attention value output",
+    "after_attention": "After attention",
+    "after_output_proj": "After output projection",
+    "moe_input": "MoE input in projection layout",
+    "moe_input_reconciled": "MoE input after layout reconciliation",
+    "router_input": "MoE router input",
+    "decode_dispatch": "MoE routed-token dispatch",
+    "expert_input": "MoE expert input",
+    "after_up_proj_c1": "After MoE up-projection C1",
+    "after_down_proj_c2": "After MoE down-projection C2",
+    "after_combine": "After MoE expert combine",
+    "after_combine_cross_set": "After cross-set MoE combine",
+    "decode_combine_a2a": "MoE routed-output return",
+    "layer_output": "Layer output",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -389,21 +438,29 @@ class LayoutTrace:
         )
         lines.append("")
 
-        col_w = (24, 14, 28, 36, 28)
-        hdr = (
-            f"{'Stage':<{col_w[0]}}"
-            f"{'Tensor':<{col_w[1]}}"
-            f"{'Global':<{col_w[2]}}"
-            f"{'Sharding':<{col_w[3]}}"
-            f"{'Per-Rank':<{col_w[4]}}"
-            f"Note"
+        col_w = (32, 26, 28, 36, 28, 72)
+        column_separator = "  "
+        hdr = column_separator.join(
+            (
+                f"{'Stage':<{col_w[0]}}",
+                f"{'Tensor':<{col_w[1]}}",
+                f"{'Global':<{col_w[2]}}",
+                f"{'Sharding':<{col_w[3]}}",
+                f"{'Per-Rank':<{col_w[4]}}",
+                f"{'Note':<{col_w[5]}}",
+            )
         )
         lines.append(hdr)
-        lines.append("-" * max(len(hdr), 120))
+        lines.append("-" * len(hdr))
 
         prev_stage = ""
         for rec in self.records:
-            stage_label = rec.stage if rec.stage != prev_stage else ""
+            if rec.stage != prev_stage:
+                if rec.stage not in _LAYOUT_STAGE_DISPLAY_NAMES:
+                    raise ValueError(f"Missing layout-table display name for stage: {rec.stage}")
+                stage_label = _LAYOUT_STAGE_DISPLAY_NAMES[rec.stage]
+            else:
+                stage_label = ""
             prev_stage = rec.stage
 
             gs = self._fmt_shape(rec.tensor.global_shape)
@@ -417,15 +474,25 @@ class LayoutTrace:
             if rec.flags:
                 note = "[FLAG] " + note
 
-            line = (
-                f"{stage_label:<{col_w[0]}}"
-                f"{rec.tensor.name:<{col_w[1]}}"
-                f"{gs:<{col_w[2]}}"
-                f"{parts:<{col_w[3]}}"
-                f"{pr:<{col_w[4]}}"
-                f"{note}"
+            cell_lines = (
+                self._wrap_table_cell(stage_label, col_w[0]),
+                self._wrap_table_cell(rec.tensor.name, col_w[1]),
+                self._wrap_table_cell(gs, col_w[2]),
+                self._wrap_table_cell(parts, col_w[3]),
+                self._wrap_table_cell(pr, col_w[4]),
+                self._wrap_table_cell(note, col_w[5]),
             )
-            lines.append(line)
+            row_count = max(len(cell) for cell in cell_lines)
+            for row_index in range(row_count):
+                row_cells = tuple(
+                    cell[row_index] if row_index < len(cell) else "" for cell in cell_lines
+                )
+                lines.append(
+                    column_separator.join(
+                        f"{row_cells[column_index]:<{col_w[column_index]}}"
+                        for column_index in range(len(col_w))
+                    )
+                )
 
         issues = self.verify_layer_boundary()
         flags = self.collect_flags()
@@ -463,25 +530,47 @@ class LayoutTrace:
             return "0"
         return f"{s * 1e6:.2f} us"
 
+    @staticmethod
+    def _wrap_table_cell(value: str, width: int) -> List[str]:
+        """Wrap a table cell, preserving explicit newline boundaries."""
+        wrapped: List[str] = []
+        logical_lines = value.splitlines()
+        if not logical_lines:
+            return [""]
+        for logical_line in logical_lines:
+            wrapped.extend(
+                textwrap.wrap(
+                    logical_line,
+                    width=width,
+                    break_long_words=True,
+                    break_on_hyphens=False,
+                )
+                or [""]
+            )
+        return wrapped
+
     def format_comm_table(self) -> str:
         if not self.comm_records:
             return ""
         lines: List[str] = []
         lines.append("=== Collective Communications (per layer) ===")
-        cw = (28, 8, 14, 6, 14, 12, 12, 12)
-        hdr = (
-            f"{'Stage':<{cw[0]}}"
-            f"{'Coll':<{cw[1]}}"
-            f"{'Topology':<{cw[2]}}"
-            f"{'P':<{cw[3]}}"
-            f"{'Volume/rank':<{cw[4]}}"
-            f"{'Alpha':<{cw[5]}}"
-            f"{'Beta':<{cw[6]}}"
-            f"{'Total':<{cw[7]}}"
-            f"Note"
+        cw = (32, 8, 14, 6, 14, 12, 12, 12, 72)
+        column_separator = "  "
+        hdr = column_separator.join(
+            (
+                f"{'Stage':<{cw[0]}}",
+                f"{'Coll':<{cw[1]}}",
+                f"{'Topology':<{cw[2]}}",
+                f"{'P':<{cw[3]}}",
+                f"{'Volume/rank':<{cw[4]}}",
+                f"{'Alpha':<{cw[5]}}",
+                f"{'Beta':<{cw[6]}}",
+                f"{'Total':<{cw[7]}}",
+                f"{'Note':<{cw[8]}}",
+            )
         )
         lines.append(hdr)
-        lines.append("-" * max(len(hdr), 120))
+        lines.append("-" * len(hdr))
 
         total_alpha = 0.0
         total_beta = 0.0
@@ -495,30 +584,45 @@ class LayoutTrace:
             if not is_zero:
                 nonzero_count += 1
             tag = "  (noop)" if is_zero else ""
-            line = (
-                f"{cr.stage:<{cw[0]}}"
-                f"{cr.collective:<{cw[1]}}"
-                f"{cr.topology:<{cw[2]}}"
-                f"{cr.participants:<{cw[3]}}"
-                f"{self._fmt_bytes(cr.volume_bytes):<{cw[4]}}"
-                f"{self._fmt_us(cr.alpha_s):<{cw[5]}}"
-                f"{self._fmt_us(cr.beta_s):<{cw[6]}}"
-                f"{self._fmt_us(cr.total_s):<{cw[7]}}"
-                f"{cr.note}{tag}"
-            )
-            lines.append(line)
+            if cr.stage not in _COMM_STAGE_DISPLAY_NAMES:
+                raise ValueError(f"Missing communication-table display name for stage: {cr.stage}")
+            display_stage = _COMM_STAGE_DISPLAY_NAMES[cr.stage]
+            stage_lines = self._wrap_table_cell(display_stage, cw[0])
+            note_lines = self._wrap_table_cell(f"{cr.note}{tag}", cw[8])
+            row_count = max(len(stage_lines), len(note_lines))
+            for row_index in range(row_count):
+                stage_text = stage_lines[row_index] if row_index < len(stage_lines) else ""
+                note_text = note_lines[row_index] if row_index < len(note_lines) else ""
+                first_row = row_index == 0
+                lines.append(
+                    column_separator.join(
+                        (
+                            f"{stage_text:<{cw[0]}}",
+                            f"{cr.collective if first_row else '':<{cw[1]}}",
+                            f"{cr.topology if first_row else '':<{cw[2]}}",
+                            f"{cr.participants if first_row else '':<{cw[3]}}",
+                            f"{self._fmt_bytes(cr.volume_bytes) if first_row else '':<{cw[4]}}",
+                            f"{self._fmt_us(cr.alpha_s) if first_row else '':<{cw[5]}}",
+                            f"{self._fmt_us(cr.beta_s) if first_row else '':<{cw[6]}}",
+                            f"{self._fmt_us(cr.total_s) if first_row else '':<{cw[7]}}",
+                            f"{note_text:<{cw[8]}}",
+                        )
+                    )
+                )
 
-        lines.append("-" * max(len(hdr), 120))
+        lines.append("-" * len(hdr))
         label = f"TOTAL ({nonzero_count} active / {len(self.comm_records)} collectives)"
-        summary = (
-            f"{label:<{cw[0]}}"
-            f"{'':<{cw[1]}}"
-            f"{'':<{cw[2]}}"
-            f"{'':<{cw[3]}}"
-            f"{'':<{cw[4]}}"
-            f"{self._fmt_us(total_alpha):<{cw[5]}}"
-            f"{self._fmt_us(total_beta):<{cw[6]}}"
-            f"{self._fmt_us(total_time):<{cw[7]}}"
+        summary = column_separator.join(
+            (
+                f"{label:<{cw[0]}}",
+                f"{'':<{cw[1]}}",
+                f"{'':<{cw[2]}}",
+                f"{'':<{cw[3]}}",
+                f"{'':<{cw[4]}}",
+                f"{self._fmt_us(total_alpha):<{cw[5]}}",
+                f"{self._fmt_us(total_beta):<{cw[6]}}",
+                f"{self._fmt_us(total_time):<{cw[7]}}",
+            )
         )
         lines.append(summary)
         return "\n".join(lines)
@@ -776,21 +880,15 @@ def _trace_moe_stages(
     y_eff = tp_y // g
     G = -(-n_experts // c)
 
-    # Detect 1×Y_eff replicated-router path (§11.3): MoE uses tp_x=1 but
-    # attention uses tp_x>1. After AG(X)+AG(YZ) full D is available, C1 is
-    # eliminated, and C2 becomes RS(YZ) instead of RS(X).
     _moe_tp_x = moe_tp_x if moe_tp_x is not None else tp_x
     _moe_tp_yz = moe_tp_yz if moe_tp_yz is not None else (tp_y // g)
     _moe_d_mesh_dims: Tuple[str, ...] = tuple(
         d for d, size in (("X", _moe_tp_x), ("Y_eff", _moe_tp_yz)) if size > 1
     )
-    _replicated_1d_y = (
-        _moe_tp_x == 1 and _moe_tp_yz > 1 and router_mode == "replicated" and tp_x > 1
-    )
     _rs_handoff_to_attn_x = _moe_tp_x == 1 and tp_x > 1 and G == tp_x and _moe_tp_yz == y_eff
     _rs_handoff_to_attn_y_eff = _moe_tp_yz == 1 and _moe_tp_x == tp_x and y_eff > 1 and G == y_eff
 
-    # Stage 5: MoE input (after residual add + LayerNorm — same layout as output_proj)
+    # Stage 5: incoming MoE input keeps the output-projection RS(X) layout.
     trace.record(
         "moe_input",
         "Residual add + LayerNorm (same layout as output_proj)",
@@ -798,12 +896,48 @@ def _trace_moe_stages(
             name="x_moe",
             global_shape={"B": s, "D": d_model},
             partitions={
-                **({"D": P("sharded", _moe_d_mesh_dims)} if _moe_d_mesh_dims else {}),
+                "D": P("sharded", ("X", "Y_eff")),
                 "B": P("replicated", ("Y",)),
             },
             dtype_bytes=dtype_bytes,
         ),
-        note=f"D/(moe_tp_x·moe_tp_yz) = {d_model // (_moe_tp_x * _moe_tp_yz)}",
+        note=f"output-projection layout: D/(X·Y_eff) = {d_model // (tp_x * y_eff)}",
+    )
+
+    # The consumer completes RS+AG over projection X using all tokens, then
+    # reconciles projection Y_eff with TP_MoE_Y.
+    _reconciled_partitions = {"D": P("sharded", ("Y_eff",))} if _moe_tp_yz > 1 else {}
+    if y_eff == _moe_tp_yz:
+        y_reconcile_note = "Y_eff already equals TP_MoE_Y; no Y collective"
+        y_reconcile_flags: Tuple[str, ...] = ()
+    elif y_eff > _moe_tp_yz:
+        y_reconcile_note = f"AG(Y quotient={y_eff // _moe_tp_yz})"
+        y_reconcile_flags = (
+            "MODEL_LIMITATION: projection-Y quotient gathers assume aligned disjoint "
+            "subgroups execute concurrently; cross-subgroup fabric contention is not modeled.",
+        )
+    else:
+        raise ValueError(
+            "Projection-to-MoE Y refinement is unsupported without explicit projection-replica "
+            f"metadata: TP_Proj_Y_eff={y_eff}, TP_MoE_Y={_moe_tp_yz}."
+        )
+    trace.record(
+        "moe_input_reconciled",
+        "After all-token AG(TP_Proj_X) and Y reconciliation",
+        TensorRecord(
+            name="x_moe_reconciled",
+            global_shape={"B": s, "D": d_model},
+            partitions={
+                **_reconciled_partitions,
+                "B": P("replicated", ("Y",)),
+            },
+            dtype_bytes=dtype_bytes,
+        ),
+        note=(
+            f"comm: AG(TP_Proj_X={tp_x}); {y_reconcile_note}. "
+            f"D/TP_MoE_Y = {d_model // _moe_tp_yz}"
+        ),
+        flags=y_reconcile_flags,
     )
 
     # Stage 6: router input — depends on router mode
@@ -821,17 +955,8 @@ def _trace_moe_stages(
                 dtype_bytes=dtype_bytes,
             ),
             note=(
-                f"comm: AG(X) + AG(Y_eff) → full d_model={d_model}. "
-                "See §3.1.1: is Y_eff AG actually needed?"
-            ),
-            flags=(
-                (
-                    "OPEN: replicated router with Y_eff>1 requires full d_model gather — "
-                    "current code only models AG(X) (Phase A1)",
-                    "OPEN: fused router+expert gather vs separate? See §9.5.8",
-                )
-                if y_eff > 1 and not _replicated_1d_y
-                else ()
+                f"boundary AG(TP_Proj_X) plus AG(Y quotient), followed by "
+                f"LN/router AG(TP_MoE_Y), provides full d_model={d_model}."
             ),
         )
     else:
@@ -891,134 +1016,72 @@ def _trace_moe_stages(
         )
 
     # Stage 7: expert input
-    if _replicated_1d_y:
-        # §11.3: After AG(attn_X) + AG(YZ), full D is available for expert matmul.
-        trace.record(
-            "expert_input",
-            "Expert input after AG(X) + AG(YZ) — full D (§11.3)",
-            TensorRecord(
-                name="x_expert",
-                global_shape={"B": s, "D": d_model},
-                partitions={
-                    "D": P("replicated"),
-                    "B": P("replicated", ("Y",)),
-                },
-                dtype_bytes=dtype_bytes,
-            ),
-            note=(
-                f"full D={d_model} (AG(X={tp_x})+AG(YZ={_moe_tp_yz})). "
-                f"W_up: [{d_model}, {d_ff // _moe_tp_yz}] (1×{_moe_tp_yz} TP)"
-            ),
+    _expert_d_partitions = {"D": P("sharded", ("Y_eff",))} if _moe_tp_yz > 1 else {}
+    if attn_domains_per_full_expert_set > 1:
+        expert_input_desc = (
+            "Expert input (post-dispatch: tokens arrived from "
+            f"{attn_domains_per_full_expert_set} feeder attention domains)"
         )
     else:
-        expert_input_flags: List[str] = []
-        if router_mode == "replicated" and y_eff > 1:
-            expert_input_flags.append(
-                "OPEN: if router gathered full D, expert still uses D/Y_eff slice — "
-                "extra bandwidth wasted? See §9.5.8"
-            )
-        _expert_d_partitions = {"D": P("sharded", ("Y_eff",))} if _moe_tp_yz > 1 else {}
-        if attn_domains_per_full_expert_set > 1:
-            expert_input_desc = (
-                "Expert input (post-dispatch: tokens arrived from "
-                f"{attn_domains_per_full_expert_set} feeder attention domains)"
-            )
-        else:
-            expert_input_desc = (
-                "Expert input (single attention domain per expert set: "
-                "tokens already local, dispatch = 0)"
-            )
-        trace.record(
-            "expert_input",
-            expert_input_desc,
-            TensorRecord(
-                name="x_expert",
-                global_shape={"B": s, "D": d_model},
-                partitions={
-                    **_expert_d_partitions,
-                    "B": P("replicated", ("Y",)),
-                },
-                dtype_bytes=dtype_bytes,
-            ),
-            note=(
-                f"D/Y_eff = {d_model // _moe_tp_yz}. "
-                f"W_up: [D/Y_eff, Dff/X] = [{d_model // _moe_tp_yz}, {d_ff // _moe_tp_x}]"
-            ),
-            flags=tuple(expert_input_flags),
+        expert_input_desc = (
+            "Expert input (single attention domain per expert set: "
+            "tokens already local, dispatch = 0)"
         )
+    trace.record(
+        "expert_input",
+        expert_input_desc,
+        TensorRecord(
+            name="x_expert",
+            global_shape={"B": s, "D": d_model},
+            partitions={
+                **_expert_d_partitions,
+                "B": P("replicated", ("Y",)),
+            },
+            dtype_bytes=dtype_bytes,
+        ),
+        note=(
+            f"D/TP_MoE_Y = {d_model // _moe_tp_yz}. "
+            f"W_up: [D/Y, Dff/X] = [{d_model // _moe_tp_yz}, {d_ff // _moe_tp_x}]"
+        ),
+    )
 
     # Stage 8: after up-proj + C1
-    if _replicated_1d_y:
-        # Full D input → complete matmul, no C1 needed.
-        trace.record(
-            "after_up_proj_c1",
-            "Up-proj: complete (full D, no C1 — §11.3)",
-            TensorRecord(
-                name="h_expert",
-                global_shape={"B": s, "Dff": d_ff},
-                partitions={"B": P("replicated", ("Y",))},
-                dtype_bytes=dtype_bytes,
-            ),
-            note=f"C1 SKIPPED. Dff={d_ff} (full). mlp_ratio = {d_ff / d_model:.3f}",
-        )
-    else:
-        trace.record(
-            "after_up_proj_c1",
-            "Up-proj matmul + C1 AR(Y_eff)",
-            TensorRecord(
-                name="h_expert",
-                global_shape={"B": s, "Dff": d_ff},
-                partitions={
-                    **({"Dff": P("sharded", ("X",))} if _moe_tp_x > 1 else {}),
-                    "B": P("replicated", ("Y",)),
-                },
-                dtype_bytes=dtype_bytes,
-            ),
-            note=(
-                f"comm: C1 AR(Y_eff). Dff/X = {d_ff // _moe_tp_x}. "
-                f"mlp_ratio = d_ff/d_model = {d_ff}/{d_model} = {d_ff / d_model:.3f}"
-            ),
-        )
+    trace.record(
+        "after_up_proj_c1",
+        "Up-proj matmul + C1 AR(TP_MoE_Y)",
+        TensorRecord(
+            name="h_expert",
+            global_shape={"B": s, "Dff": d_ff},
+            partitions={
+                **({"Dff": P("sharded", ("X",))} if _moe_tp_x > 1 else {}),
+                "B": P("replicated", ("Y",)),
+            },
+            dtype_bytes=dtype_bytes,
+        ),
+        note=(
+            f"comm: C1 AR(TP_MoE_Y={_moe_tp_yz}); no-op iff TP_MoE_Y=1. "
+            f"Dff/X = {d_ff // _moe_tp_x}."
+        ),
+    )
 
     # Stage 9: after activation + down-proj + C2
-    if _replicated_1d_y:
-        # C2 is RS(YZ) + local-select → D/(X·Y_eff) per rank.
-        trace.record(
-            "after_down_proj_c2",
-            f"Down-proj + RS(Y={_moe_tp_yz}) + local-select (§11.3)",
-            TensorRecord(
-                name="y_expert",
-                global_shape={"B": s, "D": d_model},
-                partitions={
-                    "D": P("sharded", ("X", "Y_eff")),
-                    "B": P("replicated", ("Y",)),
-                },
-                dtype_bytes=dtype_bytes,
-            ),
-            note=(
-                f"comm: RS(Y={_moe_tp_yz}) + local-select. "
-                f"D/(X·Y_eff) = {d_model // (tp_x * y_eff)}. "
-                f"W_down: [{d_ff // _moe_tp_yz}, {d_model}]"
-            ),
-        )
-    else:
-        trace.record(
-            "after_down_proj_c2",
-            "Activation + down-proj + C2 RS(X)",
-            TensorRecord(
-                name="y_expert",
-                global_shape={"B": s, "D": d_model},
-                partitions={
-                    **({"D": P("sharded", _moe_d_mesh_dims)} if _moe_d_mesh_dims else {}),
-                    "B": P("replicated", ("Y",)),
-                },
-                dtype_bytes=dtype_bytes,
-            ),
-            note=(
-                f"comm: C2 RS(X). D/(X·Y_eff) = {d_model // (_moe_tp_x * _moe_tp_yz)}. "
-                f"W_down: [Dff/X, D/Y_eff] = [{d_ff // _moe_tp_x}, {d_model // _moe_tp_yz}]"
-            ),
-        )
+    trace.record(
+        "after_down_proj_c2",
+        "Activation + down-proj + C2 RS(TP_MoE_X)",
+        TensorRecord(
+            name="y_expert",
+            global_shape={"B": s, "D": d_model},
+            partitions={
+                **({"D": P("sharded", _moe_d_mesh_dims)} if _moe_d_mesh_dims else {}),
+                "B": P("replicated", ("Y",)),
+            },
+            dtype_bytes=dtype_bytes,
+        ),
+        note=(
+            f"comm: C2 RS(TP_MoE_X={_moe_tp_x}); no-op iff TP_MoE_X=1. "
+            f"D/(X·Y) = {d_model // (_moe_tp_x * _moe_tp_yz)}."
+        ),
+    )
 
     # Stage 10: after combine
     if G == 1:

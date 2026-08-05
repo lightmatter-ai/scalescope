@@ -17,6 +17,9 @@ prefill_seq_len: 1024           # OVERRIDDEN per record by the driver.
 num_generated_tokens: 1
 seq_length: 1
 decode_moe_router_sync_mode: replicated_router
+# MoE software/runtime overhead per routed token-expert pair per layer per pass.
+# Applies independently of network A2A; 0.0 = not modeled.
+moe_token_pair_overhead_sec: 0.0
 kernel_launch_latency_per_layer_sec: 0.0   # OVERRIDDEN per record by the driver (per-model calibration).
 
 float_size_bytes: 0.5           # FP4

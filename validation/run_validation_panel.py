@@ -64,6 +64,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import math
 import os
@@ -114,6 +115,22 @@ KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER: dict[str, float] = {
     "llama3_1_8b": 24e-6,
     "minimax_m2_5": 90e-6,
     "gpt_oss_120b": 32e-6,
+}
+
+# Per-model MoE software overhead (seconds per routed token-expert pair per
+# layer per pass), injected into each generated workload spec. It models
+# host/framework routing bookkeeping and permutation kernel-dispatch work,
+# independently of whether network A2A runs. Dense shapes are structurally
+# zero. The gpt_oss_120b value is a decode-serving non-negative least-squares
+# fit of the EP-case TPOT residuals across all dp-attn+EP panel cells (see
+# validation/fit_ep_dispatch_overhead.py). Fail-fast lookup, like the kernel
+# floor above.
+MOE_TOKEN_PAIR_OVERHEAD_SEC: dict[str, float] = {
+    "llama3_70b": 0.0,
+    "llama3_1_405b": 0.0,
+    "llama3_1_8b": 0.0,
+    "minimax_m2_5": 0.0,
+    "gpt_oss_120b": 85e-9,
 }
 
 # FP4 model_ids explicitly promoted into the canonical panel despite the
@@ -806,12 +823,14 @@ def _patch_workload(
     num_colocated_experts: int,
     is_dense: bool,
     kernel_launch_latency_per_layer_sec: float,
+    moe_token_pair_overhead_sec: float,
 ) -> None:
     with template.open() as f:
         spec = yaml.safe_load(f)
     spec["global_batch_size"] = int(global_batch)
     spec["prefill_seq_len"] = int(prefill_seq_len)
     spec["kernel_launch_latency_per_layer_sec"] = float(kernel_launch_latency_per_layer_sec)
+    spec["moe_token_pair_overhead_sec"] = float(moe_token_pair_overhead_sec)
     spec["moe_spec_v2"]["num_colocated_experts"] = int(num_colocated_experts)
     if is_dense:
         # A dense (single-expert) model has no routing skew: all tokens go to
@@ -847,6 +866,12 @@ def _run_scalescope(record: Record, case: Case, *, global_batch: int) -> dict:
             f"Add it to KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER in run_validation_panel.py "
             f"(known: {sorted(KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER)})."
         )
+    if case.model_yaml not in MOE_TOKEN_PAIR_OVERHEAD_SEC:
+        raise KeyError(
+            f"No EP dispatch overhead calibrated for model '{case.model_yaml}'. "
+            f"Add it to MOE_TOKEN_PAIR_OVERHEAD_SEC in run_validation_panel.py "
+            f"(known: {sorted(MOE_TOKEN_PAIR_OVERHEAD_SEC)})."
+        )
     # Decode TPOT must be averaged over the generation: the per-step context
     # grows ISL -> ISL+OSL as tokens are emitted, so the KV-cache read cost
     # rises across the run. We evaluate a single representative step at the
@@ -865,6 +890,7 @@ def _run_scalescope(record: Record, case: Case, *, global_batch: int) -> dict:
         num_colocated_experts=case.num_colocated_experts,
         is_dense=is_dense,
         kernel_launch_latency_per_layer_sec=KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER[case.model_yaml],
+        moe_token_pair_overhead_sec=MOE_TOKEN_PAIR_OVERHEAD_SEC[case.model_yaml],
     )
     cmd = [
         sys.executable,
@@ -1582,16 +1608,28 @@ def main(argv: list[str] | None = None) -> int:
     _heartbeat(force=True)
     progress.close()
 
-    summary_yaml = RESULTS_DIR / f"validation_panel_summary{suffix}.yaml"
-    summary_yaml.write_text(yaml.safe_dump({"results": rows}, sort_keys=False))
+    now = datetime.datetime.now()
+    timestamp_iso = now.strftime("%Y-%m-%d %H:%M:%S")
+    timestamp_fn = now.strftime("%Y%m%d_%H%M%S")
 
+    yaml_dict = {"timestamp": timestamp_iso, "results": rows}
+    yaml_text = yaml.safe_dump(yaml_dict, sort_keys=False)
+    md_text = _format_markdown(rows, deferred_count=len(deferred), timestamp=timestamp_iso)
+
+    summary_yaml_ts = RESULTS_DIR / f"validation_panel_summary_{timestamp_fn}{suffix}.yaml"
+    summary_md_ts = RESULTS_DIR / f"validation_panel_summary_{timestamp_fn}{suffix}.md"
+    summary_yaml = RESULTS_DIR / f"validation_panel_summary{suffix}.yaml"
     summary_md = RESULTS_DIR / f"validation_panel_summary{suffix}.md"
-    summary_md.write_text(_format_markdown(rows, deferred_count=len(deferred)))
+
+    summary_yaml_ts.write_text(yaml_text)
+    summary_md_ts.write_text(md_text)
+    summary_yaml.write_text(yaml_text)
+    summary_md.write_text(md_text)
 
     n_ok = sum(1 for r in rows if r.get("ok"))
     print()
-    print(f"Wrote {summary_yaml}")
-    print(f"Wrote {summary_md}")
+    print(f"Wrote {summary_yaml_ts} and {summary_yaml}")
+    print(f"Wrote {summary_md_ts} and {summary_md}")
     print(f"OK: {n_ok}/{len(rows)} records ran successfully.")
     return 0
 
@@ -1634,9 +1672,11 @@ def _stat_row(bucket: str, metric: str, ratios: list[float]) -> str | None:
     )
 
 
-def _format_markdown(rows: list[dict], *, deferred_count: int) -> str:
+def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | None = None) -> str:
     out: list[str] = []
     out.append("# Validation-panel comparison — ScaleScope vs. published benchmarks\n")
+    if timestamp:
+        out.append(f"**Run timestamp**: `{timestamp}`\n")
     out.append(
         "Each row is one measured datapoint compared to a ScaleScope "
         "decode-step prediction at the operating-point batch.\n"
@@ -1790,20 +1830,71 @@ def _format_markdown(rows: list[dict], *, deferred_count: int) -> str:
         # α-corrected TPOT where the correction applies (non-disagg), naive
         # TPOT for disagg (no chunked-prefill overlap to correct), else TPS
         # for TRT-LLM throughput rows.
+        def _primary_ratio(r: dict) -> float | None:
+            if r.get("corrected_tpot_ratio") is not None:
+                return r["corrected_tpot_ratio"]
+            if r.get("tpot_ratio") is not None:
+                return r["tpot_ratio"]
+            return r.get("tps_ratio")
+
         overall: list[float] = []
         for r in ok_rows:
             if r.get("contaminated"):
                 continue
-            if r.get("corrected_tpot_ratio") is not None:
-                primary = r["corrected_tpot_ratio"]
-            elif r.get("tpot_ratio") is not None:
-                primary = r["tpot_ratio"]
-            else:
-                primary = r.get("tps_ratio")
+            primary = _primary_ratio(r)
             if primary is not None:
                 overall.append(primary)
         _row("**All clean records**", "TPOT/TPS", overall)
         out.append("")
+
+        # Per-(model, framework, GPU) breakdown of the same pooled
+        # best-metric ratios, sorted worst-first (largest |log geomean|),
+        # so the biggest modeling gaps are at the top. Same clean-record
+        # filter and metric selection as the pooled row above.
+        groups: dict[tuple[str, str, str], list[float]] = {}
+        for r in ok_rows:
+            if r.get("contaminated"):
+                continue
+            primary = _primary_ratio(r)
+            if primary is None:
+                continue
+            key = (
+                r["model_id"],
+                r.get("submitter") or "trtllm",
+                r.get("gpu_class") or "?",
+            )
+            groups.setdefault(key, []).append(primary)
+        if groups:
+            out.append("### Per model / framework")
+            out.append("")
+            out.append(
+                "Clean records only, best available metric per record (same "
+                "selection as the pooled row above). Sorted worst-first by "
+                "mean |log error| — unlike the geomean, this does not let "
+                "symmetric over/under scatter cancel out, so the top rows "
+                "are where modeling attention pays off most.\n"
+            )
+            out.append(
+                "| Model | Framework | GPU | N | Mean \\|err\\| | Geomean | Median | Min | Max | ±10% | ±25% | ±50% |"
+            )
+            out.append("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+
+            def _mean_abs_log_err(ratios: list[float]) -> float:
+                return sum(abs(math.log(r)) for r in ratios) / len(ratios)
+
+            for (model_id, framework, gpu), ratios in sorted(
+                groups.items(), key=lambda kv: -_mean_abs_log_err(kv[1])
+            ):
+                srt = sorted(ratios)
+                n = len(srt)
+                bands = " | ".join(f"{_within(srt, lo, hi):.0f}%" for _, lo, hi in _ACCURACY_BANDS)
+                mean_err_pct = 100.0 * (math.exp(_mean_abs_log_err(srt)) - 1.0)
+                out.append(
+                    f"| {model_id} | {framework} | {gpu} | {n} | "
+                    f"{mean_err_pct:.0f}% | {_geomean(srt):.2f}× | {srt[n // 2]:.2f}× | "
+                    f"{srt[0]:.2f}× | {srt[-1]:.2f}× | {bands} |"
+                )
+            out.append("")
 
         if nd_contam:
             n_infeasible = sum(1 for r in nd_contam if r.get("infeasible_capacity"))
@@ -2014,12 +2105,13 @@ def _format_markdown(rows: list[dict], *, deferred_count: int) -> str:
                 f"OSL=1024, conc=1-3072. By shape: clean-TP "
                 f"({len(ix_clean)} rows) at {clean_median:.2f}× median, "
                 f"DP-attention + EP hybrids ({len(ix_hybrid)} rows) at "
-                f"{hybrid_median:.2f}× median — the hybrid shapes run "
-                f"systematically optimistic (under-modelled MoE all-to-all "
-                f"dispatch/combine overhead at 32-64 colocated experts). "
-                f"gpt-oss's alternating sliding-window / full-attention "
-                f"layers (half the layers cap KV history at 128 tokens) are "
-                f"not modelled, so KV traffic is over-counted at ISL=8192. "
+                f"{hybrid_median:.2f}× median — the hybrid shapes carry the "
+                f"fitted serial EP dispatch term "
+                f"(moe_token_pair_overhead_sec, see "
+                f"MOE_TOKEN_PAIR_OVERHEAD_SEC and modeling_"
+                f"improvements_todo.md §14); the residual misses there are "
+                f"the DP-replicated cells with saturation-flat measured TPOT "
+                f"(over-predicted) and the EP4 shapes (modestly under). "
                 f"See Notes & caveats below."
             )
             out.append("")
@@ -2157,10 +2249,10 @@ def _format_markdown(rows: list[dict], *, deferred_count: int) -> str:
         "concurrency (non-disagg).\n"
     )
     out.append(
-        "- **Sliding-window / hybrid attention is not modelled.** gpt-oss "
-        "caps KV history at 128 tokens on half its layers; the "
-        "uniform-full-attention assumption over-counts KV traffic at long "
-        "ISL.\n"
+        "- **Sliding-window / hybrid attention is modelled via the "
+        "`attention_layers` blend** (gpt-oss caps KV history at 128 tokens "
+        "on half its layers; the model spec carries the sliding/full layer "
+        "mix, so KV traffic at long ISL reflects it).\n"
     )
     out.append(
         "- **The kernel-launch floor is keyed on model only, not "

@@ -3,6 +3,7 @@
 Implements modeling for forward/backward TP collectives for 1D/2D weight sharding variants.
 """
 
+import math
 import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -45,6 +46,154 @@ class Resolved2DSplit:
     tp_yz: int
     x_view: LogicalTopology
     yz_view: LogicalTopology
+
+
+def _physical_axis_sizes(view: LogicalTopology) -> dict[str, int]:
+    """Return the logical extent assigned to each physical dimension."""
+    sizes: dict[str, int] = {}
+    for dim in view.dimensions:
+        physical_name = dim.maps_to_physical_dimension_name
+        if physical_name in sizes:
+            sizes[physical_name] *= dim.size
+        else:
+            sizes[physical_name] = dim.size
+    return sizes
+
+
+def _layout_quotient_view(
+    *,
+    numerator_view: LogicalTopology,
+    denominator_view: LogicalTopology,
+    view_name: str,
+) -> LogicalTopology:
+    """Build the exact physical-axis quotient ``numerator / denominator``.
+
+    This is used only when every numerator extent is an integer multiple of
+    the corresponding denominator extent.  Mixed coarsening/refinement across
+    physical dimensions is rejected rather than approximated as a virtual
+    one-dimensional collective.
+    """
+    numerator_sizes = _physical_axis_sizes(numerator_view)
+    denominator_sizes = _physical_axis_sizes(denominator_view)
+    numerator_physical_names = set(numerator_sizes)
+    denominator_physical_names = set(denominator_sizes)
+    if numerator_physical_names != denominator_physical_names:
+        raise ValueError(
+            f"{view_name}: numerator and denominator must map the same physical dimensions; "
+            f"numerator={sorted(numerator_physical_names)}, "
+            f"denominator={sorted(denominator_physical_names)}"
+        )
+
+    quotient_by_physical: dict[str, int] = {}
+    for physical_name in numerator_physical_names:
+        numerator_size = numerator_sizes[physical_name]
+        denominator_size = denominator_sizes[physical_name]
+        if numerator_size % denominator_size != 0:
+            raise ValueError(
+                f"{view_name}: layout extents are not divisible on physical dimension "
+                f"{physical_name}: {numerator_size} / {denominator_size}"
+            )
+        quotient_by_physical[physical_name] = numerator_size // denominator_size
+
+    new_sizes: dict[str, int] = {}
+    remaining = dict(quotient_by_physical)
+    for dim in numerator_view.dimensions:
+        physical_name = dim.maps_to_physical_dimension_name
+        factor = math.gcd(remaining[physical_name], dim.size)
+        new_sizes[_tag_to_str(dim.logical_tag)] = factor
+        remaining[physical_name] //= factor
+
+    if any(size != 1 for size in remaining.values()):
+        raise ValueError(f"{view_name}: quotient contains an unmapped physical extent: {remaining}")
+
+    return numerator_view.create_resized_view(view_name=view_name, new_sizes=new_sizes)
+
+
+def _decode_moe_input_layout_comm(
+    *,
+    proj_x_topology: LogicalTopology,
+    proj_yz_topology: LogicalTopology,
+    moe_yz_topology: LogicalTopology,
+    tokens: int,
+    d_model: int,
+    float_size: float,
+    layout_trace,
+) -> CommStats:
+    """Price the all-token output-projection -> MoE input layout handoff."""
+    if tokens < 0:
+        raise ValueError(f"tokens must be >= 0, got {tokens}")
+    if d_model <= 0:
+        raise ValueError(f"d_model must be > 0, got {d_model}")
+    if float_size <= 0:
+        raise ValueError(f"float_size must be > 0, got {float_size}")
+
+    proj_y = proj_yz_topology.num_chips
+    moe_y = moe_yz_topology.num_chips
+    if proj_y <= 0 or moe_y <= 0:
+        raise ValueError(f"Projection and MoE Y extents must be > 0, got {proj_y} and {moe_y}")
+    if proj_y < moe_y:
+        raise ValueError(
+            "Projection-to-MoE Y refinement is unsupported without explicit projection-replica "
+            f"metadata: TP_Proj_Y_eff={proj_y}, TP_MoE_Y={moe_y}. No scatter fallback is "
+            "modeled; prove a local replica-to-shard selection or add an exact redistribution."
+        )
+
+    total = CommStats()
+
+    # Output projection intentionally ends with RS(TP_Proj_X).  The MoE
+    # consumer completes the split all-reduce with an all-token AG over that
+    # same projection-X group.  This payload is independent of top-k and rho.
+    x_after_ag_bytes = float_size * tokens * (d_model / proj_y)
+    comm_x = hockney_model_all_gather_on_nd_topology(
+        proj_x_topology, x_after_ag_bytes, float_size_bytes=float_size
+    )
+    total += comm_x
+    layout_trace.record_comm(
+        "moe_input_ag_proj_x",
+        "AG",
+        f"TP_Proj_X({proj_x_topology.num_chips})",
+        proj_x_topology.num_chips,
+        x_after_ag_bytes,
+        comm_x,
+        note="all-token consumer gather; completes output-projection RS+AG",
+    )
+
+    if proj_y == moe_y:
+        return total
+
+    if proj_y > moe_y:
+        # The Y_p / Q_y quotient defines one representative gather subgroup.
+        # There are Q_y aligned, disjoint subgroups, each with Y_p / Q_y ranks,
+        # and the model assumes they execute concurrently.  We therefore charge
+        # the critical-path time of one subgroup rather than summing Q_y
+        # launches.  Explicit subgroup identities and contention when those
+        # concurrent groups share physical fabric resources are not modeled.
+        quotient_view = _layout_quotient_view(
+            numerator_view=proj_yz_topology,
+            denominator_view=moe_yz_topology,
+            view_name="TP_Proj_Y_to_TP_MoE_Y_AG",
+        )
+        y_after_ag_bytes = float_size * tokens * (d_model / moe_y)
+        comm_y = hockney_model_all_gather_on_nd_topology(
+            quotient_view, y_after_ag_bytes, float_size_bytes=float_size
+        )
+        total += comm_y
+        layout_trace.record_comm(
+            "moe_input_ag_y",
+            "AG",
+            f"TP_Proj_Y/TP_MoE_Y({quotient_view.num_chips})",
+            quotient_view.num_chips,
+            y_after_ag_bytes,
+            comm_y,
+            note=(
+                f"coarsen projection Y layout: {proj_y} -> {moe_y}; "
+                f"{moe_y} disjoint subgroup(s) of size {proj_y // moe_y} run concurrently. "
+                "MODEL_LIMITATION: cross-subgroup fabric contention is not modeled."
+            ),
+        )
+        return total
+
+    raise AssertionError("Unreachable projection-to-MoE Y reconciliation branch")
 
 
 def resolve_tp2d_split(
@@ -2022,12 +2171,16 @@ class TP2DMoEStrategy(TensorParallelStrategy):
         moe_config,
         workload_spec,
         n_seq: int,
-        moe_tp_topology: LogicalTopology = None,
-        x_dims: list[int] | None = None,
-        yz_dims: list[int] | None = None,
-        x_topology: LogicalTopology | None = None,
-        yz_topology: LogicalTopology | None = None,
-        attn_tp_topology: LogicalTopology | None = None,
+        *,
+        moe_tp_topology: LogicalTopology,
+        x_dims: list[int],
+        yz_dims: list[int],
+        x_topology: LogicalTopology,
+        yz_topology: LogicalTopology,
+        attn_tp_topology: LogicalTopology,
+        proj_x_topology: LogicalTopology | None,
+        proj_yz_topology: LogicalTopology | None,
+        is_decode: bool,
         **kwargs,
     ) -> CommStats:
         layout_trace = kwargs.pop("layout_trace", NULL_LAYOUT_TRACE)
@@ -2038,6 +2191,14 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             raise ValueError("TP2DMoEStrategy requires explicit x_dims and yz_dims.")
         if x_topology is None or yz_topology is None:
             raise ValueError("TP2DMoEStrategy requires x_topology and yz_topology.")
+        if attn_tp_topology is None:
+            raise ValueError("TP2DMoEStrategy requires attn_tp_topology.")
+        single_domain_decode = is_decode and moe_config.attn_domains_per_full_expert_set == 1
+        if single_domain_decode and (proj_x_topology is None or proj_yz_topology is None):
+            raise ValueError(
+                "Single-domain TP2D MoE decode requires proj_x_topology and "
+                "proj_yz_topology for the output-projection layout handoff."
+            )
 
         d_model = transformer_config.d_model
         float_size = workload_spec.float_size_bytes
@@ -2140,15 +2301,40 @@ class TP2DMoEStrategy(TensorParallelStrategy):
         else:
             num_combine_sets = 1
 
-        layout_trace.record(
-            "moe_input",
-            "Residual add + LayerNorm (same layout as output_proj)",
-            TensorRecord("x_moe", {"B": s, "D": d_model}, _moe_d_part, dtype_bytes=float_size),
-            note=(
-                f"actual: moe_tp_x={tp_x}, moe_tp_yz={tp_yz}, "
-                f"D/({tp_x}·{tp_yz}) = {_moe_d_local}"
-            ),
-        )
+        if single_domain_decode:
+            assert proj_x_topology is not None
+            assert proj_yz_topology is not None
+            proj_x = proj_x_topology.num_chips
+            proj_y = proj_yz_topology.num_chips
+            _proj_d_dims = []
+            if proj_x > 1:
+                _proj_d_dims.append("X")
+            if proj_y > 1:
+                _proj_d_dims.append("Y_eff")
+            _proj_d_part = (
+                {"D": P("sharded", tuple(_proj_d_dims)), "B": P("replicated", ("Y",))}
+                if _proj_d_dims
+                else {"B": P("replicated", ("Y",))}
+            )
+            layout_trace.record(
+                "moe_input",
+                "Residual add + LayerNorm (same layout as output_proj)",
+                TensorRecord("x_moe", {"B": s, "D": d_model}, _proj_d_part, dtype_bytes=float_size),
+                note=(
+                    f"actual incoming projection layout: D/({proj_x}·{proj_y}) = "
+                    f"{d_model // (proj_x * proj_y)}"
+                ),
+            )
+        else:
+            layout_trace.record(
+                "moe_input",
+                "MoE input in the existing pass-specific layout",
+                TensorRecord("x_moe", {"B": s, "D": d_model}, _moe_d_part, dtype_bytes=float_size),
+                note=(
+                    f"actual: moe_tp_x={tp_x}, moe_tp_yz={tp_yz}, "
+                    f"D/({tp_x}·{tp_yz}) = {_moe_d_local}"
+                ),
+            )
 
         # ---- Phase-structured comm model for 2D TP MoE (prefill/train) ----
         #
@@ -2170,13 +2356,10 @@ class TP2DMoEStrategy(TensorParallelStrategy):
         if moe_config.num_shared_experts_per_dp_rank > 0:
             raise NotImplementedError("Shared experts not implemented in 2D TP MoE strategy.")
 
-        # Phase A1 (transport shaping): all-gather X for expert input activations.
-        # Each rank starts with [tokens, E/(tp_x*tp_yz)] and gathers to [tokens, E/tp_yz].
-        #
-        # Use routed-token basis (traffic multiplier + colocation + remote fraction) so
-        # this phase is aligned with TP1D/C-phases semantics under expert imbalance.
-        # TP core collectives are modeled on routed token payload processed by expert TP
-        # shards (local + remote). Placement locality/remote_fraction is modeled in EP A2A.
+        # Phase A1.  Single-domain decode consumes the output-projection
+        # layout directly: always AG all tokens over TP_Proj_X, then reconcile
+        # TP_Proj_Y_eff with TP_MoE_Y.  Other pass/domain modes retain the
+        # existing optional routed-token transport optimization.
         redistribution_optimization_enabled = bool(
             moe_config.tp_moe_a2a_replication_optimization_enabled
         )
@@ -2198,11 +2381,44 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             )
         else:
             routed_tokens_per_chip = 0.0
-        # Optional TP2D redistribution optimization:
-        # when enabled, model an additional X all-gather setup phase.
-        # Base routed-token exchange volume itself is modeled by MoE A2A (ep_strategy)
-        # and remains toggle-independent.
-        if redistribution_optimization_enabled:
+        if single_domain_decode and n_experts > 0:
+            assert proj_x_topology is not None
+            assert proj_yz_topology is not None
+            total_comm += _decode_moe_input_layout_comm(
+                proj_x_topology=proj_x_topology,
+                proj_yz_topology=proj_yz_topology,
+                moe_yz_topology=yz_topology,
+                tokens=tokens_local,
+                d_model=d_model,
+                float_size=float_size,
+                layout_trace=layout_trace,
+            )
+            _reconciled_d_part = (
+                {"D": P("sharded", ("Y_eff",)), "B": P("replicated", ("Y",))}
+                if tp_yz > 1
+                else {"B": P("replicated", ("Y",))}
+            )
+            _reconciliation_flags = (
+                (
+                    "MODEL_LIMITATION: projection-Y quotient gathers assume aligned disjoint "
+                    "subgroups execute concurrently; cross-subgroup fabric contention is not modeled.",
+                )
+                if proj_yz_topology.num_chips > tp_yz
+                else ()
+            )
+            layout_trace.record(
+                "moe_input_reconciled",
+                "After AG(TP_Proj_X) and projection-Y to MoE-Y reconciliation",
+                TensorRecord(
+                    "x_moe_reconciled",
+                    {"B": s, "D": d_model},
+                    _reconciled_d_part,
+                    dtype_bytes=float_size,
+                ),
+                note=f"actual: X replicated, D/tp_moe_y = {d_model // tp_yz}",
+                flags=_reconciliation_flags,
+            )
+        elif redistribution_optimization_enabled:
             x_after_ag_bytes = float_size * routed_tokens_per_chip * (d_model / tp_yz)
             comm_transport = hockney_model_all_gather_on_nd_topology(
                 x_topology, x_after_ag_bytes, float_size_bytes=float_size
@@ -2491,6 +2707,7 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             x_topology=x_topology,
             yz_topology=yz_topology,
             attn_tp_topology=attn_tp_topology,
+            is_decode=False,
             **kwargs,
         )
 
@@ -2519,6 +2736,7 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             x_topology=x_topology,
             yz_topology=yz_topology,
             attn_tp_topology=attn_tp_topology,
+            is_decode=False,
             **kwargs,
         )
 
@@ -2547,6 +2765,7 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             x_topology=x_topology,
             yz_topology=yz_topology,
             attn_tp_topology=attn_tp_topology,
+            is_decode=True,
             **kwargs,
         )
 

@@ -410,6 +410,19 @@ class WorkloadSpec(BaseModel):
             "or hardware property. Set 0.0 where this floor is not modeled."
         ),
     )
+    moe_token_pair_overhead_sec: float = Field(
+        ...,
+        ge=0,
+        description=(
+            "MoE software/runtime overhead in seconds per routed token-expert "
+            "pair per MoE layer per pass. Applied to training forward and backward, "
+            "inference prefill, and every decode step using the modeled hot-rank routed "
+            "load (including top-k and colocation-diluted routing imbalance). This covers "
+            "routing bookkeeping and permutation/unpermutation kernel-dispatch overhead; "
+            "it is independent of whether network A2A is required and is not part of "
+            "Hockney communication or HBM byte accounting. Set 0.0 where not modeled."
+        ),
+    )
     # TP-MoE expert-input redistribution optimization toggle (mode-agnostic).
     tp_moe_a2a_replication_optimization: bool = Field(
         ...,
@@ -845,6 +858,7 @@ class InferenceDecodeSpec(WorkloadSpec):
             "'sharded_router' shards router logits across attention-TP ranks and requires an all-reduce."
         ),
     )
+
     _parse_decode_moe_router_sync_mode = field_validator(
         "decode_moe_router_sync_mode", mode="before"
     )(parse_enum_by_name_or_value(MoERouterSyncMode))

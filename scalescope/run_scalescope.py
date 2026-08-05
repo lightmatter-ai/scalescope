@@ -87,6 +87,7 @@ from scalescope.model_spec import (
     TransformerConfig,
 )
 from scalescope.pp_strategy import get_pp_strategy
+from scalescope.runtime_overhead_model import moe_token_pair_overhead_per_pass
 from scalescope.stats import CommStats
 from scalescope.sweep_dsl import (
     apply_case_to_specs,
@@ -1211,6 +1212,12 @@ def get_model_stats(
             total_train_tokens = workload_spec.total_train_tokens
             seq_length = workload_spec.seq_length
             train_steps, _ = workload_spec.calculate_number_of_train_steps()
+            moe_runtime_overhead_per_pass = moe_token_pair_overhead_per_pass(
+                model_spec=model_spec,
+                moe_config=moe_config,
+                workload_spec=workload_spec,
+                n_seq=seq_length,
+            )
             (
                 batch_compute_time_forward_pass,
                 batch_flops_forward_pass,
@@ -1226,7 +1233,10 @@ def get_model_stats(
                 moe_config,
                 workload_spec,
             )
-            batch_compute_time_forward_pass += kernel_launch_floor_per_pass
+            batch_compute_time_forward_pass += (
+                kernel_launch_floor_per_pass + moe_runtime_overhead_per_pass
+            )
+            compute_time_moe_fwd += moe_runtime_overhead_per_pass
 
             # Attention compute breakdown: projection vs core attention (per-batch, per-chip)
             attn_proj_compute_time_fwd_per_layer, _, attn_core_compute_time_fwd_per_layer, _ = (
@@ -1273,7 +1283,10 @@ def get_model_stats(
                 moe_config,
                 workload_spec,
             )
-            batch_compute_time_backward_pass += kernel_launch_floor_per_pass
+            batch_compute_time_backward_pass += (
+                kernel_launch_floor_per_pass + moe_runtime_overhead_per_pass
+            )
+            compute_time_moe_bwd += moe_runtime_overhead_per_pass
             compute_time_param_update, flops_param_update = parameter_update_flops(
                 attn_tp_topology_view, model_spec, moe_config, workload_spec
             )
@@ -1284,6 +1297,12 @@ def get_model_stats(
             # inference does not have train steps
             train_steps = 1
             total_train_tokens = workload_spec.global_batch_size * seq_length * train_steps
+            moe_runtime_overhead_per_pass = moe_token_pair_overhead_per_pass(
+                model_spec=model_spec,
+                moe_config=moe_config,
+                workload_spec=workload_spec,
+                n_seq=seq_length,
+            )
             (
                 batch_compute_time_forward_pass,
                 batch_flops_forward_pass,
@@ -1299,7 +1318,10 @@ def get_model_stats(
                 moe_config,
                 workload_spec,
             )
-            batch_compute_time_forward_pass += kernel_launch_floor_per_pass
+            batch_compute_time_forward_pass += (
+                kernel_launch_floor_per_pass + moe_runtime_overhead_per_pass
+            )
+            compute_time_moe_fwd += moe_runtime_overhead_per_pass
 
             # Attention compute breakdown: projection vs core attention (per-batch, per-chip)
             attn_proj_compute_time_fwd_per_layer, _, attn_core_compute_time_fwd_per_layer, _ = (
@@ -1336,6 +1358,13 @@ def get_model_stats(
             # inference does not have train steps
             train_steps = 1
             total_train_tokens = workload_spec.global_batch_size * num_decode_steps * train_steps
+
+            moe_runtime_overhead_per_step = moe_token_pair_overhead_per_pass(
+                model_spec=model_spec,
+                moe_config=moe_config,
+                workload_spec=workload_spec,
+                n_seq=1,
+            )
 
             batch_compute_time_forward_pass = 0.0
             batch_flops_forward_pass = 0
@@ -1381,12 +1410,14 @@ def get_model_stats(
                     workload_spec,
                     n_seq_so_far,
                 )
-                batch_compute_time_forward_pass += step_time + kernel_launch_floor_per_pass
+                batch_compute_time_forward_pass += (
+                    step_time + kernel_launch_floor_per_pass + moe_runtime_overhead_per_step
+                )
                 batch_flops_forward_pass += step_flops
                 attn_flops_forward_pass += step_attn_flops
                 moe_flops_forward_pass += step_moe_flops
                 compute_time_attn_fwd += step_attn_time
-                compute_time_moe_fwd += step_moe_time
+                compute_time_moe_fwd += step_moe_time + moe_runtime_overhead_per_step
 
                 # Embedding/Unembedding compute per decode step with explicit seq_len=1
                 embedding_time, embedding_flops_chip = calculate_embedding_compute(

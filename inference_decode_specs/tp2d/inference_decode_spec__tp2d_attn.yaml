@@ -5,6 +5,9 @@ micro_batch_size: 2
 prefill_seq_len: 8192
 num_generated_tokens: 1024
 decode_moe_router_sync_mode: replicated_router
+# MoE software/runtime overhead per routed token-expert pair per layer per pass.
+# Applies independently of network A2A; 0.0 = not modeled.
+moe_token_pair_overhead_sec: 0.0
 
 float_size_bytes: 1
 

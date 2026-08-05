@@ -14,6 +14,9 @@ seq_length: 1
 kernel_launch_latency_per_layer_sec: 0.0
 
 decode_moe_router_sync_mode: replicated_router
+# MoE software/runtime overhead per routed token-expert pair per layer per pass.
+# Applies independently of network A2A; 0.0 = not modeled.
+moe_token_pair_overhead_sec: 0.0
 float_size_bytes: 1
 
 memory_device_map_traffic:

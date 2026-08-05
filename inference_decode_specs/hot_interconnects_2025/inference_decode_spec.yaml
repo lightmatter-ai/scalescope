@@ -8,6 +8,9 @@ micro_batch_size: 2             # Micro-batch size per PP stage; per-DP batch = 
 prefill_seq_len: 8192           # Context length used to build initial KV cache (from prefill)
 num_generated_tokens: 1024      # Tokens to generate per sequence during decode
 decode_moe_router_sync_mode: replicated_router
+# MoE software/runtime overhead per routed token-expert pair per layer per pass.
+# Applies independently of network A2A; 0.0 = not modeled.
+moe_token_pair_overhead_sec: 0.0
 
 float_size_bytes: 1             # Inference precision in bytes (e.g., 1 = int8/fp8)
 

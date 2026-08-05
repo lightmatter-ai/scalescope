@@ -1274,6 +1274,21 @@ def _forward_pass_prefill_moe_ffn_tp_1d_memory_traffic(
             tokens_per_routed_expert * traffic_mult * d_model * float_size
         )
 
+        # Permute/unpermute staging for the grouped expert GEMMs. Routed MoE
+        # kernels require tokens sorted into per-expert contiguous segments:
+        # the dispatch side permutes the received token slab into expert order
+        # (read + write), and the combine side unpermutes expert outputs back
+        # into token order (read + write). This is real HBM traffic on every
+        # routed-MoE rank — including EP=1 / TP-only MoE, where the sort is
+        # purely local — and is charged at the same hot-rank token volume as
+        # the expert reads below (traffic_mult carries top_k x diluted
+        # imbalance). Dense/single-expert layers have no routing, hence no
+        # permute (guarded by total_num_routed_experts > 1).
+        if total_num_routed_experts > 1:
+            permute_leg_bytes = num_colocated * token_volume_per_routed_expert
+            traffic.activations.bytes_read += 2 * permute_leg_bytes
+            traffic.activations.bytes_written += 2 * permute_leg_bytes
+
         # Calculate the total volume of tokens routed to a single regular expert.
         # The input for this expert's FFN1 is read from the All-to-All output buffer.
         # Scale by number of colocated experts per chip
@@ -1826,6 +1841,17 @@ def _forward_pass_prefill_moe_ffn_tp_2d_memory_traffic(
         # Expert input activations are model-dimension sharded on YZ in TP-2D.
         # Each rank reads only its local E/TP_MoE_Y feature shard.
         expert_input_sharded = tokens_processed * (d_model / moe_tp_size_yz) * float_size
+
+        # Permute/unpermute staging for the grouped expert GEMMs (same physics
+        # as the TP-1D path): dispatch-side sort into per-expert contiguous
+        # order (read + write) and combine-side unsort back to token order
+        # (read + write), on the rank's local buffer shape [tokens, E/YZ].
+        # Charged for any routed MoE, including EP=1 where the sort is local.
+        if total_num_routed_experts > 1:
+            permute_leg_bytes = num_colocated * expert_input_sharded
+            traffic.activations.bytes_read += 2 * permute_leg_bytes
+            traffic.activations.bytes_written += 2 * permute_leg_bytes
+
         traffic.activations.bytes_read += num_colocated * expert_input_sharded
 
         # FFN1 output: size [tokens_processed, H/X] where H=d_ff and X=moe_tp_size_x.

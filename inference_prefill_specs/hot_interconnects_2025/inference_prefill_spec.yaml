@@ -31,6 +31,7 @@ comp_comm_efficiency: 0.7       # Overlap between compute and communication
 comp_mem_efficiency: 0.7        # Overlap between compute and memory traffic
 comm_mem_efficiency: 0.7        # Overlap between communication and memory traffic
 kernel_launch_latency_per_layer_sec: 0.0  # per-layer host kernel-launch floor (0.0 = not modeled)
+moe_token_pair_overhead_sec: 0.0  # per routed token-expert pair per MoE layer per pass
 tp_moe_a2a_replication_optimization: true  # on: send to expert shard then all-gather across expert TP shards; off: regular routed MoE A2A
 
 tp_attn_spec:
