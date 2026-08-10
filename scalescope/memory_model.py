@@ -1602,21 +1602,18 @@ def _decode_attention_projection_tp_2d_memory_traffic(
     qkv_output_sharded_size = n_batch * step_seq * qkv_out_elems / shard * float_size
     traffic.activations.bytes_written += int(qkv_output_sharded_size)
 
-    # Phase 3: output projection staging (explicit, non-fused; matches 2D TP algorithm).
-    # Reads of the attention output shard and gathered activation are accounted here, but
-    # note that the attention output shard itself is written in the attention-core helper.
-    # `attn_out_sharded` is the post-attention activation = q_proj_out_dim
-    # (NOT d_model — they differ under wide-Q layouts); `partial_out` is
-    # the post-output-proj activation = d_model.
-    attn_out_sharded = n_batch * step_seq * q_proj_out_dim / shard * float_size
-    traffic.activations.bytes_read += int(attn_out_sharded)
-    traffic.activations.bytes_read += int(
-        n_batch * step_seq * q_proj_out_dim / proj_tp_size_x * float_size
-    )
+    # Phase 3: output projection staging (explicit, non-fused; matches decode TP comm).
+    # Phase 2 AR(Y) leaves the attention output replicated on Y and sharded only on X,
+    # so W_O reads one local [B, q_proj_out_dim/X] activation. There is no decode AG(Y).
+    # `partial_out` is the post-output-proj activation = d_model/Y; RS(X) then writes
+    # the final d_model/(X*Y) residual-stream shard.
+    attn_out_after_ar_y = n_batch * step_seq * q_proj_out_dim / proj_tp_size_x * float_size
+    traffic.activations.bytes_read += int(attn_out_after_ar_y)
     partial_out = n_batch * step_seq * d_model / proj_tp_size_yz * float_size
     traffic.activations.bytes_written += int(partial_out)
     traffic.activations.bytes_read += int(partial_out)
-    traffic.activations.bytes_written += int(attn_out_sharded)
+    final_out_shard = n_batch * step_seq * d_model / shard * float_size
+    traffic.activations.bytes_written += int(final_out_shard)
 
 
 def _decode_attention_attn_tp_2d_memory_traffic(
@@ -1698,11 +1695,11 @@ def _decode_attention_attn_tp_2d_memory_traffic(
     traffic.activations.bytes_written += int(attn_score_sharded_size)
     traffic.activations.bytes_read += int(attn_score_sharded_size)
 
-    shard_attn = attn_tp_size_x * attn_tp_size_yz
-    # Attention output write (post-attention activation, dim = q_proj_out_dim
-    # = num_heads * head_dim; NOT d_model under wide-Q).
+    # Phase 2 AR(Y) produces the exact attention output replicated across Y and
+    # sharded only across X heads. The output projection consumes this layout
+    # directly; decode does not perform another AG(Y).
     traffic.activations.bytes_written += int(
-        n_batch * step_seq * q_proj_out_dim / shard_attn * float_size
+        n_batch * step_seq * q_proj_out_dim / attn_tp_size_x * float_size
     )
 
 

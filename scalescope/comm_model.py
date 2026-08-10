@@ -99,6 +99,7 @@ def get_transformer_comm_stats(
     proj_tp_topology,
     moe_tp_topology,
     ep_topology,
+    expert_set_topology,
     model_spec,
     moe_config,
     workload_spec,
@@ -155,6 +156,7 @@ def get_transformer_comm_stats(
         "attn_tp_topology": attn_tp_topology,
         "proj_x_topology": None,
         "proj_yz_topology": None,
+        "expert_set_topology": expert_set_topology,
         "layout_trace": layout_trace,
     }
 
@@ -279,6 +281,7 @@ def get_transformer_comm_stats(
 
     # MoE communication cost for the forward pass
     num_global_batch_tokens = attn_dp_topology.num_chips * n_batch * n_seq
+    num_attention_domain_tokens = n_batch * comm_n_seq
 
     # EP / MoE A2A: strategy functions return per-layer stats (same convention
     # as TP strategies above); multiply by num_layers_per_pp_stage here.
@@ -344,22 +347,33 @@ def get_transformer_comm_stats(
                 layout_trace=layout_trace,
             )
         else:
-            # Single attention domain per expert set (attn_domains_per_full_expert_set == 1):
-            # dispatch is zero (tokens already local at every colocated expert
-            # group); combine is the dense RS-across-expert-groups + optional
-            # cross-set AG + optional projection-group AG + optional NxM remap
-            # model.
+            # One attention domain feeds one or more complete expert sets.
+            # With Y-aligned sets, token selection is local; combine performs
+            # exact per-set reduction followed by cross-set batch gathering.
+            if attn_tp_variant != TensorParallelVariant.SHARD_WEIGHTS_2D:
+                raise NotImplementedError(
+                    "Exact single-domain decode combine requires 2D attention/projection TP."
+                )
+            if moe_tp_variant != TensorParallelVariant.SHARD_WEIGHTS_2D:
+                raise NotImplementedError("Exact single-domain decode combine requires 2D MoE TP.")
             moe_stats_1 = CommStats()
             moe_stats_2 = num_layers_per_pp_stage * calculate_moe_combine_decode(
                 ep_topology_view=ep_topology,
                 transformer_config=model_spec,
                 moe_config=moe_config,
-                num_global_batch_tokens=num_global_batch_tokens,
+                num_attention_domain_tokens=num_attention_domain_tokens,
                 attn_tp_xpus=attn_tp_topology.num_chips,
                 float_size=workload_spec.float_size_bytes,
                 tp_moe_x_shards=tp_moe_x_shards,
                 tp_moe_y_shards=tp_moe_y_shards,
                 projection_groups=projection_groups,
+                attn_x_topology=resolved_attn.x_view,
+                attn_yz_topology=resolved_attn.yz_view,
+                proj_x_topology=resolved_proj.x_view,
+                proj_yz_topology=resolved_proj.yz_view,
+                moe_x_topology=resolved.x_view,
+                moe_yz_topology=resolved.yz_view,
+                expert_set_topology=expert_set_topology,
                 layout_trace=layout_trace,
             )
     else:

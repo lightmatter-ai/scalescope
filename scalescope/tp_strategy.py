@@ -2180,6 +2180,7 @@ class TP2DMoEStrategy(TensorParallelStrategy):
         attn_tp_topology: LogicalTopology,
         proj_x_topology: LogicalTopology | None,
         proj_yz_topology: LogicalTopology | None,
+        expert_set_topology: LogicalTopology | None,
         is_decode: bool,
         **kwargs,
     ) -> CommStats:
@@ -2194,6 +2195,20 @@ class TP2DMoEStrategy(TensorParallelStrategy):
         if attn_tp_topology is None:
             raise ValueError("TP2DMoEStrategy requires attn_tp_topology.")
         single_domain_decode = is_decode and moe_config.attn_domains_per_full_expert_set == 1
+        full_sets_per_attn_domain = moe_config.full_expert_sets_per_attn_domain
+        if single_domain_decode:
+            if full_sets_per_attn_domain is None:
+                raise ValueError(
+                    "Single-domain TP2D MoE decode requires " "full_expert_sets_per_attn_domain."
+                )
+            if full_sets_per_attn_domain > 1:
+                if expert_set_topology is None:
+                    raise ValueError("Multiple Y-aligned expert sets require expert_set_topology.")
+                if expert_set_topology.num_chips != full_sets_per_attn_domain:
+                    raise ValueError(
+                        f"expert_set_topology ({expert_set_topology.num_chips}) must equal "
+                        f"full_expert_sets_per_attn_domain ({full_sets_per_attn_domain})"
+                    )
         if single_domain_decode and (proj_x_topology is None or proj_yz_topology is None):
             raise ValueError(
                 "Single-domain TP2D MoE decode requires proj_x_topology and "
@@ -2216,6 +2231,14 @@ class TP2DMoEStrategy(TensorParallelStrategy):
         n_batch = resolved_batches.batch_size_per_dp
         tokens_local = n_batch * n_seq
         tokens_per_set = resolved_batches.batch_size_per_full_expert_set * n_seq
+        if single_domain_decode:
+            assert full_sets_per_attn_domain is not None
+            if tokens_per_set * full_sets_per_attn_domain != tokens_local:
+                raise ValueError(
+                    f"Per-set tokens ({tokens_per_set}) × sets "
+                    f"({full_sets_per_attn_domain}) must equal attention-domain tokens "
+                    f"({tokens_local})"
+                )
         # MoE-stage trace should reflect per-full-expert-set token ownership.
         # For num_complete_sets>1 this avoids showing global batch on each set.
         s = tokens_per_set
@@ -2224,73 +2247,72 @@ class TP2DMoEStrategy(TensorParallelStrategy):
 
         _moe_d_dims = []
         if tp_x > 1:
-            _moe_d_dims.append("X")
+            _moe_d_dims.append("MoE_X")
         if tp_yz > 1:
-            _moe_d_dims.append("Y_eff")
+            _moe_d_dims.append("MoE_Y")
         _moe_d_part = (
             {"D": P("sharded", tuple(_moe_d_dims)), "B": P("replicated", ("Y",))}
             if _moe_d_dims
             else {"B": P("replicated", ("Y",))}
         )
-        _moe_d_local = d_model // max(1, tp_x * tp_yz)
-        if hasattr(layout_trace, "mesh"):
-            target_x = max(1, layout_trace.mesh.size_of("X"))
-            target_y_eff = max(1, layout_trace.mesh.size_of("Y_eff"))
-        else:
-            # No-op trace path (prefill/train tests): fall back to local TP decomposition.
-            target_x = tp_x
-            target_y_eff = tp_yz
+        _moe_d_local = d_model // (tp_x * tp_yz)
         groups_per_set = moe_config.num_colocated_groups_per_set
         if groups_per_set <= 0:
             raise ValueError(f"num_colocated_groups_per_set must be > 0, got {groups_per_set}")
+        if attn_tp_topology is None:
+            raise ValueError("TP2DMoEStrategy requires attn_tp_topology for combine tracing.")
+        attn_tp_xpus = attn_tp_topology.num_chips
+        if attn_tp_xpus <= 0:
+            raise ValueError(f"attn_tp_topology.num_chips must be > 0, got {attn_tp_xpus}")
 
-        # Variant-aware combine handoff:
-        # - 1xN (tp_x=1): RS(G) can hand off into next-layer X sharding when G matches target_X.
-        # - Nx1 (tp_yz=1): RS(G) can hand off into next-layer Y_eff sharding when G matches target_Y_eff.
-        # - NxM (both >1): not modeled yet; keep flagged.
-        rs_handoff_1d_y = (
-            tp_x == 1 and tp_yz == target_y_eff and target_x > 1 and groups_per_set == target_x
-        )
-        rs_handoff_1d_x = (
-            tp_yz == 1 and tp_x == target_x and target_y_eff > 1 and groups_per_set == target_y_eff
-        )
-        rs_handoff_ok = rs_handoff_1d_y or rs_handoff_1d_x
-
-        if rs_handoff_1d_y:
-            handoff_mode = "1xN->X"
-        elif rs_handoff_1d_x:
-            handoff_mode = "Nx1->Y_eff"
-        elif tp_x > 1 and tp_yz > 1:
-            handoff_mode = "NxM-unsupported"
-        else:
-            handoff_mode = "1D-mismatch"
-
-        if rs_handoff_ok:
+        if single_domain_decode:
+            assert proj_x_topology is not None
+            assert proj_yz_topology is not None
+            target_x = proj_x_topology.num_chips
+            target_y_eff = proj_yz_topology.num_chips
+            if target_x % tp_x != 0 or target_y_eff % tp_yz != 0:
+                raise ValueError(
+                    "Exact single-domain combine requires projection layout to be a "
+                    f"coarsening of MoE layout: projection={target_x}×{target_y_eff}, "
+                    f"MoE={tp_x}×{tp_yz}"
+                )
+            feature_groups = (target_x // tp_x) * (target_y_eff // tp_yz)
+            assert full_sets_per_attn_domain is not None
+            global_projection_replicas = attn_tp_xpus // (target_x * target_y_eff)
+            if global_projection_replicas % full_sets_per_attn_domain != 0:
+                raise ValueError(
+                    f"Global projection replicas ({global_projection_replicas}) must be "
+                    f"divisible by expert sets ({full_sets_per_attn_domain})"
+                )
+            projection_replicas = global_projection_replicas // full_sets_per_attn_domain
+            if groups_per_set != feature_groups * projection_replicas:
+                raise ValueError(
+                    f"Expert groups ({groups_per_set}) != feature groups × projection replicas "
+                    f"({feature_groups} × {projection_replicas})"
+                )
+            handoff_mode = (
+                f"exact RS(feature_groups={feature_groups}) + "
+                f"AR(projection_replicas={projection_replicas})"
+            )
             _post_combine_d_part = {
                 "D": P("sharded", ("X", "Y_eff")),
                 "B": P("replicated", ("Y",)),
             }
-            _post_combine_d_local = d_model // max(1, target_x * target_y_eff)
+            _post_combine_d_local = d_model // (target_x * target_y_eff)
             _post_combine_issue_flags: tuple[str, ...] = ()
         else:
+            target_x = tp_x
+            target_y_eff = tp_yz
+            handoff_mode = "pass-specific MoE layout"
             _post_combine_d_part = _moe_d_part
             _post_combine_d_local = _moe_d_local
-            _post_combine_issue_flags = (
-                "ISSUE: combine RS(G) handoff to next-layer X-sharded layout is not guaranteed "
-                f"(moe_tp_x={tp_x}, moe_tp_yz={tp_yz}, groups_per_set={groups_per_set}, "
-                f"target_X={target_x}, target_Y_eff={target_y_eff}, mode={handoff_mode}).",
-            )
+            _post_combine_issue_flags = ()
         num_complete_sets = moe_config.num_complete_expert_sets
         if num_complete_sets < 1:
             raise ValueError(f"num_complete_expert_sets must be > 0, got {num_complete_sets}")
-        if attn_tp_topology is None:
-            raise ValueError("TP2DMoEStrategy requires attn_tp_topology for combine-set tracing.")
         full_set_xpus = moe_config.full_expert_set_xpu_count
         if full_set_xpus <= 0:
             raise ValueError(f"full_expert_set_xpu_count must be > 0, got {full_set_xpus}")
-        attn_tp_xpus = attn_tp_topology.num_chips
-        if attn_tp_xpus <= 0:
-            raise ValueError(f"attn_tp_topology.num_chips must be > 0, got {attn_tp_xpus}")
         if attn_tp_xpus >= full_set_xpus:
             if attn_tp_xpus % full_set_xpus != 0:
                 raise ValueError(
@@ -2319,10 +2341,29 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             layout_trace.record(
                 "moe_input",
                 "Residual add + LayerNorm (same layout as output_proj)",
-                TensorRecord("x_moe", {"B": s, "D": d_model}, _proj_d_part, dtype_bytes=float_size),
+                TensorRecord(
+                    "x_moe",
+                    {"B": tokens_local, "D": d_model},
+                    _proj_d_part,
+                    dtype_bytes=float_size,
+                ),
                 note=(
                     f"actual incoming projection layout: D/({proj_x}·{proj_y}) = "
                     f"{d_model // (proj_x * proj_y)}"
+                ),
+            )
+            layout_trace.record(
+                "moe_set_token_select",
+                "Local selection of this complete expert set's token slice",
+                TensorRecord(
+                    "x_moe_set",
+                    {"B": tokens_per_set, "D": d_model},
+                    _proj_d_part,
+                    dtype_bytes=float_size,
+                ),
+                note=(
+                    f"actual: zero-communication token selection B={tokens_local} -> "
+                    f"B_set={tokens_per_set} across {num_combine_sets} Y-aligned set(s)"
                 ),
             )
         else:
@@ -2388,13 +2429,13 @@ class TP2DMoEStrategy(TensorParallelStrategy):
                 proj_x_topology=proj_x_topology,
                 proj_yz_topology=proj_yz_topology,
                 moe_yz_topology=yz_topology,
-                tokens=tokens_local,
+                tokens=tokens_per_set,
                 d_model=d_model,
                 float_size=float_size,
                 layout_trace=layout_trace,
             )
             _reconciled_d_part = (
-                {"D": P("sharded", ("Y_eff",)), "B": P("replicated", ("Y",))}
+                {"D": P("sharded", ("MoE_Y",)), "B": P("replicated", ("Y",))}
                 if tp_yz > 1
                 else {"B": P("replicated", ("Y",))}
             )
@@ -2529,7 +2570,7 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             )
         elif router_sync_mode == MoERouterSyncMode.SHARDED_ROUTER:
             _router_d_part = (
-                {"D": P("sharded", ("Y_eff",)), "B": P("replicated", ("Y",))}
+                {"D": P("sharded", ("MoE_Y",)), "B": P("replicated", ("Y",))}
                 if tp_yz > 1
                 else {"B": P("replicated", ("Y",))}
             )
@@ -2543,7 +2584,7 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             )
 
         _expert_d_part = (
-            {"D": P("sharded", ("Y_eff",)), "B": P("replicated", ("Y",))}
+            {"D": P("sharded", ("MoE_Y",)), "B": P("replicated", ("Y",))}
             if tp_yz > 1
             else {"B": P("replicated", ("Y",))}
         )
@@ -2601,7 +2642,7 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             )
 
         _dff_part = (
-            {"Dff": P("sharded", ("X",)), "B": P("replicated", ("Y",))}
+            {"Dff": P("sharded", ("MoE_X",)), "B": P("replicated", ("Y",))}
             if tp_x > 1
             else {"B": P("replicated", ("Y",))}
         )
@@ -2609,7 +2650,7 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             "after_up_proj_c1",
             "Up-proj + C1 AR(Y_eff)",
             TensorRecord("h_expert", {"B": s, "Dff": d_ff}, _dff_part, dtype_bytes=float_size),
-            note=f"actual: C1 AR(Y_eff). Dff/tp_x = {d_ff // max(1, tp_x)} (tp_x={tp_x})",
+            note=f"actual: C1 AR(TP_MoE_Y). Dff/tp_x = {d_ff // tp_x} (tp_x={tp_x})",
         )
         layout_trace.record(
             "after_down_proj_c2",
@@ -2637,7 +2678,7 @@ class TP2DMoEStrategy(TensorParallelStrategy):
                 "after_combine_cross_set",
                 f"Cross-set AG(S_attn={num_combine_sets}) → attn-domain batch",
                 TensorRecord(
-                    "moe_out_full",
+                    "moe_out_full_batch",
                     {"B": tokens_local, "D": d_model},
                     _post_combine_d_part,
                     dtype_bytes=float_size,
@@ -2652,12 +2693,12 @@ class TP2DMoEStrategy(TensorParallelStrategy):
         else:
             layout_trace.record(
                 "after_combine",
-                "MoE combine RS(G)",
+                "Exact MoE output combine",
                 TensorRecord(
                     "moe_out", {"B": s, "D": d_model}, _post_combine_d_part, dtype_bytes=float_size
                 ),
                 note=(
-                    f"actual: combine RS(G). D_local = {_post_combine_d_local} "
+                    f"actual: {handoff_mode}. D_local = {_post_combine_d_local} "
                     f"(moe_tp_x={tp_x}, moe_tp_yz={tp_yz}, target_X={target_x}, "
                     f"target_Y_eff={target_y_eff}, mode={handoff_mode})"
                 ),

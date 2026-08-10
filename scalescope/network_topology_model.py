@@ -303,6 +303,16 @@ def aux_fully_connected_gather_nd(
 # N-D topology collectives (Bps)
 
 
+def _active_collective_dimensions(view: LogicalTopology):
+    """Return dimensions that contribute real participants to an N-D collective.
+
+    A size-one dimension sends no packets. It must not create an additional
+    color or receive a fraction of the payload; otherwise an ``N x 1`` view is
+    incorrectly priced as an N-D collective instead of the equivalent 1D one.
+    """
+    return [dimension for dimension in view.dimensions if dimension.size > 1]
+
+
 def hockney_model_reduce_on_nd_topology(
     view: LogicalTopology, P_total_bytes: float, float_size_bytes: float
 ) -> CommStats:
@@ -339,18 +349,18 @@ def hockney_model_reduce_scatter_on_nd_topology(
     execution pipelines ("colors") and returning the performance of the slowest one.
 
     """
-    if not view.dimensions:
+    active_dimensions = _active_collective_dimensions(view)
+    if not active_dimensions:
         return CommStats()
-    num_colors = len(view.dimensions)
-    if num_colors == 0:
-        return CommStats()
+    num_colors = len(active_dimensions)
 
     all_pipeline_stats: List[CommStats] = []
 
     # Iterate through each possible starting dimension to model each "color" or pipeline.
     for i in range(num_colors):
-        # Create a cyclically shifted list of dimensions for this specific pipeline.
-        reordered_dims = view.dimensions[i:] + view.dimensions[:i]
+        # Only active dimensions define colors. Including a size-one dimension
+        # here would divide the payload without adding a communication path.
+        reordered_dims = active_dimensions[i:] + active_dimensions[:i]
 
         # Calculate performance for this single pipeline
         pipeline_stats = CommStats()
@@ -361,12 +371,6 @@ def hockney_model_reduce_scatter_on_nd_topology(
             d_size, alpha_sec, effective_B_Bps, gamma = view.get_hockney_model_params(
                 l_dim_map.logical_tag, float_size_bytes, context="concurrent_baseline"
             )
-            # no comm is needed
-            if d_size <= 1:
-                if d_size > 0:
-                    current_P_rs /= d_size
-                continue
-
             topo_type = view.get_physical_dimension_for_tag(l_dim_map.logical_tag).topology_type
             step_stats: CommStats
             match topo_type:
@@ -393,9 +397,12 @@ def hockney_model_reduce_scatter_on_nd_topology(
     # The operation is only as fast as its slowest pipeline.
     max_startup = max(s.startup_latency for s in all_pipeline_stats)
     max_transmission = max(s.transmission_time for s in all_pipeline_stats)
-    # Compute and volume are constant across pipelines.
+    # Colors carry disjoint payload partitions and execute concurrently. Time is
+    # therefore the slowest pipeline, while wire volume is the sum over colors.
+    # Aggregate volume cannot be divided by one bandwidth to reconstruct time
+    # when colors use different fabrics.
     total_compute = all_pipeline_stats[0].compute_time
-    total_volume = all_pipeline_stats[0].comm_vol
+    total_volume = sum(stats.comm_vol for stats in all_pipeline_stats)
 
     max_phase_count = max(s.startup_phase_count for s in all_pipeline_stats)
     return CommStats(max_startup, max_transmission, total_volume, total_compute, max_phase_count)
@@ -408,18 +415,17 @@ def hockney_model_all_gather_on_nd_topology(
     Calculates AllGather time on an N-D topology by modeling all possible
     execution pipelines ("colors") and returning the performance of the slowest one.
     """
-    if not view.dimensions:
+    active_dimensions = _active_collective_dimensions(view)
+    if not active_dimensions:
         return CommStats()
-    num_colors = len(view.dimensions)
-    if num_colors == 0:
-        return CommStats()
+    num_colors = len(active_dimensions)
 
     all_pipeline_stats: List[CommStats] = []
 
     # Iterate through each possible starting dimension to model each "color" or pipeline.
     for i in range(num_colors):
-        # Create a cyclically shifted list of dimensions for this specific pipeline.
-        reordered_dims = view.dimensions[i:] + view.dimensions[:i]
+        # Degenerate axes are not colors and must not receive payload.
+        reordered_dims = active_dimensions[i:] + active_dimensions[:i]
 
         # Calculate performance for this single pipeline
         pipeline_stats = CommStats()
@@ -436,10 +442,6 @@ def hockney_model_all_gather_on_nd_topology(
 
             if d_size > 0:
                 current_P_ag *= d_size
-
-            # no comm is needed
-            if d_size <= 1:
-                continue
 
             topo_type = view.get_physical_dimension_for_tag(l_dim_map.logical_tag).topology_type
             step_stats: CommStats
@@ -466,8 +468,9 @@ def hockney_model_all_gather_on_nd_topology(
     # The operation is only as fast as its slowest pipeline.
     max_startup = max(s.startup_latency for s in all_pipeline_stats)
     max_transmission = max(s.transmission_time for s in all_pipeline_stats)
-    # Volume is constant across pipelines. All-Gather has no compute time.
-    total_volume = all_pipeline_stats[0].comm_vol
+    # Each color gathers a disjoint payload partition. Preserve critical-path
+    # timing above, but report aggregate per-rank wire traffic across colors.
+    total_volume = sum(stats.comm_vol for stats in all_pipeline_stats)
 
     max_phase_count = max(s.startup_phase_count for s in all_pipeline_stats)
     return CommStats(
@@ -497,16 +500,17 @@ def hockney_model_gather_on_nd_topology(
         root_rx_bytes = (d_size - 1) / d_size * P_dim_after_gather_bytes
       and divide by the fixed per-node bandwidth budget for that dimension.
     """
-    if not view.dimensions:
+    active_dimensions = _active_collective_dimensions(view)
+    if not active_dimensions:
         return CommStats()
-    num_colors = len(view.dimensions)
-    if num_colors == 0:
-        return CommStats()
+    num_colors = len(active_dimensions)
 
     all_pipeline_stats: List[CommStats] = []
 
     for i in range(num_colors):
-        reordered_dims = view.dimensions[i:] + view.dimensions[:i]
+        # Match RS/AG semantics: a size-one axis neither communicates nor
+        # creates a separate color.
+        reordered_dims = active_dimensions[i:] + active_dimensions[:i]
         pipeline_stats = CommStats()
 
         # Start from the per-rank shard size (per color), then expand as we gather.
@@ -524,9 +528,6 @@ def hockney_model_gather_on_nd_topology(
 
             if d_size > 0:
                 current_P_gather *= d_size
-            if d_size <= 1:
-                continue
-
             topo_type = view.get_physical_dimension_for_tag(l_dim_map.logical_tag).topology_type
             step_stats: CommStats
             match topo_type:
@@ -547,7 +548,9 @@ def hockney_model_gather_on_nd_topology(
 
     max_startup = max(s.startup_latency for s in all_pipeline_stats)
     max_transmission = max(s.transmission_time for s in all_pipeline_stats)
-    total_volume = all_pipeline_stats[0].comm_vol
+    # Gather colors carry disjoint payload partitions, so their wire bytes add
+    # even though their execution time overlaps.
+    total_volume = sum(stats.comm_vol for stats in all_pipeline_stats)
     max_phase_count = max(s.startup_phase_count for s in all_pipeline_stats)
     return CommStats(
         startup_latency=max_startup,

@@ -47,11 +47,9 @@ _COMM_STAGE_DISPLAY_NAMES: Dict[str, str] = {
     "moe_router_ar": "MoE router-logit all-reduce",
     "moe_c1_ar_yz": "MoE up-projection C1 all-reduce",
     "moe_c2_rs_x": "MoE down-projection C2 reduce-scatter",
-    "combine_rs_g": "MoE expert-group combine",
+    "combine_rs_exact_groups": "MoE exact feature-group combine",
+    "combine_ar_projection_replicas": "MoE projection-replica synchronization",
     "combine_ag_cross_set": "MoE cross-set batch all-gather",
-    "combine_ag_u": "MoE projection-replica all-gather",
-    "combine_remap_ag_x": "MoE output remap all-gather (X)",
-    "combine_remap_rs_x": "MoE output remap reduce-scatter (X)",
 }
 
 _LAYOUT_STAGE_DISPLAY_NAMES: Dict[str, str] = {
@@ -65,6 +63,7 @@ _LAYOUT_STAGE_DISPLAY_NAMES: Dict[str, str] = {
     "after_output_proj": "After output projection",
     "moe_input": "MoE input in projection layout",
     "moe_input_reconciled": "MoE input after layout reconciliation",
+    "moe_set_token_select": "MoE local expert-set token selection",
     "router_input": "MoE router input",
     "decode_dispatch": "MoE routed-token dispatch",
     "expert_input": "MoE expert input",
@@ -290,7 +289,7 @@ class LayoutTrace:
     # ---- shape verification ----
 
     def verify_layer_boundary(self) -> List[str]:
-        """Check that layer_input and layer_output have compatible layouts."""
+        """Check exact layer-input/output shape and partition identity."""
         issues: List[str] = []
         try:
             inp = self.find("layer_input", "x")
@@ -298,14 +297,34 @@ class LayoutTrace:
         except KeyError:
             return ["layer_input or layer_output not found in trace"]
 
+        if inp.tensor.global_shape != out.tensor.global_shape:
+            issues.append(
+                f"MISMATCH: layer_input global={inp.tensor.global_shape} != "
+                f"layer_output global={out.tensor.global_shape}"
+            )
+
+        for axis in sorted(set(inp.tensor.partitions) | set(out.tensor.partitions)):
+            inp_partition = self._effective_partition(inp.tensor.partitions.get(axis), self.mesh)
+            out_partition = self._effective_partition(out.tensor.partitions.get(axis), self.mesh)
+            if inp_partition != out_partition:
+                issues.append(
+                    f"MISMATCH: axis '{axis}' layer_input={inp.tensor.partitions.get(axis)} != "
+                    f"layer_output={out.tensor.partitions.get(axis)}"
+                )
+
         inp_shape = inp.tensor.per_rank_shape(self.mesh)
         out_shape = out.tensor.per_rank_shape(self.mesh)
         if inp_shape != out_shape:
             issues.append(
-                f"MISMATCH: layer_input per_rank={inp_shape} != "
-                f"layer_output per_rank={out_shape}"
+                f"MISMATCH: layer_input per_rank={inp_shape} != layer_output per_rank={out_shape}"
             )
         return issues
+
+    def assert_layer_boundary(self) -> None:
+        """Fail when a trace does not close onto the next layer's input layout."""
+        issues = self.verify_layer_boundary()
+        if issues:
+            raise ValueError("Decode layout trace does not close: " + "; ".join(issues))
 
     def collect_flags(self) -> List[Tuple[str, str, str]]:
         """Return all (stage, tensor, flag) triples for review."""
@@ -339,7 +358,10 @@ class LayoutTrace:
         Global shape is compared only for sharded axes so that batch-dimension
         mismatches (replicated/partial) don't produce false positives.
         """
-        diffs: List[str] = []
+        diffs: List[str] = [
+            *(f"Actual trace boundary: {issue}" for issue in self.verify_layer_boundary()),
+            *(f"Expected trace boundary: {issue}" for issue in expected.verify_layer_boundary()),
+        ]
 
         exp_stages = expected.stages()
         act_stages = self.stages()
@@ -639,15 +661,28 @@ def build_decode_2dtp_mesh(
     g: int,
     n_experts: int,
     c: int,
+    moe_tp_x: int,
+    moe_tp_yz: int,
+    full_expert_sets_per_attn_domain: int,
 ) -> Mesh:
     y_eff = tp_y // g
     G = -(-n_experts // c)
+    if g % full_expert_sets_per_attn_domain != 0:
+        raise ValueError(
+            f"projection groups ({g}) must be divisible by expert sets "
+            f"({full_expert_sets_per_attn_domain})"
+        )
     return Mesh(
         dims=(
             MeshDim("X", tp_x),
             MeshDim("Y", tp_y),
             MeshDim("Y_eff", y_eff),
             MeshDim("G", G),
+            MeshDim("MoE_X", moe_tp_x),
+            MeshDim("MoE_Y", moe_tp_yz),
+            MeshDim("U", g),
+            MeshDim("Set_Y", full_expert_sets_per_attn_domain),
+            MeshDim("U_set", g // full_expert_sets_per_attn_domain),
         )
     )
 
@@ -874,19 +909,42 @@ def _trace_moe_stages(
     dtype_bytes: int,
     attn_domains_per_full_expert_set: int,
     full_expert_sets_per_attn_domain: int,
-    moe_tp_x: int | None = None,
-    moe_tp_yz: int | None = None,
+    moe_tp_x: int,
+    moe_tp_yz: int,
 ) -> None:
     y_eff = tp_y // g
     G = -(-n_experts // c)
+    if full_expert_sets_per_attn_domain <= 0:
+        raise ValueError(
+            "full_expert_sets_per_attn_domain must be > 0, got "
+            f"{full_expert_sets_per_attn_domain}"
+        )
+    if s % full_expert_sets_per_attn_domain != 0:
+        raise ValueError(
+            f"attention-domain tokens ({s}) must be divisible by expert sets "
+            f"({full_expert_sets_per_attn_domain})"
+        )
+    set_tokens = s // full_expert_sets_per_attn_domain
+    if g % full_expert_sets_per_attn_domain != 0:
+        raise ValueError(
+            f"projection groups ({g}) must be divisible by expert sets "
+            f"({full_expert_sets_per_attn_domain})"
+        )
+    replicas_per_set = g // full_expert_sets_per_attn_domain
 
-    _moe_tp_x = moe_tp_x if moe_tp_x is not None else tp_x
-    _moe_tp_yz = moe_tp_yz if moe_tp_yz is not None else (tp_y // g)
     _moe_d_mesh_dims: Tuple[str, ...] = tuple(
-        d for d, size in (("X", _moe_tp_x), ("Y_eff", _moe_tp_yz)) if size > 1
+        d for d, size in (("MoE_X", moe_tp_x), ("MoE_Y", moe_tp_yz)) if size > 1
     )
-    _rs_handoff_to_attn_x = _moe_tp_x == 1 and tp_x > 1 and G == tp_x and _moe_tp_yz == y_eff
-    _rs_handoff_to_attn_y_eff = _moe_tp_yz == 1 and _moe_tp_x == tp_x and y_eff > 1 and G == y_eff
+    if tp_x % moe_tp_x != 0:
+        raise ValueError(f"TP_Proj_X ({tp_x}) must be divisible by TP_MoE_X ({moe_tp_x})")
+    if y_eff % moe_tp_yz != 0:
+        raise ValueError(f"TP_Proj_Y_eff ({y_eff}) must be divisible by TP_MoE_Y ({moe_tp_yz})")
+    feature_group_count = (tp_x // moe_tp_x) * (y_eff // moe_tp_yz)
+    if G != feature_group_count * replicas_per_set:
+        raise ValueError(
+            f"Expert groups ({G}) must equal feature groups × per-set projection replicas "
+            f"({feature_group_count} × {replicas_per_set})"
+        )
 
     # Stage 5: incoming MoE input keeps the output-projection RS(X) layout.
     trace.record(
@@ -903,15 +961,32 @@ def _trace_moe_stages(
         ),
         note=f"output-projection layout: D/(X·Y_eff) = {d_model // (tp_x * y_eff)}",
     )
+    trace.record(
+        "moe_set_token_select",
+        "Local selection of the token slice assigned to this complete expert set",
+        TensorRecord(
+            name="x_moe_set",
+            global_shape={"B": set_tokens, "D": d_model},
+            partitions={
+                "D": P("sharded", ("X", "Y_eff")),
+                "B": P("replicated", ("Y",)),
+            },
+            dtype_bytes=dtype_bytes,
+        ),
+        note=(
+            f"local zero-communication selection: B={s} -> "
+            f"B_set={set_tokens} across {full_expert_sets_per_attn_domain} Y-aligned set(s)"
+        ),
+    )
 
     # The consumer completes RS+AG over projection X using all tokens, then
     # reconciles projection Y_eff with TP_MoE_Y.
-    _reconciled_partitions = {"D": P("sharded", ("Y_eff",))} if _moe_tp_yz > 1 else {}
-    if y_eff == _moe_tp_yz:
+    _reconciled_partitions = {"D": P("sharded", ("MoE_Y",))} if moe_tp_yz > 1 else {}
+    if y_eff == moe_tp_yz:
         y_reconcile_note = "Y_eff already equals TP_MoE_Y; no Y collective"
         y_reconcile_flags: Tuple[str, ...] = ()
-    elif y_eff > _moe_tp_yz:
-        y_reconcile_note = f"AG(Y quotient={y_eff // _moe_tp_yz})"
+    elif y_eff > moe_tp_yz:
+        y_reconcile_note = f"AG(Y quotient={y_eff // moe_tp_yz})"
         y_reconcile_flags = (
             "MODEL_LIMITATION: projection-Y quotient gathers assume aligned disjoint "
             "subgroups execute concurrently; cross-subgroup fabric contention is not modeled.",
@@ -919,14 +994,14 @@ def _trace_moe_stages(
     else:
         raise ValueError(
             "Projection-to-MoE Y refinement is unsupported without explicit projection-replica "
-            f"metadata: TP_Proj_Y_eff={y_eff}, TP_MoE_Y={_moe_tp_yz}."
+            f"metadata: TP_Proj_Y_eff={y_eff}, TP_MoE_Y={moe_tp_yz}."
         )
     trace.record(
         "moe_input_reconciled",
         "After all-token AG(TP_Proj_X) and Y reconciliation",
         TensorRecord(
             name="x_moe_reconciled",
-            global_shape={"B": s, "D": d_model},
+            global_shape={"B": set_tokens, "D": d_model},
             partitions={
                 **_reconciled_partitions,
                 "B": P("replicated", ("Y",)),
@@ -935,7 +1010,7 @@ def _trace_moe_stages(
         ),
         note=(
             f"comm: AG(TP_Proj_X={tp_x}); {y_reconcile_note}. "
-            f"D/TP_MoE_Y = {d_model // _moe_tp_yz}"
+            f"D/TP_MoE_Y = {d_model // moe_tp_yz}"
         ),
         flags=y_reconcile_flags,
     )
@@ -947,7 +1022,7 @@ def _trace_moe_stages(
             "Replicated router: needs full D for W_gate matmul",
             TensorRecord(
                 name="x_router",
-                global_shape={"B": s, "D": d_model},
+                global_shape={"B": set_tokens, "D": d_model},
                 partitions={
                     "D": P("replicated"),
                     "B": P("replicated", ("Y",)),
@@ -960,13 +1035,13 @@ def _trace_moe_stages(
             ),
         )
     else:
-        _router_d_partitions = {"D": P("sharded", ("Y_eff",))} if _moe_tp_yz > 1 else {}
+        _router_d_partitions = {"D": P("sharded", ("MoE_Y",))} if moe_tp_yz > 1 else {}
         trace.record(
             "router_input",
             "Sharded router: AG(X) then partial logits + AR sync",
             TensorRecord(
                 name="x_router",
-                global_shape={"B": s, "D": d_model},
+                global_shape={"B": set_tokens, "D": d_model},
                 partitions={
                     **_router_d_partitions,
                     "B": P("replicated", ("Y",)),
@@ -974,7 +1049,7 @@ def _trace_moe_stages(
                 dtype_bytes=dtype_bytes,
             ),
             note=(
-                f"comm: AG(X) → D/Y_eff = {d_model // _moe_tp_yz}. "
+                f"comm: AG(X) → D/TP_MoE_Y = {d_model // moe_tp_yz}. "
                 "Router uses W_gate[D/Y_eff, E] → partial logits → Phase B AR."
             ),
         )
@@ -988,14 +1063,14 @@ def _trace_moe_stages(
     # the dispatch is free (tokens already colocated with their expert) and this
     # stage is suppressed.
     if attn_domains_per_full_expert_set > 1:
-        _dispatch_d_partitions = {"D": P("sharded", ("Y_eff",))} if _moe_tp_yz > 1 else {}
+        _dispatch_d_partitions = {"D": P("sharded", ("MoE_Y",))} if moe_tp_yz > 1 else {}
         trace.record(
             "decode_dispatch",
             "Cross-attention-domain dispatch A2A on EP_SU "
             "(attn_domains_per_full_expert_set > 1)",
             TensorRecord(
                 name="x_dispatched",
-                global_shape={"B": s, "D": d_model},
+                global_shape={"B": set_tokens, "D": d_model},
                 partitions={
                     **_dispatch_d_partitions,
                     "B": P("replicated", ("Y",)),
@@ -1005,7 +1080,7 @@ def _trace_moe_stages(
             note=(
                 f"comm: A2A across attn_domains_per_full_expert_set="
                 f"{attn_domains_per_full_expert_set} feeder domains. "
-                f"Per-token payload = d_model/Y_eff = {d_model // _moe_tp_yz} bytes/elem. "
+                f"Per-token payload = d_model/TP_MoE_Y = {d_model // moe_tp_yz} bytes/elem. "
                 "Single-fabric on EP_SU when full_expert_set_xpu_count <= scale_up_domain_size; "
                 "spills to EP_SO otherwise (cross-rack, not yet modeled)."
             ),
@@ -1016,7 +1091,7 @@ def _trace_moe_stages(
         )
 
     # Stage 7: expert input
-    _expert_d_partitions = {"D": P("sharded", ("Y_eff",))} if _moe_tp_yz > 1 else {}
+    _expert_d_partitions = {"D": P("sharded", ("MoE_Y",))} if moe_tp_yz > 1 else {}
     if attn_domains_per_full_expert_set > 1:
         expert_input_desc = (
             "Expert input (post-dispatch: tokens arrived from "
@@ -1032,7 +1107,7 @@ def _trace_moe_stages(
         expert_input_desc,
         TensorRecord(
             name="x_expert",
-            global_shape={"B": s, "D": d_model},
+            global_shape={"B": set_tokens, "D": d_model},
             partitions={
                 **_expert_d_partitions,
                 "B": P("replicated", ("Y",)),
@@ -1040,8 +1115,8 @@ def _trace_moe_stages(
             dtype_bytes=dtype_bytes,
         ),
         note=(
-            f"D/TP_MoE_Y = {d_model // _moe_tp_yz}. "
-            f"W_up: [D/Y, Dff/X] = [{d_model // _moe_tp_yz}, {d_ff // _moe_tp_x}]"
+            f"D/TP_MoE_Y = {d_model // moe_tp_yz}. "
+            f"W_up: [D/Y, Dff/X] = [{d_model // moe_tp_yz}, {d_ff // moe_tp_x}]"
         ),
     )
 
@@ -1051,16 +1126,16 @@ def _trace_moe_stages(
         "Up-proj matmul + C1 AR(TP_MoE_Y)",
         TensorRecord(
             name="h_expert",
-            global_shape={"B": s, "Dff": d_ff},
+            global_shape={"B": set_tokens, "Dff": d_ff},
             partitions={
-                **({"Dff": P("sharded", ("X",))} if _moe_tp_x > 1 else {}),
+                **({"Dff": P("sharded", ("MoE_X",))} if moe_tp_x > 1 else {}),
                 "B": P("replicated", ("Y",)),
             },
             dtype_bytes=dtype_bytes,
         ),
         note=(
-            f"comm: C1 AR(TP_MoE_Y={_moe_tp_yz}); no-op iff TP_MoE_Y=1. "
-            f"Dff/X = {d_ff // _moe_tp_x}."
+            f"comm: C1 AR(TP_MoE_Y={moe_tp_yz}); no-op iff TP_MoE_Y=1. "
+            f"Dff/TP_MoE_X = {d_ff // moe_tp_x}."
         ),
     )
 
@@ -1070,7 +1145,7 @@ def _trace_moe_stages(
         "Activation + down-proj + C2 RS(TP_MoE_X)",
         TensorRecord(
             name="y_expert",
-            global_shape={"B": s, "D": d_model},
+            global_shape={"B": set_tokens, "D": d_model},
             partitions={
                 **({"D": P("sharded", _moe_d_mesh_dims)} if _moe_d_mesh_dims else {}),
                 "B": P("replicated", ("Y",)),
@@ -1078,55 +1153,61 @@ def _trace_moe_stages(
             dtype_bytes=dtype_bytes,
         ),
         note=(
-            f"comm: C2 RS(TP_MoE_X={_moe_tp_x}); no-op iff TP_MoE_X=1. "
-            f"D/(X·Y) = {d_model // (_moe_tp_x * _moe_tp_yz)}."
+            f"comm: C2 RS(TP_MoE_X={moe_tp_x}); no-op iff TP_MoE_X=1. "
+            f"D/(TP_MoE_X·TP_MoE_Y) = {d_model // (moe_tp_x * moe_tp_yz)}."
         ),
     )
 
     # Stage 10: after combine
-    if G == 1:
-        combine_note = "ZERO — G=1, all experts local, combine is free local add before C2"
-        combine_flags: Tuple[str, ...] = ()
-    else:
-        remote_frac = (G - 1) / G
-        combine_note = (
-            f"comm: per-token reduce across G={G} groups on Y. "
-            f"≈{G-1}/{G} = {remote_frac:.3f} of tokens need cross-group reduce."
+    combine_ops: List[str] = []
+    if feature_group_count > 1:
+        combine_ops.append(
+            f"exact ND RS over feature quotient={feature_group_count} "
+            f"(({tp_x}/{moe_tp_x})×({y_eff}/{moe_tp_yz}))"
         )
-        combine_flags = ()
-
-    _post_combine_d_dims: Tuple[str, ...]
-    if _rs_handoff_to_attn_x or _rs_handoff_to_attn_y_eff:
-        _post_combine_d_dims = ("X", "Y_eff")
-    else:
-        _post_combine_d_dims = _moe_d_mesh_dims
+    if replicas_per_set > 1:
+        combine_ops.append(f"AR over U_set={replicas_per_set} projection replicas per set")
+    combine_note = "comm: " + "; ".join(combine_ops) if combine_ops else "ZERO — identity combine"
+    _post_combine_d_dims = ("X", "Y_eff")
 
     trace.record(
         "after_combine",
         "MoE combine (aggregate expert outputs per token)",
         TensorRecord(
             name="moe_out",
-            global_shape={"B": s, "D": d_model},
+            global_shape={"B": set_tokens, "D": d_model},
             partitions={
                 **({"D": P("sharded", _post_combine_d_dims)} if _post_combine_d_dims else {}),
                 "B": P("replicated", ("Y",)),
             },
             dtype_bytes=dtype_bytes,
         ),
-        note=(
-            combine_note
-            + (
-                f" RS handoff to attn-X enabled: D/(X·Y_eff) = {d_model // (tp_x * y_eff)}."
-                if _rs_handoff_to_attn_x
-                else (
-                    f" RS handoff to attn-Y_eff enabled: D/(X·Y_eff) = {d_model // (tp_x * y_eff)}."
-                    if _rs_handoff_to_attn_y_eff
-                    else ""
-                )
-            )
-        ),
-        flags=combine_flags,
+        note=combine_note + f". Output D/(X·Y_eff) = {d_model // (tp_x * y_eff)}.",
     )
+
+    if full_expert_sets_per_attn_domain > 1:
+        trace.record(
+            "after_combine_cross_set",
+            "Cross-set batch all-gather on Set_Y",
+            TensorRecord(
+                name="moe_out_full_batch",
+                global_shape={"B": s, "D": d_model},
+                partitions={
+                    "D": P("sharded", _post_combine_d_dims),
+                    "B": P("replicated", ("Y",)),
+                },
+                dtype_bytes=dtype_bytes,
+            ),
+            note=(
+                f"comm: AG(Set_Y={full_expert_sets_per_attn_domain}) gathers disjoint "
+                f"B_set={set_tokens} slices to B={s}; {replicas_per_set} aligned "
+                "subgroup(s) execute concurrently."
+            ),
+            flags=(
+                "MODEL_LIMITATION: concurrent cross-set AG subgroups assume no "
+                "cross-subgroup fabric contention.",
+            ),
+        )
 
     # Cross-attention-domain combine A2A (return leg of decode_dispatch).
     # Symmetric counterpart to decode_dispatch: ships expert outputs back to
@@ -1142,7 +1223,7 @@ def _trace_moe_stages(
             "Cross-attention-domain combine A2A on EP_SU " "(return leg of decode_dispatch)",
             TensorRecord(
                 name="moe_out_returned",
-                global_shape={"B": s, "D": d_model},
+                global_shape={"B": set_tokens, "D": d_model},
                 partitions={
                     **({"D": P("sharded", _post_combine_d_dims)} if _post_combine_d_dims else {}),
                     "B": P("replicated", ("Y",)),
@@ -1173,11 +1254,7 @@ def _trace_moe_stages(
             },
             dtype_bytes=dtype_bytes,
         ),
-        note=(
-            f"D/({'X·Y_eff' if (_rs_handoff_to_attn_x or _rs_handoff_to_attn_y_eff) else 'moe_tp_x·moe_tp_yz'}) = "
-            f"{(d_model // (tp_x * y_eff)) if (_rs_handoff_to_attn_x or _rs_handoff_to_attn_y_eff) else (d_model // (_moe_tp_x * _moe_tp_yz))}. "
-            "Must match layer_input."
-        ),
+        note=(f"D/(X·Y_eff) = {d_model // (tp_x * y_eff)}. " "Must match layer_input."),
     )
 
 
@@ -1202,12 +1279,12 @@ def build_decode_2dtp_trace(
     attn_domains_per_full_expert_set: int,
     full_expert_sets_per_attn_domain: int,
     attention_layers: list[AttentionLayerClass],
+    moe_tp_x: int,
+    moe_tp_yz: int,
+    batch_tokens: int,
     router_mode: str = "sharded",
-    s: int = 1,
     dtype_bytes: int = 2,
     context_len: int = 1,
-    moe_tp_x: int | None = None,
-    moe_tp_yz: int | None = None,
 ) -> LayoutTrace:
     """Build the complete decode pipeline layout trace for one 2D TP layer.
 
@@ -1233,19 +1310,28 @@ def build_decode_2dtp_trace(
         > 1 keeps the cross-set AG path (the existing "S_attn > 1" regime).
         At most one of these two ratios is > 1 at a time.
     router_mode : "replicated" or "sharded"
-    s : sequence length (1 for decode)
+    batch_tokens : number of decode tokens in the attention domain
     dtype_bytes : bytes per element (default 2 for bf16/fp16)
     context_len : KV-cache context length (prefill_seq_len)
     attention_layers : the model's attention layer classes (from
         `attention_layer_classes(transformer_config)`); KV-dependent stages
         are emitted once per class
-    moe_tp_x : MoE X-axis TP degree (defaults to tp_x if None)
-    moe_tp_yz : MoE YZ-axis TP degree (defaults to tp_y//g if None)
+    moe_tp_x : explicit MoE X-axis TP degree
+    moe_tp_yz : explicit MoE YZ-axis TP degree
     """
     if tp_y % g != 0:
         raise ValueError(f"tp_y ({tp_y}) must be divisible by g ({g})")
 
-    mesh = build_decode_2dtp_mesh(tp_x, tp_y, g, n_experts, c)
+    mesh = build_decode_2dtp_mesh(
+        tp_x,
+        tp_y,
+        g,
+        n_experts,
+        c,
+        moe_tp_x,
+        moe_tp_yz,
+        full_expert_sets_per_attn_domain,
+    )
     trace = LayoutTrace(mesh=mesh)
 
     _trace_attention_stages(
@@ -1257,7 +1343,7 @@ def build_decode_2dtp_trace(
         tp_x=tp_x,
         tp_y=tp_y,
         g=g,
-        s=s,
+        s=batch_tokens,
         dtype_bytes=dtype_bytes,
         attention_layers=attention_layers,
         context_len=context_len,
@@ -1273,7 +1359,7 @@ def build_decode_2dtp_trace(
         g=g,
         c=c,
         router_mode=router_mode,
-        s=s,
+        s=batch_tokens,
         dtype_bytes=dtype_bytes,
         attn_domains_per_full_expert_set=attn_domains_per_full_expert_set,
         full_expert_sets_per_attn_domain=full_expert_sets_per_attn_domain,
@@ -1281,4 +1367,5 @@ def build_decode_2dtp_trace(
         moe_tp_yz=moe_tp_yz,
     )
 
+    trace.assert_layer_boundary()
     return trace

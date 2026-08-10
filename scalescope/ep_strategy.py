@@ -5,16 +5,18 @@ expert collocation and parallelization strategies.
 """
 
 from dataclasses import dataclass
-from math import ceil
+from math import ceil, gcd
 
 from scalescope.decode_layout_trace import NULL_LAYOUT_TRACE
 from scalescope.model_spec import TransformerConfig
 from scalescope.network_topology_model import (
     hockney_model_all_gather_on_nd_topology,
+    hockney_model_all_reduce_on_nd_topology,
     hockney_model_reduce_scatter_on_nd_topology,
     hockney_model_total_exchange_on_nd_topology,
 )
 from scalescope.stats import CommStats
+from scalescope.topology_spec import LogicalTopology, LogicalTopologyView
 from scalescope.workload_spec import (
     ExpertRoutingDistribution,
     MoEA2ACommMode,
@@ -65,6 +67,110 @@ class ExpertXPUPlacement:
     # - ON: send tokens (or token shards) to an expert shard first, then run all-gather
     #   so that shard is available across the expert TP shards.
     tp_moe_a2a_replication_optimization_enabled: bool = True
+
+
+def _logical_tag_string(tag) -> str:
+    """Return the stable string identifier for an enum-backed or plain logical tag."""
+    return tag.value if hasattr(tag, "value") else str(tag)
+
+
+def _physical_axis_sizes(view: LogicalTopology) -> dict[str, int]:
+    """Return each physical axis's aggregate logical extent in ``view``.
+
+    Multiple logical dimensions may form a Cartesian factorization of one
+    physical domain. Their sizes are multiplied so layout comparisons operate
+    on physical rank ownership rather than individual logical tag names.
+    """
+    sizes: dict[str, int] = {}
+    for dimension in view.dimensions:
+        physical_name = dimension.maps_to_physical_dimension_name
+        if physical_name in sizes:
+            sizes[physical_name] *= dimension.size
+        else:
+            sizes[physical_name] = dimension.size
+    return sizes
+
+
+def _merge_logical_views(
+    *,
+    first_view: LogicalTopology,
+    second_view: LogicalTopology,
+    view_name: str,
+) -> LogicalTopologyView:
+    """Merge two disjoint logical views over the same physical topology.
+
+    The merged view preserves both dimension lists and uses concurrent
+    bandwidth sharing. Duplicate logical tags are rejected because they would
+    make participant extents and subsequent quotient calculations ambiguous.
+    """
+    if first_view.physical_topology is not second_view.physical_topology:
+        raise ValueError(f"{view_name}: views must reference the same physical topology object")
+
+    dimensions = [*first_view.dimensions, *second_view.dimensions]
+    tags = [_logical_tag_string(dimension.logical_tag) for dimension in dimensions]
+    if len(tags) != len(set(tags)):
+        raise ValueError(f"{view_name}: duplicate logical tags are not allowed: {tags}")
+
+    original_topology_ref = getattr(first_view, "original_topology_ref", first_view)
+
+    return LogicalTopologyView(
+        name=view_name,
+        physical_topology=first_view.physical_topology,
+        dimensions=dimensions,
+        original_topology_ref=original_topology_ref,
+        global_sharing_context="concurrent_baseline",
+    )
+
+
+def _exact_layout_quotient_view(
+    *,
+    numerator_view: LogicalTopology,
+    denominator_view: LogicalTopology,
+    view_name: str,
+) -> LogicalTopologyView:
+    """Build the exact participant quotient from two axis-aligned layouts.
+
+    Numerator and denominator must cover the same physical axes, and every
+    numerator extent must be divisible by its denominator extent. The physical
+    quotient is then factored back through the numerator's logical dimensions
+    in their existing order, producing a resized view suitable for pricing the
+    collective that reconciles the two layouts. Unsupported refinements or
+    residual unmapped factors fail explicitly.
+    """
+    numerator_sizes = _physical_axis_sizes(numerator_view)
+    denominator_sizes = _physical_axis_sizes(denominator_view)
+    numerator_physical_names = set(numerator_sizes)
+    denominator_physical_names = set(denominator_sizes)
+    if numerator_physical_names != denominator_physical_names:
+        raise ValueError(
+            f"{view_name}: numerator and denominator must map the same physical dimensions; "
+            f"numerator={sorted(numerator_physical_names)}, "
+            f"denominator={sorted(denominator_physical_names)}"
+        )
+
+    quotient_by_physical: dict[str, int] = {}
+    for physical_name in numerator_physical_names:
+        numerator_size = numerator_sizes[physical_name]
+        denominator_size = denominator_sizes[physical_name]
+        if numerator_size % denominator_size != 0:
+            raise ValueError(
+                f"{view_name}: non-divisible physical extent on {physical_name}: "
+                f"{numerator_size} / {denominator_size}"
+            )
+        quotient_by_physical[physical_name] = numerator_size // denominator_size
+
+    new_sizes: dict[str, int] = {}
+    remaining = dict(quotient_by_physical)
+    for dimension in numerator_view.dimensions:
+        physical_name = dimension.maps_to_physical_dimension_name
+        factor = gcd(remaining[physical_name], dimension.size)
+        new_sizes[_logical_tag_string(dimension.logical_tag)] = factor
+        remaining[physical_name] //= factor
+
+    if any(size != 1 for size in remaining.values()):
+        raise ValueError(f"{view_name}: quotient has unmapped physical extents: {remaining}")
+
+    return numerator_view.create_resized_view(view_name=view_name, new_sizes=new_sizes)
 
 
 def _resolve_attn_expert_size_ratio(
@@ -680,379 +786,316 @@ def calculate_moe_combine_decode(
     ep_topology_view,
     transformer_config: TransformerConfig,
     moe_config,
-    num_global_batch_tokens: int,
+    num_attention_domain_tokens: int,
     attn_tp_xpus: int,
     float_size: int,
     tp_moe_x_shards: int,
     tp_moe_y_shards: int,
     projection_groups: int,
+    attn_x_topology: LogicalTopology,
+    attn_yz_topology: LogicalTopology,
+    proj_x_topology: LogicalTopology,
+    proj_yz_topology: LogicalTopology,
+    moe_x_topology: LogicalTopology,
+    moe_yz_topology: LogicalTopology,
+    expert_set_topology: LogicalTopology | None,
     layout_trace=NULL_LAYOUT_TRACE,
 ) -> CommStats:
-    """Single-attention-domain decode combine: per-layer reduce-scatter
-    across the colocated expert groups within one expert set.
+    """Combine decode-time expert outputs inside one attention domain.
 
-    Used only when ``attn_domains_per_full_expert_set == 1`` (each expert set
-    is contained in exactly one attention TP domain, so dispatch is free and
-    only the combine needs to be modeled). Multi-attention-domain decode goes
-    through the symmetric A2A path in ``comm_model.py`` instead.
+    This path is used only when
+    ``attn_domains_per_full_expert_set == 1``: every complete expert set is
+    contained in one attention TP domain. The preceding projection-to-MoE
+    handoff makes that domain's tokens available to its expert ranks, so there
+    is no routed-token A2A dispatch here. Decode placements where one expert
+    set is fed by multiple attention domains use the symmetric dispatch/combine
+    A2A path in ``comm_model.py`` instead.
 
-    Returns **per-layer** comm stats; the caller is responsible for
-    multiplying by ``num_layers_per_pp_stage`` (consistent with the TP
-    strategy pattern in ``comm_model.py``).
+    The function returns **per-layer** communication statistics. The caller
+    multiplies the result by ``num_layers_per_pp_stage``, matching the TP
+    strategy convention in ``comm_model.py``.
 
-    The combine is a reduce-scatter **along G** (matching ranks across groups).
-    There are tp_x × Y_eff ranks per group; each (X, Y_eff) position has one
-    independent reduce-scatter with G participants.
+    Definitions used below:
 
-    Each rank holds a dense output buffer of shape [B, D_local] where
-    D_local = d_model / xpus_per_group.  After expert processing, entries
-    for tokens not routed to this group's experts are zero.
+    - ``B_set = B_attention_domain / S`` is the dense token count processed by
+      one of the ``S`` complete expert sets inside this attention domain.
+    - ``D_expert = d_model / (TP_MoE_X * TP_MoE_Y)`` is one expert rank's
+      output feature shard.
+    - ``D_residual = d_model / (TP_Proj_X * TP_Proj_Y_eff)`` is the residual
+      stream feature shard required on one rank by the next layer.
+    - ``U = TP_Attn_Y / TP_Proj_Y_eff`` is the global projection-replica
+      count. With ``S`` expert sets in one attention domain, each set owns
+      ``U_set = U / S`` aligned replicas. Thus ``U == S`` means
+      ``U_set == 1`` and no replica all-reduce is needed.
 
-    1. **Reduce** — tokens whose top_k experts span multiple groups have
-       partial weighted sums in each contributing group; RS reduces them.
-    2. **Scatter/Handoff** — RS also shards outputs across participants,
-       which can align with next-layer X sharding when group↔X mapping matches.
+    Each colocated expert group first sums the weighted outputs of its local
+    top-k experts into a dense ``[B_set, D_expert]`` buffer. Entries for tokens
+    not routed to that group are zero. Top-k and routing imbalance therefore
+    affect expert work but do not scale the inter-group combine payload.
 
-    RS input volume per rank = B_set × D_local × float_size  (the full dense buffer
-    for one expert set, where B_set = B_global / num_complete_expert_sets).
-    No traffic_mult scaling: the top_k fan-out is resolved locally inside
-    each group (the group sums its local expert outputs per token before
-    the inter-group combine).  The RS operates on the dense buffer
-    regardless of routing sparsity.
+    The combine repairs three distinct kinds of ownership in order: feature
+    shards, projection replicas, and token slices.
 
-    When G=1 the reduce-scatter is a no-op (zero cost).
+    1. **Feature-group reduce-scatter.** Build the physical-axis quotient
+       ``(TP_Proj_X × TP_Proj_Y_eff) / (TP_MoE_X × TP_MoE_Y)`` and run RS on
+       that quotient. The division is axis-by-axis, so this may be an ND
+       collective. Within each aligned feature-group subgroup, RS both sums
+       partial expert contributions and narrows ``D_expert`` to the
+       ``D_residual`` shard expected by the next layer. Its output is therefore
+       ready for the replica AR below. The RS input volume per rank is
+       ``B_set * D_expert * float_size``. It is a no-op when the quotient has
+       one participant.
+    2. **Projection-replica all-reduce.** If ``U_set > 1``, run AR across
+       aligned replicas inside the same expert set—not across expert sets.
+       Members own the same ``B_set`` tokens and ``D_residual`` shard but hold
+       disjoint expert-group contributions. AR sums those contributions and leaves
+       ``[B_set, D_residual]`` replicated across the per-set replica axis.
+       The payload is ``B_set * D_residual * float_size``.
+    3. **Cross-set batch all-gather.** If ``S > 1``, each Y-aligned set owns a
+       disjoint ``B_set`` token slice. These slices must be concatenated, not
+       summed, so AG across ``expert_set_topology`` reconstructs
+       ``[B_attention_domain, D_residual]`` for the next layer.
+       Matching replica subgroups execute concurrently; contention between
+       those subgroups is not yet modeled.
 
-    **Cross-set All-Gather** (when combine-domain set count S_attn > 1):
-    After the intra-set RS, each rank has [B_set, D_local].  An AG(S)
-    across matching ranks in different expert sets reconstructs the full
-    [B_attn_domain, D_local] needed by the next layer in the current
-    attention token domain.  When S_attn=1 this step is skipped.
+    All quotients are derived from exact physical-axis ownership. Mismatched
+    axes, non-divisible extents, inconsistent set counts, or non-integral
+    replica partitioning fail explicitly rather than using virtual participant
+    approximations.
     """
 
     if transformer_config.num_regular_experts == 0:
         return CommStats()
 
-    G = moe_config.num_colocated_groups_per_set
-
-    ep_chips = moe_config.ep_chips_per_pp_stage
+    group_count = moe_config.num_colocated_groups_per_set
     full_set_xpus = moe_config.full_expert_set_xpu_count
     xpus_per_group = moe_config.xpus_per_colocated_group
-
+    if group_count <= 0:
+        raise ValueError(f"num_colocated_groups_per_set must be > 0, got {group_count}")
     if full_set_xpus <= 0:
         raise ValueError(f"full_expert_set_xpu_count must be > 0, got {full_set_xpus}")
     if xpus_per_group <= 0:
         raise ValueError(f"xpus_per_colocated_group must be > 0, got {xpus_per_group}")
-    if ep_chips <= 0:
-        raise ValueError(f"ep_chips_per_pp_stage must be > 0, got {ep_chips}")
-    if attn_tp_xpus <= 0:
-        raise ValueError(f"attn_tp_xpus must be > 0, got {attn_tp_xpus}")
-    if ep_chips % full_set_xpus != 0:
+    if num_attention_domain_tokens <= 0:
         raise ValueError(
-            f"ep_chips_per_pp_stage ({ep_chips}) must be divisible by "
-            f"full_expert_set_xpu_count ({full_set_xpus})"
+            "num_attention_domain_tokens must be > 0, " f"got {num_attention_domain_tokens}"
         )
-    if G * xpus_per_group != full_set_xpus:
+    if tp_moe_x_shards <= 0 or tp_moe_y_shards <= 0:
         raise ValueError(
-            f"Group decomposition inconsistent: G ({G}) × xpus_per_group ({xpus_per_group}) "
-            f"= {G * xpus_per_group}, expected full_expert_set_xpu_count = {full_set_xpus}"
+            f"MoE TP extents must be > 0, got X={tp_moe_x_shards}, Y={tp_moe_y_shards}"
         )
-    if tp_moe_x_shards <= 0:
-        raise ValueError(f"tp_moe_x_shards must be > 0, got {tp_moe_x_shards}")
     if projection_groups <= 0:
         raise ValueError(f"projection_groups must be > 0, got {projection_groups}")
-    if xpus_per_group % tp_moe_y_shards != 0:
+    if xpus_per_group != tp_moe_x_shards * tp_moe_y_shards:
         raise ValueError(
-            f"xpus_per_colocated_group ({xpus_per_group}) must be divisible by "
-            f"tp_moe_y_shards ({tp_moe_y_shards})"
+            f"xpus_per_colocated_group ({xpus_per_group}) must equal "
+            f"TP_MoE_X × TP_MoE_Y ({tp_moe_x_shards} × {tp_moe_y_shards})"
         )
-    if xpus_per_group % tp_moe_x_shards != 0:
+    if group_count * xpus_per_group != full_set_xpus:
         raise ValueError(
-            f"xpus_per_colocated_group ({xpus_per_group}) must be divisible by "
-            f"tp_moe_x_shards ({tp_moe_x_shards})"
+            f"group_count × xpus_per_group = {group_count} × {xpus_per_group} "
+            f"!= full_expert_set_xpu_count ({full_set_xpus})"
+        )
+    if attn_tp_xpus != attn_x_topology.num_chips * attn_yz_topology.num_chips:
+        raise ValueError(
+            f"attn_tp_xpus ({attn_tp_xpus}) does not match resolved attention views "
+            f"({attn_x_topology.num_chips} × {attn_yz_topology.num_chips})"
+        )
+    if proj_x_topology.num_chips != attn_x_topology.num_chips:
+        raise ValueError(
+            f"TP_Proj_X ({proj_x_topology.num_chips}) must equal "
+            f"TP_Attn_X ({attn_x_topology.num_chips}) for residual-layout closure"
+        )
+    if moe_x_topology.num_chips != tp_moe_x_shards:
+        raise ValueError(f"Resolved TP_MoE_X ({moe_x_topology.num_chips}) != {tp_moe_x_shards}")
+    if moe_yz_topology.num_chips != tp_moe_y_shards:
+        raise ValueError(f"Resolved TP_MoE_Y ({moe_yz_topology.num_chips}) != {tp_moe_y_shards}")
+    if attn_yz_topology.num_chips % proj_yz_topology.num_chips != 0:
+        raise ValueError(
+            f"TP_Attn_Y ({attn_yz_topology.num_chips}) must be divisible by "
+            f"TP_Proj_Y_eff ({proj_yz_topology.num_chips})"
         )
 
-    d_model = transformer_config.d_model
+    resolved_projection_groups = attn_yz_topology.num_chips // proj_yz_topology.num_chips
+    if resolved_projection_groups != projection_groups:
+        raise ValueError(
+            f"projection_groups ({projection_groups}) != resolved attention/projection Y "
+            f"quotient ({resolved_projection_groups})"
+        )
 
-    # D_local: each rank's shard of d_model within the group (sharded by X × Y_eff).
-    d_local_bytes = (d_model / xpus_per_group) * float_size
-
-    # Dense RS input buffer: every rank materializes [B, D_local] — zeros for
-    # tokens not routed to this group's experts.
-    num_processing_sets = moe_config.num_complete_expert_sets
-    if num_processing_sets <= 0:
-        raise ValueError(f"num_complete_expert_sets must be > 0, got {num_processing_sets}")
-    if attn_tp_xpus >= full_set_xpus:
-        if attn_tp_xpus % full_set_xpus != 0:
+    if attn_tp_xpus % full_set_xpus != 0:
+        raise ValueError(
+            f"attn_tp_xpus ({attn_tp_xpus}) must be divisible by "
+            f"full_expert_set_xpu_count ({full_set_xpus})"
+        )
+    num_combine_sets = attn_tp_xpus // full_set_xpus
+    if num_combine_sets != moe_config.full_expert_sets_per_attn_domain:
+        raise ValueError(
+            f"Resolved combine sets ({num_combine_sets}) != "
+            "full_expert_sets_per_attn_domain "
+            f"({moe_config.full_expert_sets_per_attn_domain})"
+        )
+    if resolved_projection_groups % num_combine_sets != 0:
+        raise ValueError(
+            f"Projection replicas ({resolved_projection_groups}) must be divisible by "
+            f"expert sets ({num_combine_sets})"
+        )
+    replicas_per_set = resolved_projection_groups // num_combine_sets
+    if num_combine_sets > 1:
+        if expert_set_topology is None:
+            raise ValueError("Multiple expert sets require explicit expert_set_topology")
+        if expert_set_topology.num_chips != num_combine_sets:
             raise ValueError(
-                f"attn_tp_xpus ({attn_tp_xpus}) must be divisible by "
-                f"full_expert_set_xpu_count ({full_set_xpus})"
+                f"expert_set_topology ({expert_set_topology.num_chips}) != "
+                f"combine sets ({num_combine_sets})"
             )
-        num_combine_sets = attn_tp_xpus // full_set_xpus
-    else:
-        # Attention domain smaller than one full expert set: no cross-set combine in this domain.
-        num_combine_sets = 1
-    if num_combine_sets <= 0:
+
+    projection_layout = _merge_logical_views(
+        first_view=proj_x_topology,
+        second_view=proj_yz_topology,
+        view_name="Projection_Residual_Layout",
+    )
+    moe_layout = _merge_logical_views(
+        first_view=moe_x_topology,
+        second_view=moe_yz_topology,
+        view_name="MoE_Output_Layout",
+    )
+    feature_group_view = _exact_layout_quotient_view(
+        numerator_view=projection_layout,
+        denominator_view=moe_layout,
+        view_name="MoE_Combine_Feature_Groups",
+    )
+    global_replica_view = _exact_layout_quotient_view(
+        numerator_view=attn_yz_topology,
+        denominator_view=proj_yz_topology,
+        view_name="MoE_Combine_Global_Projection_Replicas",
+    )
+    feature_group_count = feature_group_view.num_chips
+    if global_replica_view.num_chips != projection_groups:
         raise ValueError(
-            f"combine-domain set count must be > 0, got {num_combine_sets} "
-            f"(attn_tp_xpus={attn_tp_xpus}, full_set_xpus={full_set_xpus})"
+            f"Replica quotient ({global_replica_view.num_chips}) != "
+            f"projection_groups ({projection_groups})"
         )
-    tokens_per_set = num_global_batch_tokens / num_processing_sets
-
-    combine_bytes_per_rank = tokens_per_set * d_local_bytes
-
-    # Variant-aware axis assignment:
-    # - 1xN: RS(G) and cross-set AG are modeled on TP_Attn_X.
-    # - Nx1: RS(G) and cross-set AG are modeled on TP_Attn_Y.
-    # - NxM: keep explicit mixed-mode marker (not fully modeled).
-    if tp_moe_x_shards == 1:
-        rs_handoff_mode = "1xN->X"
-        preferred_base_tag = "TP_Attn_X"
-    elif tp_moe_y_shards == 1:
-        rs_handoff_mode = "Nx1->Y_eff"
-        preferred_base_tag = "TP_Attn_Y"
+    if num_combine_sets == 1:
+        replica_view = global_replica_view
     else:
-        rs_handoff_mode = "NxM-unsupported"
-        preferred_base_tag = "TP_Attn_X"
-
-    # EP view contains only EP_* tags; for axis selection we need TP_Attn_* tags.
-    # Use the EP view's original topology reference to access the full tag namespace.
-    topo_ref = ep_topology_view.original_topology_ref
-    axis_note = ""
-    combine_base_tag = preferred_base_tag
-    try:
-        _ = topo_ref.get_mapping_for_tag(combine_base_tag)
-    except Exception:
-        ep_tags = ep_topology_view.get_tags_sorted_by_speed()
-        if not ep_tags:
-            raise ValueError("EP topology view has no tags to map combine axis.")
-        combine_base_tag = ep_tags[0]
-        axis_note = (
-            f" NOTE: {preferred_base_tag} not defined in logical topology; "
-            f"using EP axis {combine_base_tag} for combine-domain modeling."
+        if len(global_replica_view.dimensions) != 1:
+            raise ValueError(
+                "Y-aligned multiple-set combine requires one projection-replica "
+                f"dimension; got {len(global_replica_view.dimensions)}"
+            )
+        replica_tag = _logical_tag_string(global_replica_view.dimensions[0].logical_tag)
+        replica_view = global_replica_view.create_resized_view(
+            view_name="MoE_Combine_Per_Set_Projection_Replicas",
+            new_sizes={replica_tag: replicas_per_set},
         )
-    cross_set_base_tag = combine_base_tag
-    # The reduce-scatter runs across G groups on a selected attention-domain axis.
-    # Create a virtual view with G participants so the Hockney model uses
-    # the correct alpha count and bandwidth sharing.
-    # TODO(moe-combine): model explicit subgroup membership (set_id, local_shard_id)
-    # for RS/AG participants. Current path models axis + virtual participant count,
-    # but not exact rank pairing/placement within the axis.
-    combine_view = ep_topology_view.original_topology_ref.create_virtual_view_from_tag(
-        view_name="Combine_G",
-        base_tag=combine_base_tag,
-        virtual_size=G,
-        global_sharing_context="max_exclusive",
-    )
-
-    per_layer_rs = hockney_model_reduce_scatter_on_nd_topology(
-        view=combine_view,
-        P_total_bytes_before_rs=combine_bytes_per_rank,
-        float_size_bytes=float_size,
-    )
-
-    rs_issue_note = ""
-    if rs_handoff_mode == "NxM-unsupported":
-        rs_issue_note = (
-            " ISSUE: combine RS(G) handoff for mixed MoE TP (NxM) is not modeled yet "
-            f"(tp_moe_x_shards={tp_moe_x_shards}, tp_moe_y_shards={tp_moe_y_shards})."
+    if group_count != feature_group_count * replicas_per_set:
+        raise ValueError(
+            f"Expert groups per set ({group_count}) must equal feature groups × "
+            f"per-set projection replicas ({feature_group_count} × {replicas_per_set})"
+        )
+    if num_attention_domain_tokens % num_combine_sets != 0:
+        raise ValueError(
+            f"num_attention_domain_tokens ({num_attention_domain_tokens}) must be "
+            f"divisible by local expert sets ({num_combine_sets})"
         )
 
+    tokens_per_set = num_attention_domain_tokens // num_combine_sets
+    if tokens_per_set * num_combine_sets != num_attention_domain_tokens:
+        raise AssertionError(
+            f"Internal token partition failed to close: {tokens_per_set} × "
+            f"{num_combine_sets} != {num_attention_domain_tokens}"
+        )
+    d_model = transformer_config.d_model
+    expert_output_shard = d_model / (tp_moe_x_shards * tp_moe_y_shards)
+    residual_output_shard = d_model / (proj_x_topology.num_chips * proj_yz_topology.num_chips)
+    rs_input_bytes = tokens_per_set * expert_output_shard * float_size
+    if feature_group_count == 1:
+        per_layer_rs = CommStats()
+    else:
+        per_layer_rs = hockney_model_reduce_scatter_on_nd_topology(
+            view=feature_group_view,
+            P_total_bytes_before_rs=rs_input_bytes,
+            float_size_bytes=float_size,
+        )
+    feature_shape = " × ".join(
+        f"{_logical_tag_string(dimension.logical_tag)}={dimension.size}"
+        for dimension in feature_group_view.dimensions
+    )
     layout_trace.record_comm(
-        "combine_rs_g",
+        "combine_rs_exact_groups",
         "RS",
-        f"{combine_base_tag}({G})",
-        G,
-        combine_bytes_per_rank,
+        feature_shape,
+        feature_group_count,
+        rs_input_bytes,
         per_layer_rs,
         note=(
-            f"single-attention-domain dense combine/handoff: RS across G={G} colocated expert groups, "
-            f"buffer=[B_set={tokens_per_set:.0f}, D_local={d_model/xpus_per_group:.0f}]"
-            f", S_processing={num_processing_sets}, S_attn={num_combine_sets}"
-            f", mode={rs_handoff_mode}, rs_axis={combine_base_tag}"
-            f"{axis_note}"
-            f"{rs_issue_note}"
+            "Dense expert-output combine over exact feature-sharding quotients. "
+            f"B_set={tokens_per_set}, D_expert={expert_output_shard:g}, "
+            f"D_residual={residual_output_shard:g}."
         ),
     )
 
     per_layer = per_layer_rs
-    per_layer_cross_set = CommStats()
-    per_layer_combine_u = CommStats()
-
-    # Cross-set All-Gather: when combine-domain set count > 1, each set
-    # processed only tokens_per_set = B_global / S tokens.  After the
-    # intra-set RS(G), every rank has its set's [B/S, D_local] shard.  To
-    # reconstruct the full [B_attn_domain, D_local] for the next layer we need
-    # an AG(S) across matching ranks in different expert sets.
-    #
-    # AG input per rank  = tokens_per_set × D_local  (one set's slice)
-    # AG output per rank = B_attn_domain × D_local   (current attn-domain batch)
-    if num_combine_sets > 1:
-        tokens_per_attn_domain = tokens_per_set * num_combine_sets
-        cross_set_ag_output_bytes = tokens_per_attn_domain * d_local_bytes
-
-        cross_set_domain_note = ""
-        cross_set_phys = topo_ref.get_mapping_for_tag(
-            cross_set_base_tag
-        ).maps_to_physical_dimension_name
-        combine_phys = topo_ref.get_mapping_for_tag(
-            combine_base_tag
-        ).maps_to_physical_dimension_name
-        try:
-            attn_x_phys = topo_ref.get_mapping_for_tag("TP_Attn_X").maps_to_physical_dimension_name
-            attn_y_phys = topo_ref.get_mapping_for_tag("TP_Attn_Y").maps_to_physical_dimension_name
-            if cross_set_phys not in (attn_x_phys, attn_y_phys):
-                cross_set_domain_note = (
-                    " ISSUE: cross-set AG base domain does not map to attention TP axes "
-                    f"(base_tag={cross_set_base_tag}, phys={cross_set_phys}, "
-                    f"attn_x_phys={attn_x_phys}, attn_y_phys={attn_y_phys})."
-                )
-            else:
-                # Same-axis RS and cross-set AG can be valid: they may use different
-                # subgroups/virtual participant sets of the same physical dimension.
-                cross_set_domain_note = (
-                    f" verified_domain: rs_axis={combine_base_tag}({combine_phys}), "
-                    f"cross_set_axis={cross_set_base_tag}({cross_set_phys})."
-                )
-        except Exception:
-            cross_set_domain_note = (
-                f" NOTE: TP_Attn_X/Y tags unavailable; rs_axis={combine_base_tag}({combine_phys}), "
-                f"cross_set_axis={cross_set_base_tag}({cross_set_phys})."
-            )
-
-        cross_set_view = ep_topology_view.original_topology_ref.create_virtual_view_from_tag(
-            view_name="Combine_CrossSet",
-            base_tag=cross_set_base_tag,
-            virtual_size=num_combine_sets,
-            global_sharing_context="max_exclusive",
-        )
-
-        per_layer_cross_set = hockney_model_all_gather_on_nd_topology(
-            view=cross_set_view,
-            P_total_bytes_after_ag=cross_set_ag_output_bytes,
+    if replicas_per_set > 1:
+        replica_payload_bytes = tokens_per_set * residual_output_shard * float_size
+        per_layer_replica_ar = hockney_model_all_reduce_on_nd_topology(
+            view=replica_view,
+            P_total_bytes=replica_payload_bytes,
             float_size_bytes=float_size,
         )
+        replica_shape = " × ".join(
+            f"{_logical_tag_string(dimension.logical_tag)}={dimension.size}"
+            for dimension in replica_view.dimensions
+        )
+        layout_trace.record_comm(
+            "combine_ar_projection_replicas",
+            "AR",
+            replica_shape,
+            replicas_per_set,
+            replica_payload_bytes,
+            per_layer_replica_ar,
+            note=(
+                "Sum disjoint expert contributions and replicate the final residual shard "
+                f"across projection replicas. B_set={tokens_per_set}, "
+                f"D_residual={residual_output_shard:g}."
+            ),
+        )
+        per_layer = per_layer + per_layer_replica_ar
 
+    if num_combine_sets > 1:
+        assert expert_set_topology is not None
+        tokens_per_attn_domain = tokens_per_set * num_combine_sets
+        if tokens_per_attn_domain != num_attention_domain_tokens:
+            raise AssertionError(
+                f"Cross-set gather output tokens ({tokens_per_attn_domain}) != "
+                f"attention-domain tokens ({num_attention_domain_tokens})"
+            )
+        cross_set_output_bytes = tokens_per_attn_domain * residual_output_shard * float_size
+        per_layer_cross_set_ag = hockney_model_all_gather_on_nd_topology(
+            view=expert_set_topology,
+            P_total_bytes_after_ag=cross_set_output_bytes,
+            float_size_bytes=float_size,
+        )
+        set_shape = " × ".join(
+            f"{_logical_tag_string(dimension.logical_tag)}={dimension.size}"
+            for dimension in expert_set_topology.dimensions
+        )
         layout_trace.record_comm(
             "combine_ag_cross_set",
             "AG",
-            f"{cross_set_base_tag}({num_combine_sets})",
+            set_shape,
             num_combine_sets,
-            cross_set_ag_output_bytes,
-            per_layer_cross_set,
+            cross_set_output_bytes,
+            per_layer_cross_set_ag,
             note=(
-                f"Cross-set AG: S_attn={num_combine_sets} sets, each contributes "
-                f"[B/S={tokens_per_set:.0f}, D_local={d_model/xpus_per_group:.0f}] "
-                f"→ attn-domain [B={tokens_per_attn_domain:.0f}, D_local={d_model/xpus_per_group:.0f}]"
-                f", ag_axis={cross_set_base_tag}"
-                f"{cross_set_domain_note}"
+                f"Gather disjoint B/{num_combine_sets} token slices after per-set combine: "
+                f"B_set={tokens_per_set} -> B_domain={tokens_per_attn_domain}. "
+                f"{replicas_per_set} aligned subgroup(s) run concurrently. "
+                "MODEL_LIMITATION: cross-subgroup fabric contention is not modeled."
             ),
         )
-
-    else:
-        tokens_per_attn_domain = tokens_per_set
-
-    # projection_groups>1 means projection-domain work is split into
-    # multiple independent YZ subgroups. After combine RS(G) (and optional cross-set
-    # AG), we need an extra AG over that group axis so every rank in the active
-    # attention shard sees the full post-combine token domain.
-    if projection_groups > 1:
-        # projection_groups (`g`) is introduced by shrinking projection-domain
-        # YZ tags in run_scalescope. This reconciliation AG therefore stays on the
-        # attention Y axis regardless of whether RS(G)/cross-set AG used X or Y.
-        # It models restoring full visibility across projection groups in the YZ domain.
-        u_base_tag = "TP_Attn_Y"
-        try:
-            _ = topo_ref.get_mapping_for_tag(u_base_tag)
-        except Exception as e:
-            raise ValueError(
-                f"Missing required logical tag '{u_base_tag}' for projection-group combine AG(U) "
-                f"(g={projection_groups}, combine_axis={combine_base_tag})."
-            ) from e
-
-        combine_u_ag_output_bytes = tokens_per_attn_domain * d_local_bytes
-        combine_u_view = topo_ref.create_virtual_view_from_tag(
-            view_name="Combine_U",
-            base_tag=u_base_tag,
-            virtual_size=projection_groups,
-            global_sharing_context="max_exclusive",
-        )
-        per_layer_combine_u = hockney_model_all_gather_on_nd_topology(
-            view=combine_u_view,
-            P_total_bytes_after_ag=combine_u_ag_output_bytes,
-            float_size_bytes=float_size,
-        )
-        layout_trace.record_comm(
-            "combine_ag_u",
-            "AG",
-            f"{u_base_tag}({projection_groups})",
-            projection_groups,
-            combine_u_ag_output_bytes,
-            per_layer_combine_u,
-            note=(
-                f"Projection-group combine AG(U): g={projection_groups}, "
-                f"[B={tokens_per_attn_domain:.0f}, D_local={d_model/xpus_per_group:.0f}] "
-                "to restore full combine-domain visibility for next-layer handoff."
-            ),
-        )
-    # Keep post-RS gather stages serialized for now.
-    per_layer = per_layer + per_layer_cross_set + per_layer_combine_u
-
-    # Conservative NxM handoff remap:
-    # For mixed MoE TP (tp_moe_x_shards>1 and tp_moe_y_shards>1), RS(G) does not
-    # guarantee alignment with next-layer attention sharding. Model an explicit
-    # remap as AG+RS on TP_Attn_X over the full post-combine buffer to avoid
-    # optimistic winners while subgroup-exact mapping is not implemented.
-    if tp_moe_x_shards > 1 and tp_moe_y_shards > 1:
-        remap_base_tag = "TP_Attn_X"
-        try:
-            remap_size = topo_ref.get_mapping_for_tag(remap_base_tag).size
-        except Exception as e:
-            raise ValueError(
-                f"Missing required logical tag '{remap_base_tag}' for NxM combine remap "
-                f"(tp_moe_x_shards={tp_moe_x_shards}, tp_moe_y_shards={tp_moe_y_shards})."
-            ) from e
-        remap_output_bytes = tokens_per_attn_domain * d_local_bytes
-        remap_view = topo_ref.create_virtual_view_from_tag(
-            view_name="Combine_Remap_X",
-            base_tag=remap_base_tag,
-            virtual_size=remap_size,
-            global_sharing_context="concurrent_baseline",
-        )
-        per_layer_remap_ag = hockney_model_all_gather_on_nd_topology(
-            view=remap_view,
-            P_total_bytes_after_ag=remap_output_bytes,
-            float_size_bytes=float_size,
-        )
-        layout_trace.record_comm(
-            "combine_remap_ag_x",
-            "AG",
-            f"{remap_base_tag}({remap_size})",
-            remap_size,
-            remap_output_bytes,
-            per_layer_remap_ag,
-            note=(
-                f"Conservative NxM handoff remap (step 1/2): AG on {remap_base_tag}. "
-                f"buffer=[B={tokens_per_attn_domain:.0f}, D_local={d_model/xpus_per_group:.0f}]"
-            ),
-        )
-        per_layer_remap_rs = hockney_model_reduce_scatter_on_nd_topology(
-            view=remap_view,
-            P_total_bytes_before_rs=remap_output_bytes,
-            float_size_bytes=float_size,
-        )
-        layout_trace.record_comm(
-            "combine_remap_rs_x",
-            "RS",
-            f"{remap_base_tag}({remap_size})",
-            remap_size,
-            remap_output_bytes,
-            per_layer_remap_rs,
-            note=(
-                f"Conservative NxM handoff remap (step 2/2): RS on {remap_base_tag}. "
-                "Used until subgroup-exact remap is modeled."
-            ),
-        )
-        per_layer = per_layer + per_layer_remap_ag + per_layer_remap_rs
+        per_layer = per_layer + per_layer_cross_set_ag
 
     return per_layer
 

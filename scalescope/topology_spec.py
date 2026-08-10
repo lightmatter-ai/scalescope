@@ -7,6 +7,7 @@ computed properties (shape/total_nodes) and YAML loaders.
 
 import math
 import os
+import warnings
 from enum import Enum
 from typing import Dict, List, Set, Tuple, Type, TypeVar, Union
 
@@ -50,6 +51,10 @@ class LogicalDimensionTag(str, Enum):
             maps_to_physical_dimension_name=maps_to_physical_dimension_name,
             size=size,
         )
+
+
+class BandwidthSharingOverlapWarning(UserWarning):
+    """Warn that nested sharing scopes named the same active bandwidth consumers."""
 
 
 # Physical topology
@@ -200,7 +205,10 @@ class LogicalTopology(BaseModel):
             num_sharers = sum(
                 1
                 for ldm in self.dimensions
-                if self.get_physical_dimension_for_tag(ldm.logical_tag).interconnect_name
+                # A degenerate logical axis performs no communication and
+                # therefore consumes none of the shared injection budget.
+                if ldm.size > 1
+                and self.get_physical_dimension_for_tag(ldm.logical_tag).interconnect_name
                 == phys_dim_for_tag.interconnect_name
             )
             return base_ic_bandwidth_Bps / max(1, num_sharers)
@@ -474,42 +482,78 @@ class LogicalTopologyView(LogicalTopology):
     def get_effective_bandwidth(
         self, tag_in_view: Union[LogicalDimensionTag, str], context: str = "concurrent_baseline"
     ) -> float:
-        """Calculates bandwidth (Bps) for a tag, considering global and local sharing contexts."""
+        """Calculate bandwidth after deduplicating global and local active sharers.
+
+        ``max_exclusive`` contributes no sharers at its scope.
+        ``concurrent_baseline`` contributes active logical tags on the queried
+        interconnect. The effective divisor is the size of the union of those
+        sets, so a nested view cannot charge the same axis twice.
+        """
         self.get_mapping_for_tag(tag_in_view)  # Check existence in view
         phys_dim = self.get_physical_dimension_for_tag(tag_in_view)
         interconnect = self.get_interconnect_for_tag(tag_in_view)
         base_ic_bandwidth_Bps = interconnect.bandwidth_Bps
 
-        # Step 1: Calculate the globally-aware bandwidth slice from the original topology
-        globally_aware_slice_Bps: float
+        global_sharer_tags: Set[str] = set()
         if self.global_sharing_context == "concurrent_baseline":
-            num_global_sharers = sum(
-                1
+            global_sharer_tags = {
+                (
+                    ldm.logical_tag.value
+                    if isinstance(ldm.logical_tag, Enum)
+                    else str(ldm.logical_tag)
+                )
                 for ldm in self.original_topology_ref.dimensions
-                if self.original_topology_ref.get_physical_dimension_for_tag(
+                # Size-one dimensions are identity collectives, not global
+                # bandwidth consumers.
+                if ldm.size > 1
+                and self.original_topology_ref.get_physical_dimension_for_tag(
                     ldm.logical_tag
                 ).interconnect_name
                 == phys_dim.interconnect_name
-            )
-            globally_aware_slice_Bps = base_ic_bandwidth_Bps / max(1, num_global_sharers)
+            }
         elif self.global_sharing_context == "max_exclusive":
-            globally_aware_slice_Bps = base_ic_bandwidth_Bps
+            pass
         else:
             raise ValueError(f"Unknown global_sharing_context: '{self.global_sharing_context}'")
 
-        # Step 2: Apply further sharing based on context *within this view*
+        view_sharer_tags: Set[str] = set()
         if context == "concurrent_baseline":
-            num_view_sharers = sum(
-                1
+            view_sharer_tags = {
+                (
+                    ldm.logical_tag.value
+                    if isinstance(ldm.logical_tag, Enum)
+                    else str(ldm.logical_tag)
+                )
                 for ldm in self.dimensions
-                if self.get_physical_dimension_for_tag(ldm.logical_tag).interconnect_name
+                # Keep local sharing consistent with the active color set used
+                # by the N-D collective models.
+                if ldm.size > 1
+                and self.get_physical_dimension_for_tag(ldm.logical_tag).interconnect_name
                 == phys_dim.interconnect_name
-            )
-            return globally_aware_slice_Bps / max(1, num_view_sharers)
+            }
         elif context == "max_exclusive":
-            return globally_aware_slice_Bps
+            pass
         else:
             raise ValueError(f"Unknown context_within_view: '{context}'")
+
+        overlap = global_sharer_tags.intersection(view_sharer_tags)
+        legacy_divisor = max(1, len(global_sharer_tags)) * max(1, len(view_sharer_tags))
+        unique_sharer_tags = global_sharer_tags.union(view_sharer_tags)
+        sharing_divisor = max(1, len(unique_sharer_tags))
+        if overlap and legacy_divisor > sharing_divisor:
+            warnings.warn(
+                (
+                    f"Bandwidth sharing overlap in view '{self.name}' on interconnect "
+                    f"'{phys_dim.interconnect_name}': global={sorted(global_sharer_tags)}, "
+                    f"local={sorted(view_sharer_tags)}, overlap={sorted(overlap)}. "
+                    f"Using {sharing_divisor} unique active sharers instead of nested "
+                    f"divisor {legacy_divisor}."
+                ),
+                BandwidthSharingOverlapWarning,
+                stacklevel=2,
+            )
+
+        return base_ic_bandwidth_Bps / sharing_divisor
 
     @model_validator(mode="after")
     def validate_mapping(self) -> "LogicalTopologyView":

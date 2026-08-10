@@ -566,16 +566,21 @@ def _verifier_decode_fc_flexible_tp_moe_compat(
     try:
         attn_x_map = topo.get_mapping_for_tag("TP_Attn_X")
         attn_y_map = topo.get_mapping_for_tag("TP_Attn_Y")
+        proj_x_map = topo.get_mapping_for_tag("TP_Proj_X")
+        proj_y_map = topo.get_mapping_for_tag("TP_Proj_Y")
         moe_x_map = topo.get_mapping_for_tag("TP_MoE_X")
         moe_y_map = topo.get_mapping_for_tag("TP_MoE_Y")
+        projection_groups = int(ws.projection_groups)
     except Exception:
         return False
 
     attn_x = int(attn_x_map.size)
     attn_y = int(attn_y_map.size)
+    proj_x = int(proj_x_map.size)
+    proj_y = int(proj_y_map.size)
     moe_x = int(moe_x_map.size)
     moe_y = int(moe_y_map.size)
-    if min(attn_x, attn_y, moe_x, moe_y) <= 0:
+    if min(attn_x, attn_y, proj_x, proj_y, moe_x, moe_y, projection_groups) <= 0:
         return False
 
     # Rack-local attention budget is explicitly configured via verifier params.
@@ -594,12 +599,230 @@ def _verifier_decode_fc_flexible_tp_moe_compat(
     if moe_y_map.maps_to_physical_dimension_name != attn_y_map.maps_to_physical_dimension_name:
         return False
 
+    # The MoE feature layout must fit inside the attention-domain layout on
+    # each corresponding physical axis; it cannot introduce a finer shard
+    # count than the producer owns.
     if moe_x > attn_x or moe_y > attn_y:
         return False
+
+    # Require an integer axis-by-axis quotient so the projection-to-MoE
+    # handoff can use exact subgroup gathers rather than an arbitrary reshard.
     if (attn_x % moe_x) != 0 or (attn_y % moe_y) != 0:
         return False
 
+    # This decode path ties projection TP to attention TP before projection
+    # groups reduce the effective projection Y degree.
+    if proj_x != attn_x or proj_y != attn_y:
+        return False
+
+    # Projection groups partition the projection Y ranks into equal subgroups;
+    # a non-integral partition has no exact rank ownership.
+    if proj_y % projection_groups != 0:
+        return False
+    proj_y_eff = proj_y // projection_groups
+
+    # The effective projection Y layout must be a coarsening of the MoE Y
+    # layout. Refining from fewer projection shards to more MoE shards is
+    # unsupported, while a divisible coarsening is reconciled by an exact AG.
+    if proj_y_eff < moe_y or proj_y_eff % moe_y != 0:
+        return False
+
     return True
+
+
+def _verifier_decode_hyperx_y_sets_compat(
+    case: Case,
+    base_specs: Mapping[str, BaseModel],
+    params: Mapping[str, Any] | None = None,
+    *,
+    applied_specs: Any = None,
+) -> bool:
+    """Validate DP=1 HyperX sets aligned to projection replicas on physical Y."""
+    # Resolve the fully applied sweep point so every check below uses the same
+    # topology, workload, and model values that execution would receive.
+    specs = _resolve_specs(case, base_specs, applied_specs)
+    if specs is None:
+        return False
+    ws = specs.get("workload_spec")
+    topo = specs.get("logical_topology")
+    model = specs.get("model_spec")
+    if ws is None or topo is None or model is None:
+        return False
+
+    # This verifier is specific to decode's explicit router/layout path.
+    # Other pass modes do not expose the required decode fields.
+    if not hasattr(ws, "decode_moe_router_sync_mode"):
+        return True
+
+    # Extract every degree participating in set ownership, TP reconciliation,
+    # batch partitioning, and the expert-placement identity.
+    try:
+        set_count = int(topo.get_mapping_for_tag("Expert_Set_Y").size)
+        dp_attn_su = int(topo.get_mapping_for_tag("DP_Attn_SU").size)
+        dp_attn_so = int(topo.get_mapping_for_tag("DP_Attn_SO").size)
+        attn_x = int(topo.get_mapping_for_tag("TP_Attn_X").size)
+        attn_y = int(topo.get_mapping_for_tag("TP_Attn_Y").size)
+        proj_x = int(topo.get_mapping_for_tag("TP_Proj_X").size)
+        proj_y = int(topo.get_mapping_for_tag("TP_Proj_Y").size)
+        moe_x = int(topo.get_mapping_for_tag("TP_MoE_X").size)
+        moe_y = int(topo.get_mapping_for_tag("TP_MoE_Y").size)
+        projection_groups = int(ws.projection_groups)
+        global_batch = int(ws.global_batch_size)
+        colocated = int(ws.moe_spec_v2.num_colocated_experts)
+        experts = int(model.num_regular_experts)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+    # Reject malformed extents before any divisibility operation.
+    if (
+        min(
+            set_count,
+            dp_attn_su,
+            dp_attn_so,
+            attn_x,
+            attn_y,
+            proj_x,
+            proj_y,
+            moe_x,
+            moe_y,
+            projection_groups,
+            global_batch,
+            colocated,
+            experts,
+        )
+        <= 0
+    ):
+        return False
+
+    # HyperX has one attention replica spanning the full attention domain.
+    # Multiple expert sets live inside that domain; they are not DP replicas.
+    if dp_attn_su != 1 or dp_attn_so != 1:
+        return False
+
+    # Attention and projection start from the same complete mesh. Projection
+    # groups may later reduce only the effective projection Y degree.
+    if proj_x != attn_x or proj_y != attn_y:
+        return False
+
+    # Sets partition physical Y evenly, and projection replicas must partition
+    # into the same set-aligned subgroups for exact per-set combine ownership.
+    if attn_y % set_count != 0 or projection_groups % set_count != 0:
+        return False
+
+    # Each set selects a deterministic B/set_count token slice locally.
+    if global_batch % set_count != 0:
+        return False
+
+    # Projection groups themselves must form equal subgroups of projection Y.
+    if proj_y % projection_groups != 0:
+        return False
+
+    per_set_y = attn_y // set_count
+    y_eff = proj_y // projection_groups
+
+    # MoE X remains a divisible sub-layout of the full HyperX X axis.
+    if moe_x > attn_x or attn_x % moe_x != 0:
+        return False
+
+    # MoE Y is owned by one set and therefore cannot cross that set's Y slice.
+    if moe_y > per_set_y or per_set_y % moe_y != 0:
+        return False
+
+    # The effective projection Y layout must coarsen the MoE Y layout exactly;
+    # projection-to-MoE Y refinement has no supported redistribution algorithm.
+    if y_eff < moe_y or y_eff % moe_y != 0:
+        return False
+
+    # Colocation must divide the expert population into an integral number of
+    # groups before converting group count and MoE TP into the set footprint.
+    if experts % colocated != 0:
+        return False
+    full_set_xpus = (experts // colocated) * moe_x * moe_y
+
+    # One complete set must occupy exactly one of the equal Y-aligned slices
+    # of the full attention domain—neither overlapping nor leaving ranks idle.
+    return full_set_xpus == (attn_x * attn_y) // set_count
+
+
+def _verifier_decode_proj_layout_coarsens_moe_layout(
+    case: Case,
+    base_specs: Mapping[str, BaseModel],
+    params: Mapping[str, Any] | None = None,
+    *,
+    applied_specs: Any = None,
+) -> bool:
+    """Require projection-to-MoE layout divisibility on every physical axis."""
+    specs = _resolve_specs(case, base_specs, applied_specs)
+    if specs is None:
+        return False
+    ws = specs.get("workload_spec")
+    topo = specs.get("logical_topology")
+    if ws is None or topo is None:
+        return False
+    if not hasattr(ws, "decode_moe_router_sync_mode"):
+        return True
+
+    try:
+        proj_split = ws.tp_proj_spec.split_2d
+        moe_split = ws.tp_moe_spec.split_2d
+        projection_groups = int(ws.projection_groups)
+        if proj_split is None or moe_split is None or projection_groups <= 0:
+            return False
+
+        proj_x_tags = list(proj_split.x_tags)
+        proj_yz_tags = list(proj_split.yz_tags)
+        moe_x_tags = list(moe_split.x_tags)
+        moe_yz_tags = list(moe_split.yz_tags)
+        proj_tag_sizes = {
+            tag.value if hasattr(tag, "value") else str(tag): int(
+                topo.get_mapping_for_tag(tag.value if hasattr(tag, "value") else str(tag)).size
+            )
+            for tag in proj_x_tags + proj_yz_tags
+        }
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+    remaining_divisor = projection_groups
+    for tag in reversed(proj_yz_tags):
+        tag_name = tag.value if hasattr(tag, "value") else str(tag)
+        current_size = proj_tag_sizes[tag_name]
+        tag_divisor = remaining_divisor
+        while tag_divisor > 1 and (
+            remaining_divisor % tag_divisor != 0 or current_size % tag_divisor != 0
+        ):
+            tag_divisor -= 1
+        if tag_divisor > 1:
+            proj_tag_sizes[tag_name] = current_size // tag_divisor
+            remaining_divisor //= tag_divisor
+    if remaining_divisor != 1:
+        return False
+
+    def physical_sizes(tags: list[Any], sizes: Mapping[str, int] | None) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for tag in tags:
+            tag_name = tag.value if hasattr(tag, "value") else str(tag)
+            try:
+                mapping = topo.get_mapping_for_tag(tag_name)
+                size = int(mapping.size) if sizes is None else sizes[tag_name]
+            except (KeyError, TypeError, ValueError):
+                return {}
+            physical_name = mapping.maps_to_physical_dimension_name
+            if physical_name in result:
+                result[physical_name] *= size
+            else:
+                result[physical_name] = size
+        return result
+
+    proj_physical = physical_sizes(proj_x_tags + proj_yz_tags, proj_tag_sizes)
+    moe_physical = physical_sizes(moe_x_tags + moe_yz_tags, None)
+    if not proj_physical or not moe_physical:
+        return False
+    if set(proj_physical) != set(moe_physical):
+        return False
+    return all(
+        proj_physical[physical_name] % moe_physical[physical_name] == 0
+        for physical_name in proj_physical
+    )
 
 
 def _verifier_decode_nx1_router_compat(
@@ -722,6 +945,10 @@ ALLOWED_SWEEP_VERIFIERS["decode_sharded_router_proj_y_eff_matches_moe_y_all_shap
 )
 ALLOWED_SWEEP_VERIFIERS["decode_fc_flexible_tp_moe_compat"] = (
     _verifier_decode_fc_flexible_tp_moe_compat
+)
+ALLOWED_SWEEP_VERIFIERS["decode_hyperx_y_sets_compat"] = _verifier_decode_hyperx_y_sets_compat
+ALLOWED_SWEEP_VERIFIERS["decode_proj_layout_coarsens_moe_layout"] = (
+    _verifier_decode_proj_layout_coarsens_moe_layout
 )
 ALLOWED_SWEEP_VERIFIERS["decode_nx1_router_compat"] = _verifier_decode_nx1_router_compat
 

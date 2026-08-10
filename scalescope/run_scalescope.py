@@ -908,7 +908,7 @@ def _emit_decode_layout_trace(
             attn_domains_per_full_expert_set=(params["attn_domains_per_full_expert_set"]),
             full_expert_sets_per_attn_domain=(params["full_expert_sets_per_attn_domain"]),
             router_mode=params["router_mode"],
-            s=1,
+            batch_tokens=n_batch,
             dtype_bytes=workload_spec.float_size_bytes,
             context_len=context_len,
             attention_layers=attention_layer_classes(model_spec),
@@ -922,6 +922,7 @@ def _emit_decode_layout_trace(
         print()
 
         if actual_trace is not None and actual_trace.records:
+            actual_trace.assert_layer_boundary()
             print(
                 f"--- Decode 2D-TP Layout Trace [actual from code] (batch={n_batch}, ctx={context_len}) ---"
             )
@@ -1094,6 +1095,29 @@ def get_model_stats(
         router_shard_factor=_router_shard_factor,
         tp_moe_a2a_replication_optimization_enabled=workload_spec.tp_moe_a2a_replication_optimization,
     )
+    full_sets_per_attn_domain = moe_config.full_expert_sets_per_attn_domain
+    if full_sets_per_attn_domain is None:
+        raise ValueError("Resolved placement must define full_expert_sets_per_attn_domain")
+    try:
+        expert_set_mapping = cluster_logical_topology.get_mapping_for_tag("Expert_Set_Y")
+    except Exception as e:
+        if full_sets_per_attn_domain > 1:
+            raise ValueError(
+                "Multiple expert sets in one attention domain require explicit "
+                "logical tag `Expert_Set_Y`."
+            ) from e
+        expert_set_topology_view = None
+    else:
+        if expert_set_mapping.size != full_sets_per_attn_domain:
+            raise ValueError(
+                f"Expert_Set_Y ({expert_set_mapping.size}) must equal "
+                f"full_expert_sets_per_attn_domain ({full_sets_per_attn_domain})"
+            )
+        expert_set_topology_view = cluster_logical_topology.create_view(
+            view_name="Expert_Set_Y_View",
+            relevant_tags=["Expert_Set_Y"],
+            global_sharing_context="concurrent_baseline",
+        )
     # MoE placement fields in `moe_config` drive both EP A2A and TP-MoE comm paths.
     # We intentionally use the same placement-locality semantics for both (smooth remote fraction
     # over DP feeder groups and colocated expert groups) so TP1D/TP2D comparisons are consistent.
@@ -1506,6 +1530,9 @@ def get_model_stats(
                 params["g"],
                 params["n_experts"],
                 params["c"],
+                params["moe_tp_x"],
+                params["moe_tp_yz"],
+                params["full_expert_sets_per_attn_domain"],
             )
         )
 
@@ -2038,6 +2065,7 @@ def get_model_stats(
                 proj_tp_topology_view,  # proj_tp_topology (explicit; defaults to attn if absent)
                 moe_tp_topology_view,
                 ep_topology_view,
+                expert_set_topology_view,
                 model_spec,
                 moe_config,
                 workload_spec,
@@ -2080,6 +2108,7 @@ def get_model_stats(
                     proj_tp_topology_view,  # proj_tp_topology (explicit; defaults to attn if absent)
                     moe_tp_topology_view,
                     ep_topology_view,
+                    expert_set_topology_view,
                     model_spec,
                     moe_config,
                     workload_spec,
