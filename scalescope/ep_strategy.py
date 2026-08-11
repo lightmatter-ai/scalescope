@@ -5,28 +5,34 @@ expert collocation and parallelization strategies.
 """
 
 from dataclasses import dataclass
-from math import ceil, gcd
+from math import ceil, gcd, isclose
 
-from scalescope.decode_layout_trace import NULL_LAYOUT_TRACE
+from scalescope.decode_layout_trace import NULL_LAYOUT_TRACE, P, TensorRecord
 from scalescope.model_spec import TransformerConfig
 from scalescope.network_topology_model import (
     hockney_model_all_gather_on_nd_topology,
     hockney_model_all_reduce_on_nd_topology,
     hockney_model_reduce_scatter_on_nd_topology,
+    hockney_model_send_recv_on_nd_topology,
     hockney_model_total_exchange_on_nd_topology,
 )
 from scalescope.stats import CommStats
 from scalescope.topology_spec import LogicalTopology, LogicalTopologyView
 from scalescope.workload_spec import (
+    DecodeCrossDomainEPMode,
+    ExpertDomainPlacementKind,
     ExpertRoutingDistribution,
     MoEA2ACommMode,
     MoERouterSyncMode,
     MoESpecV2,
+    ResolvedBatchSizes,
 )
 
 
 @dataclass
 class ExpertXPUPlacement:
+    # Colocation-diluted routing imbalance, excluding top-k fanout.
+    effective_expert_imbalance: float
     num_shared_experts_per_dp_rank: int = 0
     num_regular_experts_per_dp_rank: int = 0
     num_all_experts_per_dp_rank: int = 0
@@ -67,6 +73,146 @@ class ExpertXPUPlacement:
     # - ON: send tokens (or token shards) to an expert shard first, then run all-gather
     #   so that shard is available across the expert TP shards.
     tp_moe_a2a_replication_optimization_enabled: bool = True
+
+
+@dataclass(frozen=True)
+class ResolvedMoETokenScopes:
+    """Validated batch and token ownership across attention domains and expert sets."""
+
+    global_batch_size: int
+    tokens_per_sequence: int
+    attention_domain_count: int
+    complete_expert_set_count: int
+    attn_domains_per_full_expert_set: int
+    full_expert_sets_per_attn_domain: int
+    batch_size_per_attention_domain: int
+    batch_size_per_full_expert_set: int
+    batch_size_per_feeder_set: int
+    tokens_global: int
+    tokens_per_attention_domain: int
+    tokens_per_full_expert_set: int
+    tokens_per_feeder_set: int
+
+
+def resolve_moe_token_scopes(
+    *,
+    resolved_batches: ResolvedBatchSizes,
+    tokens_per_sequence: int,
+    attn_domains_per_full_expert_set: int,
+    full_expert_sets_per_attn_domain: int,
+) -> ResolvedMoETokenScopes:
+    """Extend canonical workload batch sizes with exact MoE token scopes."""
+
+    values = {
+        "tokens_per_sequence": tokens_per_sequence,
+        "attn_domains_per_full_expert_set": attn_domains_per_full_expert_set,
+        "full_expert_sets_per_attn_domain": full_expert_sets_per_attn_domain,
+    }
+    for name, value in values.items():
+        if value <= 0:
+            raise ValueError(f"{name} must be > 0, got {value}")
+
+    global_batch_size = resolved_batches.global_batch_size
+    attention_domain_count = resolved_batches.attention_domain_count
+    complete_expert_set_count = resolved_batches.complete_expert_set_count
+    batch_size_per_attention_domain = resolved_batches.batch_size_per_dp
+    batch_size_per_full_expert_set = resolved_batches.batch_size_per_full_expert_set
+    resolved_values = {
+        "global_batch_size": global_batch_size,
+        "attention_domain_count": attention_domain_count,
+        "complete_expert_set_count": complete_expert_set_count,
+        "batch_size_per_dp": batch_size_per_attention_domain,
+        "batch_size_per_full_expert_set": batch_size_per_full_expert_set,
+    }
+    for name, value in resolved_values.items():
+        if value <= 0:
+            raise ValueError(f"resolved_batches.{name} must be > 0, got {value}")
+    if batch_size_per_attention_domain * attention_domain_count != global_batch_size:
+        raise ValueError(
+            "Resolved DP batch does not reconstruct the global batch: "
+            f"{batch_size_per_attention_domain} * {attention_domain_count} "
+            f"!= {global_batch_size}"
+        )
+    if batch_size_per_full_expert_set * complete_expert_set_count != global_batch_size:
+        raise ValueError(
+            "Resolved full-expert-set batch does not reconstruct the global batch: "
+            f"{batch_size_per_full_expert_set} * {complete_expert_set_count} "
+            f"!= {global_batch_size}"
+        )
+
+    left_edges = attention_domain_count * full_expert_sets_per_attn_domain
+    right_edges = complete_expert_set_count * attn_domains_per_full_expert_set
+    if left_edges != right_edges:
+        raise ValueError(
+            "Attention-domain/expert-set incidence must close exactly: "
+            f"{attention_domain_count} * {full_expert_sets_per_attn_domain} "
+            f"!= {complete_expert_set_count} * {attn_domains_per_full_expert_set}"
+        )
+    if batch_size_per_attention_domain % full_expert_sets_per_attn_domain != 0:
+        raise ValueError(
+            f"batch_size_per_attention_domain ({batch_size_per_attention_domain}) must be "
+            "divisible by full_expert_sets_per_attn_domain "
+            f"({full_expert_sets_per_attn_domain})"
+        )
+    if batch_size_per_full_expert_set % attn_domains_per_full_expert_set != 0:
+        raise ValueError(
+            f"batch_size_per_full_expert_set ({batch_size_per_full_expert_set}) must be "
+            "divisible by attn_domains_per_full_expert_set "
+            f"({attn_domains_per_full_expert_set})"
+        )
+
+    # A feeder-set scope is one attention-domain -> expert-set edge. Derive
+    # its batch size independently from each endpoint of that edge:
+    #
+    #   attention-domain batch / sets fed by that domain
+    #   full-expert-set batch / domains feeding that set
+    #
+    # The incidence-closure check above guarantees equal edge counts globally;
+    # this equality verifies that the per-edge batch partition also closes.
+    batch_size_per_feeder_set_via_attention_domain = (
+        batch_size_per_attention_domain // full_expert_sets_per_attn_domain
+    )
+    batch_size_per_feeder_set_via_expert_set = (
+        batch_size_per_full_expert_set // attn_domains_per_full_expert_set
+    )
+    if batch_size_per_feeder_set_via_attention_domain != batch_size_per_feeder_set_via_expert_set:
+        raise AssertionError(
+            "Feeder-set batch derivations disagree: "
+            "via attention domain="
+            f"{batch_size_per_feeder_set_via_attention_domain}, "
+            f"via expert set={batch_size_per_feeder_set_via_expert_set}"
+        )
+    batch_size_per_feeder_set = batch_size_per_feeder_set_via_attention_domain
+
+    tokens_global = global_batch_size * tokens_per_sequence
+    tokens_per_attention_domain = batch_size_per_attention_domain * tokens_per_sequence
+    tokens_per_full_expert_set = batch_size_per_full_expert_set * tokens_per_sequence
+    tokens_per_feeder_set = batch_size_per_feeder_set * tokens_per_sequence
+    if tokens_per_attention_domain * attention_domain_count != tokens_global:
+        raise AssertionError("Attention-domain token scopes do not reconstruct global tokens")
+    if tokens_per_full_expert_set * complete_expert_set_count != tokens_global:
+        raise AssertionError("Expert-set token scopes do not reconstruct global tokens")
+    if (
+        tokens_per_feeder_set * attention_domain_count * full_expert_sets_per_attn_domain
+        != tokens_global
+    ):
+        raise AssertionError("Feeder-set token scopes do not reconstruct global tokens")
+
+    return ResolvedMoETokenScopes(
+        global_batch_size=global_batch_size,
+        tokens_per_sequence=tokens_per_sequence,
+        attention_domain_count=attention_domain_count,
+        complete_expert_set_count=complete_expert_set_count,
+        attn_domains_per_full_expert_set=attn_domains_per_full_expert_set,
+        full_expert_sets_per_attn_domain=full_expert_sets_per_attn_domain,
+        batch_size_per_attention_domain=batch_size_per_attention_domain,
+        batch_size_per_full_expert_set=batch_size_per_full_expert_set,
+        batch_size_per_feeder_set=batch_size_per_feeder_set,
+        tokens_global=tokens_global,
+        tokens_per_attention_domain=tokens_per_attention_domain,
+        tokens_per_full_expert_set=tokens_per_full_expert_set,
+        tokens_per_feeder_set=tokens_per_feeder_set,
+    )
 
 
 def _logical_tag_string(tag) -> str:
@@ -643,6 +789,7 @@ def infer_expert_placement_per_xpu(
         # No MoE experts in the model: treat expert placement as a no-op so sweeps can focus on
         # attention/projection behavior without needing EP divisibility constraints.
         return ExpertXPUPlacement(
+            effective_expert_imbalance=1.0,
             num_shared_experts_per_dp_rank=0,
             num_regular_experts_per_dp_rank=0,
             num_all_experts_per_dp_rank=0,
@@ -714,6 +861,7 @@ def infer_expert_placement_per_xpu(
     regular_expert_traffic_multiplier = effective_imbalance * model_spec.num_selected_experts
 
     return ExpertXPUPlacement(
+        effective_expert_imbalance=effective_imbalance,
         num_shared_experts_per_dp_rank=num_shared_experts_per_dp_rank,
         num_regular_experts_per_dp_rank=num_routed_experts_per_dp_rank,
         num_all_experts_per_dp_rank=num_of_all_experts_per_dp_rank,
@@ -738,7 +886,7 @@ def calculate_moe_comm_first_total_exchange(
     ep_topology_view,
     transformer_config,
     moe_config,
-    num_global_batch_tokens,
+    token_scopes: ResolvedMoETokenScopes,
     float_size,
     tp_moe_y_shards: int,
     workload_spec=None,
@@ -749,7 +897,7 @@ def calculate_moe_comm_first_total_exchange(
         ep_topology_view,
         transformer_config,
         moe_config,
-        num_global_batch_tokens,
+        token_scopes,
         float_size,
         workload_spec=workload_spec,
         tp_moe_y_shards=tp_moe_y_shards,
@@ -762,7 +910,7 @@ def calculate_moe_comm_second_total_exchange(
     ep_topology_view,
     transformer_config,
     moe_config,
-    num_global_batch_tokens,
+    token_scopes: ResolvedMoETokenScopes,
     float_size,
     tp_moe_y_shards: int,
     workload_spec=None,
@@ -773,7 +921,7 @@ def calculate_moe_comm_second_total_exchange(
         ep_topology_view,
         transformer_config,
         moe_config,
-        num_global_batch_tokens,
+        token_scopes,
         float_size,
         workload_spec=workload_spec,
         tp_moe_y_shards=tp_moe_y_shards,
@@ -782,15 +930,245 @@ def calculate_moe_comm_second_total_exchange(
     )
 
 
+def calculate_moe_decode_cross_domain_exchange(
+    *,
+    ep_topology_view: LogicalTopology,
+    transformer_config: TransformerConfig,
+    moe_config,
+    workload_spec,
+    token_scopes: ResolvedMoETokenScopes,
+    float_size: int,
+    tp_moe_y_shards: int,
+    layout_trace=NULL_LAYOUT_TRACE,
+    a2a_leg: str,
+) -> CommStats:
+    """Price decode dispatch or return A2Av on EP_SO.
+
+    Expert groups are owned evenly across attention domains. Without building
+    a rank-level traffic matrix, the model starts from the balanced routed load
+    per expert-group-sized endpoint and scales it by the colocation-diluted
+    expert imbalance. This gives the busiest receiving endpoint directly.
+
+    The exact per-feeder handoff prepositions each ``D / TP_MoE_Y`` token shard
+    at every aligned local expert group. Therefore, the ``1/D`` local-owner
+    fraction needs no EP_SU dispatch or return. Only the remote ``(D-1)/D``
+    fraction is charged to EP_SO. After the return, the exact reduce-scatter
+    and replica all-reduce restore the residual layout.
+
+    This path assumes direct per-XPU EP_SO endpoints with no local
+    ingress/egress staging. Topologies with centralized scale-out endpoints
+    require a separate staging model.
+    """
+
+    if transformer_config.num_regular_experts == 0:
+        return CommStats()
+    if workload_spec.decode_cross_domain_ep_mode != DecodeCrossDomainEPMode.EXPLICIT_OWNER_A2AV:
+        raise ValueError(
+            "Cross-domain decode requires " "decode_cross_domain_ep_mode=explicit_owner_a2av"
+        )
+    ownership = workload_spec.moe_spec_v2.expert_domain_placement
+    if ownership is None:
+        raise ValueError("Cross-domain decode requires expert_domain_placement")
+    if ownership.kind != ExpertDomainPlacementKind.BALANCED_EXPERT_GROUPS:
+        raise ValueError(
+            "Cross-domain decode currently supports only "
+            "expert_domain_placement.kind=balanced_expert_groups"
+        )
+    if ownership.domain_tag != "EP_SO":
+        raise ValueError("Cross-domain decode requires expert_domain_placement.domain_tag=EP_SO")
+    if a2a_leg not in {"dispatch", "combine"}:
+        raise ValueError(f"a2a_leg must be 'dispatch' or 'combine', got {a2a_leg}")
+    tokens_per_full_expert_set = token_scopes.tokens_per_full_expert_set
+    tokens_per_feeder_set = token_scopes.tokens_per_feeder_set
+    feeders_per_full_expert_set = token_scopes.attn_domains_per_full_expert_set
+    if feeders_per_full_expert_set != moe_config.attn_domains_per_full_expert_set:
+        raise ValueError(
+            "Token-scope feeder count does not match expert placement: "
+            f"{feeders_per_full_expert_set} != "
+            f"{moe_config.attn_domains_per_full_expert_set}"
+        )
+    if tokens_per_feeder_set * feeders_per_full_expert_set != tokens_per_full_expert_set:
+        raise ValueError(
+            "Feeder-set token scopes do not reconstruct full-expert-set tokens: "
+            f"{tokens_per_feeder_set} * {feeders_per_full_expert_set} "
+            f"!= {tokens_per_full_expert_set}"
+        )
+    if feeders_per_full_expert_set <= 1:
+        raise ValueError(
+            "feeders_per_full_expert_set must be > 1, got " f"{feeders_per_full_expert_set}"
+        )
+    if tp_moe_y_shards <= 0:
+        raise ValueError(f"tp_moe_y_shards must be > 0, got {tp_moe_y_shards}")
+
+    groups_per_set = moe_config.num_colocated_groups_per_set
+    if groups_per_set <= 0:
+        raise ValueError(f"num_colocated_groups_per_set must be > 0, got {groups_per_set}")
+    if groups_per_set % feeders_per_full_expert_set != 0:
+        raise ValueError(
+            f"num_colocated_groups_per_set ({groups_per_set}) must be divisible by "
+            f"feeders_per_full_expert_set ({feeders_per_full_expert_set})"
+        )
+    xpus_per_group = moe_config.xpus_per_colocated_group
+    if xpus_per_group <= 0:
+        raise ValueError(f"xpus_per_colocated_group must be > 0, got {xpus_per_group}")
+    if xpus_per_group % tp_moe_y_shards != 0:
+        raise ValueError(
+            f"xpus_per_colocated_group ({xpus_per_group}) must be divisible by "
+            f"tp_moe_y_shards ({tp_moe_y_shards})"
+        )
+
+    so_mapping = ep_topology_view.get_mapping_for_tag("EP_SO")
+    if so_mapping.size != feeders_per_full_expert_set:
+        raise ValueError(
+            f"EP_SO size ({so_mapping.size}) must equal feeders_per_full_expert_set "
+            f"({feeders_per_full_expert_set})"
+        )
+    su_view = ep_topology_view.create_view(
+        view_name=f"Decode_{a2a_leg}_EP_SU",
+        relevant_tags=["EP_SU"],
+        global_sharing_context="max_exclusive",
+    )
+    so_view = ep_topology_view.create_view(
+        view_name=f"Decode_{a2a_leg}_EP_SO",
+        relevant_tags=["EP_SO"],
+        global_sharing_context="max_exclusive",
+    )
+
+    selected_experts_per_token = transformer_config.num_selected_experts
+    if selected_experts_per_token <= 0:
+        raise ValueError(
+            "num_selected_experts must be > 0 for cross-domain MoE exchange, "
+            f"got {selected_experts_per_token}"
+        )
+    effective_imbalance = moe_config.effective_expert_imbalance
+    if effective_imbalance < 1.0:
+        raise ValueError("effective_expert_imbalance must be >= 1, got " f"{effective_imbalance}")
+    expected_routed_multiplier = effective_imbalance * selected_experts_per_token
+    if not isclose(
+        moe_config.regular_expert_traffic_multiplier,
+        expected_routed_multiplier,
+        rel_tol=1e-12,
+        abs_tol=0.0,
+    ):
+        raise ValueError(
+            "regular_expert_traffic_multiplier must equal "
+            "effective_expert_imbalance * num_selected_experts: "
+            f"{moe_config.regular_expert_traffic_multiplier} != "
+            f"{effective_imbalance} * {selected_experts_per_token}"
+        )
+    balanced_pairs_per_endpoint = (
+        tokens_per_full_expert_set * selected_experts_per_token / groups_per_set
+    )
+    busiest_receiver_pairs = balanced_pairs_per_endpoint * effective_imbalance
+    bytes_per_token = transformer_config.d_model * float_size / tp_moe_y_shards
+
+    local_owner_fraction = 1.0 / feeders_per_full_expert_set
+    remote_fraction = 1.0 - local_owner_fraction
+    # Local-owner routes are already resident after the deterministic handoff.
+    # Keep the EP_SU trace record as an explicit no-op so the table documents
+    # why the balanced 1/D owner fraction does not become network traffic.
+    su_bytes_per_xpu = 0.0
+    so_bytes_per_xpu = busiest_receiver_pairs * remote_fraction * bytes_per_token
+
+    su_stats = CommStats()
+    so_stats = hockney_model_send_recv_on_nd_topology(
+        topology=so_view,
+        bytes_per_sender=so_bytes_per_xpu,
+        float_size_bytes=float_size,
+    )
+
+    stage_prefix = "decode_dispatch" if a2a_leg == "dispatch" else "decode_combine"
+    layout_trace.record_comm(
+        f"{stage_prefix}_su",
+        "NO-OP",
+        f"EP_SU({su_view.num_chips})",
+        su_view.num_chips,
+        su_bytes_per_xpu,
+        su_stats,
+        note=(
+            f"{a2a_leg}: local-owner fraction=1/{feeders_per_full_expert_set}, but "
+            "the exact per-feeder handoff already placed each token shard on "
+            "every aligned local expert group; EP_SU network bytes=0"
+        ),
+    )
+    layout_trace.record_comm(
+        f"{stage_prefix}_so",
+        "A2Av",
+        f"EP_SO({so_view.num_chips})",
+        so_view.num_chips,
+        so_bytes_per_xpu,
+        so_stats,
+        note=(
+            f"{a2a_leg}: busiest endpoint; remote_fraction="
+            f"{feeders_per_full_expert_set - 1}/{feeders_per_full_expert_set}; "
+            f"balanced_pairs/endpoint={balanced_pairs_per_endpoint:g}; "
+            f"effective_imbalance={effective_imbalance:g}; "
+            f"busiest_receiver_pairs={busiest_receiver_pairs:g}; "
+            f"bytes/token={bytes_per_token:g}"
+        ),
+    )
+    if a2a_leg == "dispatch":
+        tensor_stage = "decode_dispatch"
+        tensor_name = "x_dispatched"
+        d_partitions = (
+            {"D": P("sharded", ("MoE_Y",)), "B": P("replicated", ("Y",))}
+            if tp_moe_y_shards > 1
+            else {"B": P("replicated", ("Y",))}
+        )
+    else:
+        tensor_stage = "decode_combine_a2a"
+        tensor_name = "moe_out_returned"
+        moe_dims = tuple(
+            name
+            for name, size in (
+                ("MoE_X", moe_config.xpus_per_colocated_group // tp_moe_y_shards),
+                ("MoE_Y", tp_moe_y_shards),
+            )
+            if size > 1
+        )
+        d_partitions = (
+            {"D": P("sharded", moe_dims), "B": P("replicated", ("Y",))}
+            if moe_dims
+            else {"B": P("replicated", ("Y",))}
+        )
+    layout_trace.record(
+        tensor_stage,
+        f"Remote-owner {a2a_leg} A2Av on EP_SO; local-owner data already resident",
+        TensorRecord(
+            tensor_name,
+            {"B": tokens_per_feeder_set, "D": transformer_config.d_model},
+            d_partitions,
+            dtype_bytes=float_size,
+        ),
+        note=(
+            "actual: explicit, evenly distributed expert-group ownership with "
+            "busiest-endpoint timing; "
+            f"local_owner_fraction={local_owner_fraction:g} (already local), "
+            f"SO_network_fraction={remote_fraction:g}; "
+            f"feeder-equivalent B={tokens_per_feeder_set}"
+        ),
+    )
+    if not isclose(
+        so_bytes_per_xpu,
+        busiest_receiver_pairs * remote_fraction * bytes_per_token,
+        rel_tol=1e-12,
+        abs_tol=0.0,
+    ):
+        raise AssertionError("EP_SO exchange bytes do not conserve remote routed payload")
+    return so_stats
+
+
 def calculate_moe_combine_decode(
     ep_topology_view,
     transformer_config: TransformerConfig,
     moe_config,
-    num_attention_domain_tokens: int,
+    token_scopes: ResolvedMoETokenScopes,
     attn_tp_xpus: int,
     float_size: int,
     tp_moe_x_shards: int,
     tp_moe_y_shards: int,
+    num_local_colocated_groups: int,
+    record_layout_output: bool,
     projection_groups: int,
     attn_x_topology: LogicalTopology,
     attn_yz_topology: LogicalTopology,
@@ -801,15 +1179,12 @@ def calculate_moe_combine_decode(
     expert_set_topology: LogicalTopology | None,
     layout_trace=NULL_LAYOUT_TRACE,
 ) -> CommStats:
-    """Combine decode-time expert outputs inside one attention domain.
+    """Restore decode-time expert outputs to one attention-domain residual layout.
 
-    This path is used only when
-    ``attn_domains_per_full_expert_set == 1``: every complete expert set is
-    contained in one attention TP domain. The preceding projection-to-MoE
-    handoff makes that domain's tokens available to its expert ranks, so there
-    is no routed-token A2A dispatch here. Decode placements where one expert
-    set is fed by multiple attention domains use the symmetric dispatch/combine
-    A2A path in ``comm_model.py`` instead.
+    For a single-domain expert set this follows local expert execution directly.
+    For a cross-domain set it follows the A2Av return leg and combines only the
+    expert groups owned by this feeder domain. ``num_local_colocated_groups`` is
+    therefore explicit and must describe one feeder→set edge.
 
     The function returns **per-layer** communication statistics. The caller
     multiplies the result by ``num_layers_per_pp_stage``, matching the TP
@@ -817,8 +1192,8 @@ def calculate_moe_combine_decode(
 
     Definitions used below:
 
-    - ``B_set = B_attention_domain / S`` is the dense token count processed by
-      one of the ``S`` complete expert sets inside this attention domain.
+    - ``B_edge`` is the canonical token count for one attention-domain →
+      expert-set edge. It is supplied by ``token_scopes.tokens_per_feeder_set``.
     - ``D_expert = d_model / (TP_MoE_X * TP_MoE_Y)`` is one expert rank's
       output feature shard.
     - ``D_residual = d_model / (TP_Proj_X * TP_Proj_Y_eff)`` is the residual
@@ -829,30 +1204,30 @@ def calculate_moe_combine_decode(
       ``U_set == 1`` and no replica all-reduce is needed.
 
     Each colocated expert group first sums the weighted outputs of its local
-    top-k experts into a dense ``[B_set, D_expert]`` buffer. Entries for tokens
+    top-k experts into a dense ``[B_edge, D_expert]`` buffer. Entries for tokens
     not routed to that group are zero. Top-k and routing imbalance therefore
     affect expert work but do not scale the inter-group combine payload.
 
     The combine repairs three distinct kinds of ownership in order: feature
     shards, projection replicas, and token slices.
 
-    1. **Feature-group reduce-scatter.** Build the physical-axis quotient
+    1. **MoE-to-residual layout-quotient reduce-scatter.** Build the physical-axis quotient
        ``(TP_Proj_X × TP_Proj_Y_eff) / (TP_MoE_X × TP_MoE_Y)`` and run RS on
        that quotient. The division is axis-by-axis, so this may be an ND
-       collective. Within each aligned feature-group subgroup, RS both sums
+       collective. Within each aligned layout-quotient subgroup, RS both sums
        partial expert contributions and narrows ``D_expert`` to the
        ``D_residual`` shard expected by the next layer. Its output is therefore
        ready for the replica AR below. The RS input volume per rank is
-       ``B_set * D_expert * float_size``. It is a no-op when the quotient has
+       ``B_edge * D_expert * float_size``. It is a no-op when the quotient has
        one participant.
     2. **Projection-replica all-reduce.** If ``U_set > 1``, run AR across
        aligned replicas inside the same expert set—not across expert sets.
-       Members own the same ``B_set`` tokens and ``D_residual`` shard but hold
+       Members own the same ``B_edge`` tokens and ``D_residual`` shard but hold
        disjoint expert-group contributions. AR sums those contributions and leaves
-       ``[B_set, D_residual]`` replicated across the per-set replica axis.
-       The payload is ``B_set * D_residual * float_size``.
+       ``[B_edge, D_residual]`` replicated across the per-set replica axis.
+       The payload is ``B_edge * D_residual * float_size``.
     3. **Cross-set batch all-gather.** If ``S > 1``, each Y-aligned set owns a
-       disjoint ``B_set`` token slice. These slices must be concatenated, not
+       disjoint ``B_edge`` token slice. These slices must be concatenated, not
        summed, so AG across ``expert_set_topology`` reconstructs
        ``[B_attention_domain, D_residual]`` for the next layer.
        Matching replica subgroups execute concurrently; contention between
@@ -867,11 +1242,13 @@ def calculate_moe_combine_decode(
     if transformer_config.num_regular_experts == 0:
         return CommStats()
 
-    group_count = moe_config.num_colocated_groups_per_set
+    group_count = num_local_colocated_groups
+    num_attention_domain_tokens = token_scopes.tokens_per_attention_domain
+    tokens_per_feeder_set = token_scopes.tokens_per_feeder_set
     full_set_xpus = moe_config.full_expert_set_xpu_count
     xpus_per_group = moe_config.xpus_per_colocated_group
     if group_count <= 0:
-        raise ValueError(f"num_colocated_groups_per_set must be > 0, got {group_count}")
+        raise ValueError(f"num_local_colocated_groups must be > 0, got {group_count}")
     if full_set_xpus <= 0:
         raise ValueError(f"full_expert_set_xpu_count must be > 0, got {full_set_xpus}")
     if xpus_per_group <= 0:
@@ -891,10 +1268,11 @@ def calculate_moe_combine_decode(
             f"xpus_per_colocated_group ({xpus_per_group}) must equal "
             f"TP_MoE_X × TP_MoE_Y ({tp_moe_x_shards} × {tp_moe_y_shards})"
         )
-    if group_count * xpus_per_group != full_set_xpus:
+    local_set_xpus = min(full_set_xpus, attn_tp_xpus)
+    if group_count * xpus_per_group != local_set_xpus:
         raise ValueError(
             f"group_count × xpus_per_group = {group_count} × {xpus_per_group} "
-            f"!= full_expert_set_xpu_count ({full_set_xpus})"
+            f"!= local expert-set footprint ({local_set_xpus})"
         )
     if attn_tp_xpus != attn_x_topology.num_chips * attn_yz_topology.num_chips:
         raise ValueError(
@@ -923,17 +1301,26 @@ def calculate_moe_combine_decode(
             f"quotient ({resolved_projection_groups})"
         )
 
-    if attn_tp_xpus % full_set_xpus != 0:
-        raise ValueError(
-            f"attn_tp_xpus ({attn_tp_xpus}) must be divisible by "
-            f"full_expert_set_xpu_count ({full_set_xpus})"
-        )
-    num_combine_sets = attn_tp_xpus // full_set_xpus
+    if full_set_xpus > attn_tp_xpus:
+        num_combine_sets = 1
+    else:
+        if attn_tp_xpus % full_set_xpus != 0:
+            raise ValueError(
+                f"attn_tp_xpus ({attn_tp_xpus}) must be divisible by "
+                f"full_expert_set_xpu_count ({full_set_xpus})"
+            )
+        num_combine_sets = attn_tp_xpus // full_set_xpus
     if num_combine_sets != moe_config.full_expert_sets_per_attn_domain:
         raise ValueError(
             f"Resolved combine sets ({num_combine_sets}) != "
             "full_expert_sets_per_attn_domain "
             f"({moe_config.full_expert_sets_per_attn_domain})"
+        )
+    if num_combine_sets != token_scopes.full_expert_sets_per_attn_domain:
+        raise ValueError(
+            f"Resolved combine sets ({num_combine_sets}) != token-scope "
+            "full_expert_sets_per_attn_domain "
+            f"({token_scopes.full_expert_sets_per_attn_domain})"
         )
     if resolved_projection_groups % num_combine_sets != 0:
         raise ValueError(
@@ -960,17 +1347,17 @@ def calculate_moe_combine_decode(
         second_view=moe_yz_topology,
         view_name="MoE_Output_Layout",
     )
-    feature_group_view = _exact_layout_quotient_view(
+    moe_to_residual_layout_quotient_view = _exact_layout_quotient_view(
         numerator_view=projection_layout,
         denominator_view=moe_layout,
-        view_name="MoE_Combine_Feature_Groups",
+        view_name="MoE_To_Residual_Layout_Quotient",
     )
     global_replica_view = _exact_layout_quotient_view(
         numerator_view=attn_yz_topology,
         denominator_view=proj_yz_topology,
         view_name="MoE_Combine_Global_Projection_Replicas",
     )
-    feature_group_count = feature_group_view.num_chips
+    moe_to_residual_layout_quotient_count = moe_to_residual_layout_quotient_view.num_chips
     if global_replica_view.num_chips != projection_groups:
         raise ValueError(
             f"Replica quotient ({global_replica_view.num_chips}) != "
@@ -989,56 +1376,52 @@ def calculate_moe_combine_decode(
             view_name="MoE_Combine_Per_Set_Projection_Replicas",
             new_sizes={replica_tag: replicas_per_set},
         )
-    if group_count != feature_group_count * replicas_per_set:
+    if group_count != moe_to_residual_layout_quotient_count * replicas_per_set:
         raise ValueError(
-            f"Expert groups per set ({group_count}) must equal feature groups × "
-            f"per-set projection replicas ({feature_group_count} × {replicas_per_set})"
+            f"Expert groups per set ({group_count}) must equal MoE-to-residual "
+            "layout quotients × per-set projection replicas "
+            f"({moe_to_residual_layout_quotient_count} × {replicas_per_set})"
         )
-    if num_attention_domain_tokens % num_combine_sets != 0:
+    if tokens_per_feeder_set * num_combine_sets != num_attention_domain_tokens:
         raise ValueError(
-            f"num_attention_domain_tokens ({num_attention_domain_tokens}) must be "
-            f"divisible by local expert sets ({num_combine_sets})"
-        )
-
-    tokens_per_set = num_attention_domain_tokens // num_combine_sets
-    if tokens_per_set * num_combine_sets != num_attention_domain_tokens:
-        raise AssertionError(
-            f"Internal token partition failed to close: {tokens_per_set} × "
+            "Canonical feeder-set token scopes do not close over the attention "
+            f"domain: {tokens_per_feeder_set} × "
             f"{num_combine_sets} != {num_attention_domain_tokens}"
         )
     d_model = transformer_config.d_model
     expert_output_shard = d_model / (tp_moe_x_shards * tp_moe_y_shards)
     residual_output_shard = d_model / (proj_x_topology.num_chips * proj_yz_topology.num_chips)
-    rs_input_bytes = tokens_per_set * expert_output_shard * float_size
-    if feature_group_count == 1:
+    rs_input_bytes = tokens_per_feeder_set * expert_output_shard * float_size
+    if moe_to_residual_layout_quotient_count == 1:
         per_layer_rs = CommStats()
     else:
         per_layer_rs = hockney_model_reduce_scatter_on_nd_topology(
-            view=feature_group_view,
+            view=moe_to_residual_layout_quotient_view,
             P_total_bytes_before_rs=rs_input_bytes,
             float_size_bytes=float_size,
         )
-    feature_shape = " × ".join(
+    layout_quotient_shape = " × ".join(
         f"{_logical_tag_string(dimension.logical_tag)}={dimension.size}"
-        for dimension in feature_group_view.dimensions
+        for dimension in moe_to_residual_layout_quotient_view.dimensions
     )
     layout_trace.record_comm(
         "combine_rs_exact_groups",
         "RS",
-        feature_shape,
-        feature_group_count,
+        layout_quotient_shape,
+        moe_to_residual_layout_quotient_count,
         rs_input_bytes,
         per_layer_rs,
         note=(
-            "Dense expert-output combine over exact feature-sharding quotients. "
-            f"B_set={tokens_per_set}, D_expert={expert_output_shard:g}, "
+            "Dense expert-output combine over the exact MoE-to-residual "
+            "layout quotient. "
+            f"B_feeder_set={tokens_per_feeder_set}, D_expert={expert_output_shard:g}, "
             f"D_residual={residual_output_shard:g}."
         ),
     )
 
     per_layer = per_layer_rs
     if replicas_per_set > 1:
-        replica_payload_bytes = tokens_per_set * residual_output_shard * float_size
+        replica_payload_bytes = tokens_per_feeder_set * residual_output_shard * float_size
         per_layer_replica_ar = hockney_model_all_reduce_on_nd_topology(
             view=replica_view,
             P_total_bytes=replica_payload_bytes,
@@ -1057,7 +1440,7 @@ def calculate_moe_combine_decode(
             per_layer_replica_ar,
             note=(
                 "Sum disjoint expert contributions and replicate the final residual shard "
-                f"across projection replicas. B_set={tokens_per_set}, "
+                f"across projection replicas. B_feeder_set={tokens_per_feeder_set}, "
                 f"D_residual={residual_output_shard:g}."
             ),
         )
@@ -1065,7 +1448,7 @@ def calculate_moe_combine_decode(
 
     if num_combine_sets > 1:
         assert expert_set_topology is not None
-        tokens_per_attn_domain = tokens_per_set * num_combine_sets
+        tokens_per_attn_domain = tokens_per_feeder_set * num_combine_sets
         if tokens_per_attn_domain != num_attention_domain_tokens:
             raise AssertionError(
                 f"Cross-set gather output tokens ({tokens_per_attn_domain}) != "
@@ -1090,12 +1473,47 @@ def calculate_moe_combine_decode(
             per_layer_cross_set_ag,
             note=(
                 f"Gather disjoint B/{num_combine_sets} token slices after per-set combine: "
-                f"B_set={tokens_per_set} -> B_domain={tokens_per_attn_domain}. "
+                f"B_feeder_set={tokens_per_feeder_set} -> "
+                f"B_domain={tokens_per_attn_domain}. "
                 f"{replicas_per_set} aligned subgroup(s) run concurrently. "
                 "MODEL_LIMITATION: cross-subgroup fabric contention is not modeled."
             ),
         )
         per_layer = per_layer + per_layer_cross_set_ag
+
+    if record_layout_output:
+        output_partitions = {
+            "D": P("sharded", ("X", "Y_eff")),
+            "B": P("replicated", ("Y",)),
+        }
+        output_tensor = TensorRecord(
+            "moe_out",
+            {"B": num_attention_domain_tokens, "D": transformer_config.d_model},
+            output_partitions,
+            dtype_bytes=float_size,
+        )
+        layout_trace.record(
+            "after_combine",
+            "Local residual-layout restoration after cross-domain return",
+            output_tensor,
+            note=(
+                "actual: exact RS(moe_to_residual_layout_quotient="
+                f"{moe_to_residual_layout_quotient_count}) + "
+                f"AR(projection_replicas={replicas_per_set}); "
+                f"D_local={residual_output_shard:g}"
+            ),
+        )
+        layout_trace.record(
+            "layer_output",
+            "Residual add → next layer",
+            TensorRecord(
+                "x_out",
+                {"B": num_attention_domain_tokens, "D": transformer_config.d_model},
+                output_partitions,
+                dtype_bytes=float_size,
+            ),
+            note=f"actual: restored incoming projection layout; D_local={residual_output_shard:g}",
+        )
 
     return per_layer
 
@@ -1104,7 +1522,7 @@ def calculate_moe_comm_hierarchical_total_exchange(
     ep_topology_view,
     transformer_config: TransformerConfig,
     moe_config,
-    num_global_batch_tokens: int,
+    token_scopes: ResolvedMoETokenScopes,
     float_size: int,
     tp_moe_y_shards: int,
     workload_spec=None,
@@ -1118,6 +1536,8 @@ def calculate_moe_comm_hierarchical_total_exchange(
 
     ``a2a_leg`` labels the layout-trace stage emitted by this call:
     ``"dispatch"`` (token routing to experts) or ``"combine"`` (return leg).
+    Per-set token volume comes from the canonical ``token_scopes`` rather than
+    being reconstructed from topology dimensions.
     """
     if transformer_config.num_regular_experts == 0:
         return CommStats()
@@ -1138,12 +1558,12 @@ def calculate_moe_comm_hierarchical_total_exchange(
     if (
         full_expert_set_xpu_count <= 0
         or xpus_per_colocated_group <= 0
-        or num_colocated_groups_per_set < 0
+        or num_colocated_groups_per_set <= 0
         or attn_domains_per_full_expert_set <= 0
     ):
         raise ValueError(
             "Invalid expert placement fields: expected full_expert_set_xpu_count>0, "
-            "xpus_per_colocated_group>0, num_colocated_groups_per_set>=0, "
+            "xpus_per_colocated_group>0, num_colocated_groups_per_set>0, "
             "attn_domains_per_full_expert_set>0."
         )
     routed_expert_traffic_multiplier = float(
@@ -1158,13 +1578,17 @@ def calculate_moe_comm_hierarchical_total_exchange(
         ) from e
     if ep_total_xpus <= 0:
         raise ValueError(f"Invalid ep_chips_per_pp_stage: {ep_total_xpus}. Expected > 0.")
-    if ep_total_xpus % max(1, full_expert_set_xpu_count) != 0:
+    if ep_total_xpus % full_expert_set_xpu_count != 0:
         raise ValueError(
             f"EP chips ({ep_total_xpus}) must be divisible by full_expert_set_xpu_count ({full_expert_set_xpu_count})"
         )
-    num_full_sets = ep_total_xpus // max(1, full_expert_set_xpu_count)
-
-    tokens_per_set = num_global_batch_tokens / max(1, num_full_sets)
+    num_full_sets = ep_total_xpus // full_expert_set_xpu_count
+    if num_full_sets != token_scopes.complete_expert_set_count:
+        raise ValueError(
+            f"Topology-derived expert-set count ({num_full_sets}) != token-scope "
+            f"complete_expert_set_count ({token_scopes.complete_expert_set_count})"
+        )
+    tokens_per_set = token_scopes.tokens_per_full_expert_set
     # Smooth locality model (independence approximation):
     #   routing_nonlocal_fraction = 1 - 1 / (attn_domains_per_full_expert_set
     #                                        * num_colocated_groups_per_set)
@@ -1182,18 +1606,16 @@ def calculate_moe_comm_hierarchical_total_exchange(
     # attn_domains_per_full_expert_set factor is only needed when separating
     # the within-attention-domain remote share from the cross-attention-
     # domain remote share (which only matters for cross-rack fabric
-    # accounting). For the intra-rack centralized-pool path the two formulas
+    # accounting). For the scale-up-resident wide-EP path the two formulas
     # pick the same physical fabric — only the volume scales differ. The
     # product form is kept pending the refinement below.
     #
     # TODO: refine into separate within-attention-domain and cross-attention-
-    # domain fractions so cross-rack centralized pools (full_expert_set spans
-    # scale-out fabric) attribute the right volume to EP_SU vs. EP_SO.
+    # domain fractions so scale-out-spanning wide-EP sets attribute the right
+    # volume to EP_SU vs. EP_SO.
     # Current product form double-counts locality when both factors are > 1
     # and under-counts the SO leg when only the cross-domain share is remote.
-    routing_buckets_per_set = max(
-        1, attn_domains_per_full_expert_set * max(1, num_colocated_groups_per_set)
-    )
+    routing_buckets_per_set = attn_domains_per_full_expert_set * num_colocated_groups_per_set
     routing_nonlocal_fraction = max(0.0, 1.0 - (1.0 / float(routing_buckets_per_set)))
     # Model routed exchange at expert-group granularity, then map to per-XPU payload
     # by dividing across TP ranks inside the group.
@@ -1201,17 +1623,15 @@ def calculate_moe_comm_hierarchical_total_exchange(
         tokens_per_set
         * routed_expert_traffic_multiplier
         * routing_nonlocal_fraction
-        / max(1, num_colocated_groups_per_set)
+        / num_colocated_groups_per_set
     )
     # EP A2A toggle semantics:
     # - optimization ON: send one grouped copy over EP exchange, then redistribute inside TP group.
     # - optimization OFF: each TP rank carries its own routed copy over EP exchange.
     # This makes EP A2A volume larger in OFF mode, as intended.
     optimization_enabled = bool(getattr(workload_spec, "tp_moe_a2a_replication_optimization", True))
-    a2a_replication_factor = (
-        1.0 if optimization_enabled else float(max(1, xpus_per_colocated_group))
-    )
-    tokens_per_xpu = tokens_per_group / max(1, xpus_per_colocated_group) * a2a_replication_factor
+    a2a_replication_factor = 1.0 if optimization_enabled else float(xpus_per_colocated_group)
+    tokens_per_xpu = tokens_per_group / xpus_per_colocated_group * a2a_replication_factor
 
     # Resolve this once so hierarchical and fused paths are based on the same EP
     # interpretation. EP_SU is the scale-up XPU-domain capacity for experts.
@@ -1227,7 +1647,8 @@ def calculate_moe_comm_hierarchical_total_exchange(
     moe_a2a_comm_mode = workload_spec.moe_a2a_comm_mode
     # Shard MoE A2A activation payload by TP_MoE_Y.
     # For 1D MoE TP this value is 1, so behavior is unchanged.
-    tp_moe_y_shards = max(1, int(tp_moe_y_shards))
+    if tp_moe_y_shards <= 0:
+        raise ValueError(f"tp_moe_y_shards must be > 0, got {tp_moe_y_shards}")
     bytes_per_token = (d_model * float_size) / tp_moe_y_shards
 
     # Stage name in the layout trace.  Mirrors the TensorRecord stages

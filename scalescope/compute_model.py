@@ -157,7 +157,7 @@ def _calculate_prefill_moe_compute(
             "Shared experts are not supported in _calculate_prefill_moe_compute normalization"
         )
 
-    # Router computation uses total tokens per full expert set (batch × seq_length)
+    # Expert compute uses the token scope of one complete expert set.
     tokens_per_set = (
         workload_spec.get_resolved_batches().batch_size_per_full_expert_set
         * workload_spec.seq_length
@@ -169,7 +169,7 @@ def _calculate_prefill_moe_compute(
     #    topk_flops = tokens_per_set * max(0, num_routed_experts)
     # router_flops = gating_flops + topk_flops
 
-    # Router computation
+    # Router computation is local to one attention domain.
     # TODO(MB): refine router FLOPs approximation
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     n_seq = workload_spec.seq_length

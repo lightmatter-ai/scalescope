@@ -932,8 +932,110 @@ def _verifier_batch_divides_dp_attn(
     return gb % dp_chips == 0
 
 
+def _verifier_decode_cross_domain_ep_exact(
+    case: Case,
+    base_specs: Mapping[str, BaseModel],
+    params: Mapping[str, Any] | None = None,
+    *,
+    applied_specs: Any = None,
+) -> bool:
+    """Validate one-set decode with evenly distributed expert-group ownership."""
+
+    specs = _resolve_specs(case, base_specs, applied_specs)
+    if specs is None:
+        return False
+    ws = specs.get("workload_spec")
+    topo = specs.get("logical_topology")
+    model = specs.get("model_spec")
+    if ws is None or topo is None or model is None:
+        return False
+    mode = getattr(ws, "decode_cross_domain_ep_mode", None)
+    if mode is None:
+        return True
+    if getattr(mode, "value", str(mode)) != "explicit_owner_a2av":
+        return False
+    router_mode = getattr(ws.decode_moe_router_sync_mode, "value", "")
+    if router_mode not in {"replicated_router", "sharded_router"}:
+        return False
+
+    ownership = getattr(ws.moe_spec_v2, "expert_domain_placement", None)
+    if ownership is None:
+        return False
+    if getattr(ownership.kind, "value", "") != "balanced_expert_groups":
+        return False
+    if ownership.domain_tag != "EP_SO":
+        return False
+
+    try:
+        experts = int(model.num_regular_experts)
+        colocated = int(ws.moe_spec_v2.num_colocated_experts)
+        attn_x = int(topo.get_mapping_for_tag("TP_Attn_X").size)
+        attn_y = int(topo.get_mapping_for_tag("TP_Attn_Y").size)
+        proj_y = int(topo.get_mapping_for_tag("TP_Proj_Y").size)
+        moe_x = int(topo.get_mapping_for_tag("TP_MoE_X").size)
+        moe_y = int(topo.get_mapping_for_tag("TP_MoE_Y").size)
+        dp_attn_su = int(topo.get_mapping_for_tag("DP_Attn_SU").size)
+        dp_attn_so = int(topo.get_mapping_for_tag("DP_Attn_SO").size)
+        ep_so = int(topo.get_mapping_for_tag("EP_SO").size)
+        moe_y_physical_axis = topo.get_mapping_for_tag("TP_MoE_Y").maps_to_physical_dimension_name
+        ep_so_physical_axis = topo.get_mapping_for_tag("EP_SO").maps_to_physical_dimension_name
+        projection_groups = int(ws.projection_groups)
+        global_batch_size = int(ws.global_batch_size)
+        cluster_xpus = int(topo.physical_topology.total_nodes)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+    values = (
+        experts,
+        colocated,
+        attn_x,
+        attn_y,
+        proj_y,
+        moe_x,
+        moe_y,
+        dp_attn_su,
+        dp_attn_so,
+        ep_so,
+        projection_groups,
+        global_batch_size,
+        cluster_xpus,
+    )
+    if any(value <= 0 for value in values):
+        return False
+    if experts % colocated != 0 or proj_y % projection_groups != 0:
+        return False
+
+    groups_per_set = experts // colocated
+    xpus_per_group = moe_x * moe_y
+    full_set_xpus = groups_per_set * xpus_per_group
+    attention_domain_xpus = attn_x * attn_y
+    if full_set_xpus <= attention_domain_xpus:
+        return False
+    if full_set_xpus != cluster_xpus:
+        return False
+    if full_set_xpus % attention_domain_xpus != 0:
+        return False
+    attention_domains_per_set = full_set_xpus // attention_domain_xpus
+    if groups_per_set % attention_domains_per_set != 0:
+        return False
+    if dp_attn_su * dp_attn_so != attention_domains_per_set:
+        return False
+    if ep_so != attention_domains_per_set:
+        return False
+    if global_batch_size % attention_domains_per_set != 0:
+        return False
+    if (
+        router_mode == "sharded_router"
+        and moe_y > 1
+        and ep_so > 1
+        and moe_y_physical_axis == ep_so_physical_axis
+    ):
+        return False
+    return proj_y // projection_groups == moe_y
+
+
 # Extend allowlist
 ALLOWED_SWEEP_VERIFIERS["batch_divides_dp_attn"] = _verifier_batch_divides_dp_attn
+ALLOWED_SWEEP_VERIFIERS["decode_cross_domain_ep_exact"] = _verifier_decode_cross_domain_ep_exact
 ALLOWED_SWEEP_VERIFIERS["projection_groups_divides_proj_yz"] = (
     _verifier_projection_groups_divides_proj_yz
 )

@@ -8,7 +8,8 @@ import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from scalescope.decode_layout_trace import NULL_LAYOUT_TRACE
+from scalescope.decode_layout_trace import NULL_LAYOUT_TRACE, P, TensorRecord
+from scalescope.ep_strategy import resolve_moe_token_scopes
 from scalescope.model_spec import (
     attention_layer_classes,
     resolve_kv_heads_per_partition,
@@ -1372,7 +1373,7 @@ class TP1DAttnStrategy(TensorParallelStrategy):
 class TP1DMoEStrategy(TensorParallelStrategy):
     """Models 1D TP for the MoE/FFN block."""
 
-    def _forward_comm_prefill_train(
+    def _forward_comm_all_modes(
         self,
         transformer_config: TransformerConfig,
         moe_config,
@@ -1493,7 +1494,7 @@ class TP1DMoEStrategy(TensorParallelStrategy):
         attn_tp_topology: LogicalTopology | None = None,
         **kwargs,
     ) -> CommStats:
-        return self._forward_comm_prefill_train(
+        return self._forward_comm_all_modes(
             transformer_config,
             moe_config,
             workload_spec,
@@ -1513,7 +1514,7 @@ class TP1DMoEStrategy(TensorParallelStrategy):
         attn_tp_topology: LogicalTopology | None = None,
         **kwargs,
     ) -> CommStats:
-        return self._forward_comm_prefill_train(
+        return self._forward_comm_all_modes(
             transformer_config,
             moe_config,
             workload_spec,
@@ -1533,7 +1534,7 @@ class TP1DMoEStrategy(TensorParallelStrategy):
         attn_tp_topology: LogicalTopology | None = None,
         **kwargs,
     ) -> CommStats:
-        return self._forward_comm_prefill_train(
+        return self._forward_comm_all_modes(
             transformer_config,
             moe_config,
             workload_spec,
@@ -1777,8 +1778,6 @@ class TP2DAttnStrategy(TensorParallelStrategy):
         n_kv_heads = transformer_config.num_kv_heads
         d_head = transformer_config.head_dim
         s = n_batch * n_seq
-
-        from scalescope.decode_layout_trace import P, TensorRecord
 
         layout_trace.record(
             "layer_input",
@@ -2165,7 +2164,7 @@ class TP2DAttnStrategy(TensorParallelStrategy):
 class TP2DMoEStrategy(TensorParallelStrategy):
     """Models 2D TP for the MoE/FFN block."""
 
-    def _forward_comm_prefill_train(
+    def _forward_comm_all_modes(
         self,
         transformer_config: TransformerConfig,
         moe_config,
@@ -2194,14 +2193,17 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             raise ValueError("TP2DMoEStrategy requires x_topology and yz_topology.")
         if attn_tp_topology is None:
             raise ValueError("TP2DMoEStrategy requires attn_tp_topology.")
+        # Decode always uses the deterministic projection-to-MoE layout
+        # handoff. For D=1 it places the expert set's local tokens; for D>1 it
+        # applies the same handoff independently to each feeder before the
+        # remote-owner A2Av. Prefill/training retain the routed exchange path.
+        exact_decode_handoff = is_decode
         single_domain_decode = is_decode and moe_config.attn_domains_per_full_expert_set == 1
         full_sets_per_attn_domain = moe_config.full_expert_sets_per_attn_domain
-        if single_domain_decode:
+        if exact_decode_handoff:
             if full_sets_per_attn_domain is None:
-                raise ValueError(
-                    "Single-domain TP2D MoE decode requires " "full_expert_sets_per_attn_domain."
-                )
-            if full_sets_per_attn_domain > 1:
+                raise ValueError("TP2D MoE decode requires full_expert_sets_per_attn_domain.")
+            if single_domain_decode and full_sets_per_attn_domain > 1:
                 if expert_set_topology is None:
                     raise ValueError("Multiple Y-aligned expert sets require expert_set_topology.")
                 if expert_set_topology.num_chips != full_sets_per_attn_domain:
@@ -2209,9 +2211,9 @@ class TP2DMoEStrategy(TensorParallelStrategy):
                         f"expert_set_topology ({expert_set_topology.num_chips}) must equal "
                         f"full_expert_sets_per_attn_domain ({full_sets_per_attn_domain})"
                     )
-        if single_domain_decode and (proj_x_topology is None or proj_yz_topology is None):
+        if exact_decode_handoff and (proj_x_topology is None or proj_yz_topology is None):
             raise ValueError(
-                "Single-domain TP2D MoE decode requires proj_x_topology and "
+                "TP2D MoE decode requires proj_x_topology and "
                 "proj_yz_topology for the output-projection layout handoff."
             )
 
@@ -2228,22 +2230,30 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             tp_yz *= shape[idx]
 
         resolved_batches = workload_spec.get_resolved_batches()
-        n_batch = resolved_batches.batch_size_per_dp
-        tokens_local = n_batch * n_seq
-        tokens_per_set = resolved_batches.batch_size_per_full_expert_set * n_seq
-        if single_domain_decode:
+        if exact_decode_handoff:
             assert full_sets_per_attn_domain is not None
-            if tokens_per_set * full_sets_per_attn_domain != tokens_local:
+            if resolved_batches.complete_expert_set_count != moe_config.num_complete_expert_sets:
                 raise ValueError(
-                    f"Per-set tokens ({tokens_per_set}) × sets "
-                    f"({full_sets_per_attn_domain}) must equal attention-domain tokens "
-                    f"({tokens_local})"
+                    "Resolved expert-set count does not match expert placement: "
+                    f"{resolved_batches.complete_expert_set_count} != "
+                    f"{moe_config.num_complete_expert_sets}"
                 )
+            token_scopes = resolve_moe_token_scopes(
+                resolved_batches=resolved_batches,
+                tokens_per_sequence=n_seq,
+                attn_domains_per_full_expert_set=(moe_config.attn_domains_per_full_expert_set),
+                full_expert_sets_per_attn_domain=full_sets_per_attn_domain,
+            )
+            tokens_local = token_scopes.tokens_per_attention_domain
+            tokens_per_set = token_scopes.tokens_per_full_expert_set
+            tokens_per_feeder_set = token_scopes.tokens_per_feeder_set
+        else:
+            tokens_local = resolved_batches.batch_size_per_dp * n_seq
+            tokens_per_set = resolved_batches.batch_size_per_full_expert_set * n_seq
+            tokens_per_feeder_set = tokens_per_set
         # MoE-stage trace should reflect per-full-expert-set token ownership.
-        # For num_complete_sets>1 this avoids showing global batch on each set.
-        s = tokens_per_set
-
-        from scalescope.decode_layout_trace import P, TensorRecord
+        # Decode traces one feeder→set edge; prefill/training retain full-set scope.
+        s = tokens_per_feeder_set if exact_decode_handoff else tokens_per_set
 
         _moe_d_dims = []
         if tp_x > 1:
@@ -2276,7 +2286,7 @@ class TP2DMoEStrategy(TensorParallelStrategy):
                     f"coarsening of MoE layout: projection={target_x}×{target_y_eff}, "
                     f"MoE={tp_x}×{tp_yz}"
                 )
-            feature_groups = (target_x // tp_x) * (target_y_eff // tp_yz)
+            moe_to_residual_layout_quotient_count = (target_x // tp_x) * (target_y_eff // tp_yz)
             assert full_sets_per_attn_domain is not None
             global_projection_replicas = attn_tp_xpus // (target_x * target_y_eff)
             if global_projection_replicas % full_sets_per_attn_domain != 0:
@@ -2285,13 +2295,16 @@ class TP2DMoEStrategy(TensorParallelStrategy):
                     f"divisible by expert sets ({full_sets_per_attn_domain})"
                 )
             projection_replicas = global_projection_replicas // full_sets_per_attn_domain
-            if groups_per_set != feature_groups * projection_replicas:
+            if groups_per_set != moe_to_residual_layout_quotient_count * projection_replicas:
                 raise ValueError(
-                    f"Expert groups ({groups_per_set}) != feature groups × projection replicas "
-                    f"({feature_groups} × {projection_replicas})"
+                    f"Expert groups ({groups_per_set}) != MoE-to-residual layout "
+                    "quotients × projection replicas "
+                    f"({moe_to_residual_layout_quotient_count} × "
+                    f"{projection_replicas})"
                 )
             handoff_mode = (
-                f"exact RS(feature_groups={feature_groups}) + "
+                "exact RS(moe_to_residual_layout_quotient="
+                f"{moe_to_residual_layout_quotient_count}) + "
                 f"AR(projection_replicas={projection_replicas})"
             )
             _post_combine_d_part = {
@@ -2323,7 +2336,7 @@ class TP2DMoEStrategy(TensorParallelStrategy):
         else:
             num_combine_sets = 1
 
-        if single_domain_decode:
+        if exact_decode_handoff:
             assert proj_x_topology is not None
             assert proj_yz_topology is not None
             proj_x = proj_x_topology.num_chips
@@ -2357,13 +2370,14 @@ class TP2DMoEStrategy(TensorParallelStrategy):
                 "Local selection of this complete expert set's token slice",
                 TensorRecord(
                     "x_moe_set",
-                    {"B": tokens_per_set, "D": d_model},
+                    {"B": tokens_per_feeder_set, "D": d_model},
                     _proj_d_part,
                     dtype_bytes=float_size,
                 ),
                 note=(
                     f"actual: zero-communication token selection B={tokens_local} -> "
-                    f"B_set={tokens_per_set} across {num_combine_sets} Y-aligned set(s)"
+                    f"B_feeder_set={tokens_per_feeder_set} across "
+                    f"{full_sets_per_attn_domain} local set(s)"
                 ),
             )
         else:
@@ -2397,9 +2411,9 @@ class TP2DMoEStrategy(TensorParallelStrategy):
         if moe_config.num_shared_experts_per_dp_rank > 0:
             raise NotImplementedError("Shared experts not implemented in 2D TP MoE strategy.")
 
-        # Phase A1.  Single-domain decode consumes the output-projection
-        # layout directly: always AG all tokens over TP_Proj_X, then reconcile
-        # TP_Proj_Y_eff with TP_MoE_Y.  Other pass/domain modes retain the
+        # Phase A1. Decode consumes each feeder's output-projection layout
+        # directly: always AG all feeder-set tokens over TP_Proj_X, then
+        # reconcile TP_Proj_Y_eff with TP_MoE_Y. Prefill/training retain the
         # existing optional routed-token transport optimization.
         redistribution_optimization_enabled = bool(
             moe_config.tp_moe_a2a_replication_optimization_enabled
@@ -2422,14 +2436,14 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             )
         else:
             routed_tokens_per_chip = 0.0
-        if single_domain_decode and n_experts > 0:
+        if exact_decode_handoff and n_experts > 0:
             assert proj_x_topology is not None
             assert proj_yz_topology is not None
             total_comm += _decode_moe_input_layout_comm(
                 proj_x_topology=proj_x_topology,
                 proj_yz_topology=proj_yz_topology,
                 moe_yz_topology=yz_topology,
-                tokens=tokens_per_set,
+                tokens=tokens_per_feeder_set,
                 d_model=d_model,
                 float_size=float_size,
                 layout_trace=layout_trace,
@@ -2658,6 +2672,10 @@ class TP2DMoEStrategy(TensorParallelStrategy):
             TensorRecord("y_expert", {"B": s, "D": d_model}, _moe_d_part, dtype_bytes=float_size),
             note=f"actual: C2 RS(X). D_local = {_moe_d_local} (tp_x={tp_x}, tp_yz={tp_yz})",
         )
+        if exact_decode_handoff and not single_domain_decode:
+            # Cross-domain return A2Av and local residual-layout restoration
+            # are priced and traced by ep_strategy after expert execution.
+            return total_comm
         if num_combine_sets > 1:
             # After intra-set RS(G), rank-local D may hand off to next-layer X sharding.
             layout_trace.record(
@@ -2737,7 +2755,7 @@ class TP2DMoEStrategy(TensorParallelStrategy):
         attn_tp_topology: LogicalTopology | None = None,
         **kwargs,
     ) -> CommStats:
-        return self._forward_comm_prefill_train(
+        return self._forward_comm_all_modes(
             transformer_config=transformer_config,
             moe_config=moe_config,
             workload_spec=workload_spec,
@@ -2766,7 +2784,7 @@ class TP2DMoEStrategy(TensorParallelStrategy):
         attn_tp_topology: LogicalTopology | None = None,
         **kwargs,
     ) -> CommStats:
-        return self._forward_comm_prefill_train(
+        return self._forward_comm_all_modes(
             transformer_config=transformer_config,
             moe_config=moe_config,
             workload_spec=workload_spec,
@@ -2795,7 +2813,7 @@ class TP2DMoEStrategy(TensorParallelStrategy):
         attn_tp_topology: LogicalTopology | None = None,
         **kwargs,
     ) -> CommStats:
-        return self._forward_comm_prefill_train(
+        return self._forward_comm_all_modes(
             transformer_config=transformer_config,
             moe_config=moe_config,
             workload_spec=workload_spec,

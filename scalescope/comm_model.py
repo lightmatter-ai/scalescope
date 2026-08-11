@@ -12,6 +12,8 @@ from scalescope.ep_strategy import (
     calculate_moe_combine_decode,
     calculate_moe_comm_first_total_exchange,
     calculate_moe_comm_second_total_exchange,
+    calculate_moe_decode_cross_domain_exchange,
+    resolve_moe_token_scopes,
 )
 from scalescope.model_spec import (
     attn_params_per_xpu,
@@ -33,7 +35,11 @@ from scalescope.tp_strategy import (
     validate_2d_tp_invariants_proj,
 )
 from scalescope.utils import PassMode
-from scalescope.workload_spec import TensorParallelVariant, WorkloadSpec
+from scalescope.workload_spec import (
+    MoERouterSyncMode,
+    TensorParallelVariant,
+    WorkloadSpec,
+)
 
 
 def pipeline_parallel_comm_forward_backward(
@@ -107,7 +113,6 @@ def get_transformer_comm_stats(
     pass_mode,
     layout_trace=NULL_LAYOUT_TRACE,
 ):
-    n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     # Use layers per pipeline stage from workload spec
     num_layers_per_pp_stage = workload_spec.get_layers_per_pp_stage()
     # Allow different TP variants for Attn vs MoE
@@ -280,8 +285,25 @@ def get_transformer_comm_stats(
     tp_attn_fwd_phase3 = num_layers_per_pp_stage * phases.phase3_output_proj
 
     # MoE communication cost for the forward pass
-    num_global_batch_tokens = attn_dp_topology.num_chips * n_batch * n_seq
-    num_attention_domain_tokens = n_batch * comm_n_seq
+    resolved_batches = workload_spec.get_resolved_batches()
+    if resolved_batches.attention_domain_count != attn_dp_topology.num_chips:
+        raise ValueError(
+            "Resolved attention-domain count does not match the DP topology: "
+            f"{resolved_batches.attention_domain_count} != "
+            f"{attn_dp_topology.num_chips}"
+        )
+    if resolved_batches.complete_expert_set_count != moe_config.num_complete_expert_sets:
+        raise ValueError(
+            "Resolved expert-set count does not match expert placement: "
+            f"{resolved_batches.complete_expert_set_count} != "
+            f"{moe_config.num_complete_expert_sets}"
+        )
+    token_scopes = resolve_moe_token_scopes(
+        resolved_batches=resolved_batches,
+        tokens_per_sequence=comm_n_seq,
+        attn_domains_per_full_expert_set=moe_config.attn_domains_per_full_expert_set,
+        full_expert_sets_per_attn_domain=moe_config.full_expert_sets_per_attn_domain,
+    )
 
     # EP / MoE A2A: strategy functions return per-layer stats (same convention
     # as TP strategies above); multiply by num_layers_per_pp_stage here.
@@ -292,12 +314,14 @@ def get_transformer_comm_stats(
         if attn_domains_per_set > 1:
             # Multi-attention-domain decode: the expert set is larger than one
             # attention TP domain, so dispatch is no longer free.  Two sub-cases:
-            #   - intra-rack centralized pool: full_set_xpus <= scale_up_domain
-            #     size → all feeders + experts inside one scale-up fabric.
+            #   - scale-up-resident wide-EP set: full_set_xpus <= scale_up_domain
+            #     size → all feeder domains and experts share one scale-up fabric.
             #     Single-fabric A2A on EP_SU for both dispatch and combine.
-            #   - cross-rack centralized pool: full_set_xpus > scale_up_domain
-            #     size → pool spans scale-out fabric; needs per-feeder
-            #     hierarchical accounting (deferred).
+            #   - scale-out-spanning wide-EP set: full_set_xpus >
+            #     scale_up_domain size → one expert set spans multiple scale-up
+            #     domains. The exact handoff prepositions local-owner shards, so
+            #     local dispatch/return is a zero-byte EP_SU no-op; only
+            #     remote-owner A2Av is charged on EP_SO.
             try:
                 scale_up_domain_size = ep_topology.get_mapping_for_tag("EP_SU").size
             except Exception as e:
@@ -306,46 +330,114 @@ def get_transformer_comm_stats(
                     "multi-attention-domain decode feasibility."
                 ) from e
             if full_set_xpus > scale_up_domain_size:
-                raise NotImplementedError(
-                    f"EP decode with full_expert_set_xpu_count={full_set_xpus} > "
-                    f"scale_up_domain_size={scale_up_domain_size} (and "
-                    f"attn_domains_per_full_expert_set={attn_domains_per_set}) "
-                    f"is not supported yet. Cross-rack centralized expert pools "
-                    f"require per-feeder hierarchical dispatch + combine "
-                    f"accounting on scale-out fabric, which is not implemented. "
-                    f"For now, choose a topology where the expert set fits in "
-                    f"one scale-up domain (full_expert_set_xpu_count <= "
-                    f"scale_up_domain_size)."
+                if moe_config.num_complete_expert_sets != 1:
+                    raise NotImplementedError(
+                        "Scale-out-spanning wide-EP decode currently requires exactly "
+                        "one complete expert set"
+                    )
+                if moe_config.full_expert_sets_per_attn_domain != 1:
+                    raise NotImplementedError(
+                        "Scale-out-spanning wide-EP decode does not support multiple "
+                        "complete expert sets inside one attention domain"
+                    )
+                if moe_config.router_sync_mode == MoERouterSyncMode.SHARDED_ROUTER:
+                    if moe_config.router_shard_factor != tp_moe_y_shards:
+                        raise ValueError(
+                            "Feeder-local sharded router requires router_shard_factor "
+                            "to equal TP_MoE_Y; got "
+                            f"{moe_config.router_shard_factor} != {tp_moe_y_shards}"
+                        )
+                    ep_so_mapping = ep_topology.get_mapping_for_tag("EP_SO")
+                    router_physical_axes = {
+                        mapping.maps_to_physical_dimension_name
+                        for mapping in resolved.yz_view.dimensions
+                        if mapping.size > 1
+                    }
+                    if (
+                        ep_so_mapping.size > 1
+                        and ep_so_mapping.maps_to_physical_dimension_name in router_physical_axes
+                    ):
+                        raise NotImplementedError(
+                            "Feeder-local sharded router cannot use the EP_SO physical "
+                            "axis; router logits synchronization must remain inside each "
+                            "attention domain"
+                        )
+                if resolved_proj.yz_view.num_chips != tp_moe_y_shards:
+                    raise NotImplementedError(
+                        "Scale-out-spanning wide-EP decode currently requires "
+                        "TP_Proj_Y_eff == TP_MoE_Y; got "
+                        f"{resolved_proj.yz_view.num_chips} != {tp_moe_y_shards}"
+                    )
+                moe_stats_1 = num_layers_per_pp_stage * calculate_moe_decode_cross_domain_exchange(
+                    ep_topology_view=ep_topology,
+                    transformer_config=model_spec,
+                    moe_config=moe_config,
+                    workload_spec=workload_spec,
+                    token_scopes=token_scopes,
+                    float_size=workload_spec.float_size_bytes,
+                    tp_moe_y_shards=tp_moe_y_shards,
+                    layout_trace=layout_trace,
+                    a2a_leg="dispatch",
                 )
-            # Intra-rack centralized pool: reuse the prefill A2A primitive for
-            # both dispatch and combine.  When full_set_xpus <= scale_up_domain
-            # the primitive's hierarchical-split path collapses to single-fabric
-            # (scale-up only): the second-fastest tag carries 0 bytes because
-            # the pool fits in one scale-up domain.
-            #
-            # The dense RS-across-expert-groups combine model used in the
-            # single-attention-domain regime is bypassed here because the
-            # cross-domain A2A already covers all routed-token redistribution.
-            moe_stats_1 = num_layers_per_pp_stage * calculate_moe_comm_first_total_exchange(
-                ep_topology,
-                model_spec,
-                moe_config,
-                num_global_batch_tokens,
-                float_size=workload_spec.float_size_bytes,
-                workload_spec=workload_spec,
-                tp_moe_y_shards=tp_moe_y_shards,
-                layout_trace=layout_trace,
-            )
-            moe_stats_2 = num_layers_per_pp_stage * calculate_moe_comm_second_total_exchange(
-                ep_topology_view=ep_topology,
-                transformer_config=model_spec,
-                moe_config=moe_config,
-                num_global_batch_tokens=num_global_batch_tokens,
-                float_size=workload_spec.float_size_bytes,
-                workload_spec=workload_spec,
-                tp_moe_y_shards=tp_moe_y_shards,
-                layout_trace=layout_trace,
-            )
+                moe_stats_2 = num_layers_per_pp_stage * calculate_moe_decode_cross_domain_exchange(
+                    ep_topology_view=ep_topology,
+                    transformer_config=model_spec,
+                    moe_config=moe_config,
+                    workload_spec=workload_spec,
+                    token_scopes=token_scopes,
+                    float_size=workload_spec.float_size_bytes,
+                    tp_moe_y_shards=tp_moe_y_shards,
+                    layout_trace=layout_trace,
+                    a2a_leg="combine",
+                )
+                local_group_count = moe_config.num_colocated_groups_per_set // attn_domains_per_set
+                moe_stats_2 += num_layers_per_pp_stage * calculate_moe_combine_decode(
+                    ep_topology_view=ep_topology,
+                    transformer_config=model_spec,
+                    moe_config=moe_config,
+                    token_scopes=token_scopes,
+                    attn_tp_xpus=attn_tp_topology.num_chips,
+                    float_size=workload_spec.float_size_bytes,
+                    tp_moe_x_shards=tp_moe_x_shards,
+                    tp_moe_y_shards=tp_moe_y_shards,
+                    num_local_colocated_groups=local_group_count,
+                    record_layout_output=True,
+                    projection_groups=projection_groups,
+                    attn_x_topology=resolved_attn.x_view,
+                    attn_yz_topology=resolved_attn.yz_view,
+                    proj_x_topology=resolved_proj.x_view,
+                    proj_yz_topology=resolved_proj.yz_view,
+                    moe_x_topology=resolved.x_view,
+                    moe_yz_topology=resolved.yz_view,
+                    expert_set_topology=None,
+                    layout_trace=layout_trace,
+                )
+                # Exact scale-out-spanning dispatch/return has been fully priced.
+                # Do not also charge the approximate B1 hierarchical primitive.
+            else:
+                # Scale-up-resident wide-EP set: reuse the prefill A2A primitive
+                # for both dispatch and combine. When the set fits in one scale-up
+                # domain, the second-fastest EP tag carries zero bytes.
+                moe_stats_1 = num_layers_per_pp_stage * calculate_moe_comm_first_total_exchange(
+                    ep_topology,
+                    model_spec,
+                    moe_config,
+                    token_scopes,
+                    float_size=workload_spec.float_size_bytes,
+                    workload_spec=workload_spec,
+                    tp_moe_y_shards=tp_moe_y_shards,
+                    layout_trace=layout_trace,
+                )
+                moe_stats_2 = num_layers_per_pp_stage * calculate_moe_comm_second_total_exchange(
+                    ep_topology_view=ep_topology,
+                    transformer_config=model_spec,
+                    moe_config=moe_config,
+                    token_scopes=token_scopes,
+                    float_size=workload_spec.float_size_bytes,
+                    workload_spec=workload_spec,
+                    tp_moe_y_shards=tp_moe_y_shards,
+                    layout_trace=layout_trace,
+                )
         else:
             # One attention domain feeds one or more complete expert sets.
             # With Y-aligned sets, token selection is local; combine performs
@@ -361,11 +453,13 @@ def get_transformer_comm_stats(
                 ep_topology_view=ep_topology,
                 transformer_config=model_spec,
                 moe_config=moe_config,
-                num_attention_domain_tokens=num_attention_domain_tokens,
+                token_scopes=token_scopes,
                 attn_tp_xpus=attn_tp_topology.num_chips,
                 float_size=workload_spec.float_size_bytes,
                 tp_moe_x_shards=tp_moe_x_shards,
                 tp_moe_y_shards=tp_moe_y_shards,
+                num_local_colocated_groups=moe_config.num_colocated_groups_per_set,
+                record_layout_output=False,
                 projection_groups=projection_groups,
                 attn_x_topology=resolved_attn.x_view,
                 attn_yz_topology=resolved_attn.yz_view,
@@ -382,7 +476,7 @@ def get_transformer_comm_stats(
             ep_topology,
             model_spec,
             moe_config,
-            num_global_batch_tokens,
+            token_scopes,
             float_size=workload_spec.float_size_bytes,
             workload_spec=workload_spec,
             tp_moe_y_shards=tp_moe_y_shards,
@@ -391,7 +485,7 @@ def get_transformer_comm_stats(
             ep_topology_view=ep_topology,
             transformer_config=model_spec,
             moe_config=moe_config,
-            num_global_batch_tokens=num_global_batch_tokens,
+            token_scopes=token_scopes,
             float_size=workload_spec.float_size_bytes,
             workload_spec=workload_spec,
             tp_moe_y_shards=tp_moe_y_shards,

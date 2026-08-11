@@ -47,9 +47,13 @@ _COMM_STAGE_DISPLAY_NAMES: Dict[str, str] = {
     "moe_router_ar": "MoE router-logit all-reduce",
     "moe_c1_ar_yz": "MoE up-projection C1 all-reduce",
     "moe_c2_rs_x": "MoE down-projection C2 reduce-scatter",
-    "combine_rs_exact_groups": "MoE exact feature-group combine",
+    "combine_rs_exact_groups": "MoE-to-residual layout reduce-scatter",
     "combine_ar_projection_replicas": "MoE projection-replica synchronization",
     "combine_ag_cross_set": "MoE cross-set batch all-gather",
+    "decode_dispatch_su": "MoE local-owner dispatch (already resident)",
+    "decode_dispatch_so": "MoE dispatch across attention domains",
+    "decode_combine_su": "MoE local-owner return (already resident)",
+    "decode_combine_so": "MoE return across attention domains",
 }
 
 _LAYOUT_STAGE_DISPLAY_NAMES: Dict[str, str] = {
@@ -69,9 +73,9 @@ _LAYOUT_STAGE_DISPLAY_NAMES: Dict[str, str] = {
     "expert_input": "MoE expert input",
     "after_up_proj_c1": "After MoE up-projection C1",
     "after_down_proj_c2": "After MoE down-projection C2",
+    "decode_combine_a2a": "MoE routed-output return",
     "after_combine": "After MoE expert combine",
     "after_combine_cross_set": "After cross-set MoE combine",
-    "decode_combine_a2a": "MoE routed-output return",
     "layer_output": "Layer output",
 }
 
@@ -475,8 +479,16 @@ class LayoutTrace:
         lines.append(hdr)
         lines.append("-" * len(hdr))
 
+        # Runtime records follow producer call order, not necessarily pipeline
+        # order: TP records expert stages before comm_model later records the
+        # cross-domain EP dispatch/return. Sort only for presentation so the
+        # table reads router -> dispatch -> expert -> return -> combine.
+        # Python's stable sort preserves insertion order within each stage.
+        stage_order = {stage: index for index, stage in enumerate(_LAYOUT_STAGE_DISPLAY_NAMES)}
         prev_stage = ""
-        for rec in self.records:
+        for rec in sorted(
+            self.records, key=lambda item: stage_order.get(item.stage, len(stage_order))
+        ):
             if rec.stage != prev_stage:
                 if rec.stage not in _LAYOUT_STAGE_DISPLAY_NAMES:
                     raise ValueError(f"Missing layout-table display name for stage: {rec.stage}")
@@ -939,11 +951,21 @@ def _trace_moe_stages(
         raise ValueError(f"TP_Proj_X ({tp_x}) must be divisible by TP_MoE_X ({moe_tp_x})")
     if y_eff % moe_tp_yz != 0:
         raise ValueError(f"TP_Proj_Y_eff ({y_eff}) must be divisible by TP_MoE_Y ({moe_tp_yz})")
-    feature_group_count = (tp_x // moe_tp_x) * (y_eff // moe_tp_yz)
-    if G != feature_group_count * replicas_per_set:
+    moe_to_residual_layout_quotient_count = (tp_x // moe_tp_x) * (y_eff // moe_tp_yz)
+    if attn_domains_per_full_expert_set > 1:
+        if G % attn_domains_per_full_expert_set != 0:
+            raise ValueError(
+                f"Expert groups ({G}) must be divisible by feeder attention domains "
+                f"({attn_domains_per_full_expert_set})"
+            )
+        local_group_count = G // attn_domains_per_full_expert_set
+    else:
+        local_group_count = G
+    if local_group_count != moe_to_residual_layout_quotient_count * replicas_per_set:
         raise ValueError(
-            f"Expert groups ({G}) must equal feature groups × per-set projection replicas "
-            f"({feature_group_count} × {replicas_per_set})"
+            f"Local expert groups ({local_group_count}) must equal MoE-to-residual "
+            "layout quotients × per-set projection replicas "
+            f"({moe_to_residual_layout_quotient_count} × {replicas_per_set})"
         )
 
     # Stage 5: incoming MoE input keeps the output-projection RS(X) layout.
@@ -1055,18 +1077,17 @@ def _trace_moe_stages(
         )
 
     # Cross-attention-domain dispatch A2A.
-    # When attn_domains_per_full_expert_set > 1, the expert set spans multiple
-    # attention TP domains, so each token's hidden state must be shipped to the
-    # chip hosting its routed expert.  At full_expert_set_xpu_count <=
-    # scale_up_domain_size this is a single-fabric A2A on EP_SU
-    # (intra-rack centralized pool).  When attn_domains_per_full_expert_set == 1
-    # the dispatch is free (tokens already colocated with their expert) and this
-    # stage is suppressed.
+    # When one expert set spans multiple attention domains, the deterministic
+    # handoff has already placed each token shard on aligned local expert
+    # groups. Same-domain owners consume that copy without network traffic;
+    # only remote-domain owners need A2Av. The logical trace cannot name the
+    # physical cross-domain fabric: runtime uses EP_SU for a scale-up-resident
+    # set and EP_SO for a scale-out-spanning set.
     if attn_domains_per_full_expert_set > 1:
         _dispatch_d_partitions = {"D": P("sharded", ("MoE_Y",))} if moe_tp_yz > 1 else {}
         trace.record(
             "decode_dispatch",
-            "Cross-attention-domain dispatch A2A on EP_SU "
+            "Remote-owner dispatch A2Av on the cross-domain fabric "
             "(attn_domains_per_full_expert_set > 1)",
             TensorRecord(
                 name="x_dispatched",
@@ -1078,15 +1099,18 @@ def _trace_moe_stages(
                 dtype_bytes=dtype_bytes,
             ),
             note=(
-                f"comm: A2A across attn_domains_per_full_expert_set="
+                f"comm: A2Av with explicit, evenly distributed expert-group "
+                f"ownership across "
+                f"attn_domains_per_full_expert_set="
                 f"{attn_domains_per_full_expert_set} feeder domains. "
-                f"Per-token payload = d_model/TP_MoE_Y = {d_model // moe_tp_yz} bytes/elem. "
-                "Single-fabric on EP_SU when full_expert_set_xpu_count <= scale_up_domain_size; "
-                "spills to EP_SO otherwise (cross-rack, not yet modeled)."
-            ),
-            flags=(
-                "OPEN: smooth routing_nonlocal_fraction = 1 - 1/(attn_domains_per_full_expert_set "
-                "* num_colocated_groups_per_set) abstraction; per-feeder routing is not modeled.",
+                "Local-owner routes require no network transfer because the "
+                "exact handoff replicated each token shard across aligned local "
+                "expert groups. Per routed token-expert pair per MoE-Y lane: "
+                f"{d_model // moe_tp_yz} elements = "
+                f"{(d_model // moe_tp_yz) * dtype_bytes} bytes. "
+                "Same-domain network fraction=0; remote-owner network fraction="
+                f"{attn_domains_per_full_expert_set - 1}/"
+                f"{attn_domains_per_full_expert_set}."
             ),
         )
 
@@ -1158,11 +1182,37 @@ def _trace_moe_stages(
         ),
     )
 
-    # Stage 10: after combine
+    # Cross-attention-domain return precedes local residual-layout restoration.
+    if attn_domains_per_full_expert_set > 1:
+        _returned_d_partitions = {"D": P("sharded", _moe_d_mesh_dims)} if _moe_d_mesh_dims else {}
+        trace.record(
+            "decode_combine_a2a",
+            "Remote-owner return A2Av on the cross-domain fabric",
+            TensorRecord(
+                name="moe_out_returned",
+                global_shape={"B": set_tokens, "D": d_model},
+                partitions={
+                    **_returned_d_partitions,
+                    "B": P("replicated", ("Y",)),
+                },
+                dtype_bytes=dtype_bytes,
+            ),
+            note=(
+                f"comm: symmetric A2Av return across attn_domains_per_full_expert_set="
+                f"{attn_domains_per_full_expert_set} feeder domains. "
+                "Local-owner outputs are already resident; same-domain network "
+                "fraction=0. Remote-owner network fraction="
+                f"{attn_domains_per_full_expert_set - 1}/"
+                f"{attn_domains_per_full_expert_set}."
+            ),
+        )
+
+    # Stage 10: local residual-layout restoration after the return leg.
     combine_ops: List[str] = []
-    if feature_group_count > 1:
+    if moe_to_residual_layout_quotient_count > 1:
         combine_ops.append(
-            f"exact ND RS over feature quotient={feature_group_count} "
+            "exact ND RS over MoE-to-residual layout quotient="
+            f"{moe_to_residual_layout_quotient_count} "
             f"(({tp_x}/{moe_tp_x})×({y_eff}/{moe_tp_yz}))"
         )
     if replicas_per_set > 1:
@@ -1206,38 +1256,6 @@ def _trace_moe_stages(
             flags=(
                 "MODEL_LIMITATION: concurrent cross-set AG subgroups assume no "
                 "cross-subgroup fabric contention.",
-            ),
-        )
-
-    # Cross-attention-domain combine A2A (return leg of decode_dispatch).
-    # Symmetric counterpart to decode_dispatch: ships expert outputs back to
-    # their origin attention domain.  Only present when
-    # attn_domains_per_full_expert_set > 1; same fabric as the dispatch leg
-    # (EP_SU intra-rack centralized pool; cross-rack pools spilling onto EP_SO
-    # are not yet supported).  Per-rank tensor layout is the same as
-    # `after_combine`: the A2A redistributes whose tokens live where but does
-    # not change per-rank shape.
-    if attn_domains_per_full_expert_set > 1:
-        trace.record(
-            "decode_combine_a2a",
-            "Cross-attention-domain combine A2A on EP_SU " "(return leg of decode_dispatch)",
-            TensorRecord(
-                name="moe_out_returned",
-                global_shape={"B": set_tokens, "D": d_model},
-                partitions={
-                    **({"D": P("sharded", _post_combine_d_dims)} if _post_combine_d_dims else {}),
-                    "B": P("replicated", ("Y",)),
-                },
-                dtype_bytes=dtype_bytes,
-            ),
-            note=(
-                f"comm: A2A return across attn_domains_per_full_expert_set="
-                f"{attn_domains_per_full_expert_set} feeder domains. "
-                "Symmetric to decode_dispatch; same fabric (EP_SU intra-rack)."
-            ),
-            flags=(
-                "OPEN: combine return modeled as symmetric to dispatch; "
-                "per-token weighted-sum combine cost not separately tracked.",
             ),
         )
 

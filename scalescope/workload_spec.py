@@ -153,6 +153,31 @@ class MoEA2ACommMode(StrEnum):
     FUSED_ND = "fused_nd"
 
 
+class DecodeCrossDomainEPMode(StrEnum):
+    """Decode exchange contract when one expert set spans attention domains."""
+
+    EXPLICIT_OWNER_A2AV = "explicit_owner_a2av"
+
+
+class ExpertDomainPlacementKind(StrEnum):
+    """Supported mappings from colocated expert groups to EP domains."""
+
+    BALANCED_EXPERT_GROUPS = "balanced_expert_groups"
+
+
+class ExpertDomainPlacementSpec(BaseModel):
+    """Explicit ownership policy for expert groups spanning attention domains."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: ExpertDomainPlacementKind = Field(...)
+    domain_tag: str = Field(..., min_length=1)
+
+    _parse_kind = field_validator("kind", mode="before")(
+        parse_enum_by_name_or_value(ExpertDomainPlacementKind)
+    )
+
+
 class ExpertWeightResidencyPolicy(StrEnum):
     """Policy for how MoE expert weights are accounted for in memory traffic.
 
@@ -328,6 +353,13 @@ class MoESpecV2(BaseModel):
         ge=1,
         description="Replication factor per shared expert; if None, may be inferred later",
     )
+    expert_domain_placement: Optional[ExpertDomainPlacementSpec] = Field(
+        default=None,
+        description=(
+            "Explicit colocated-expert-group ownership policy for an expert set spanning "
+            "multiple attention domains. Required by the exact cross-domain decode path."
+        ),
+    )
 
     _parse_expert_weight_residency_policy = field_validator(
         "expert_weight_residency_policy", mode="before"
@@ -477,7 +509,9 @@ class WorkloadSpec(BaseModel):
 
     def infer_batch_size_per_dp(self, dp_attn_chips: int) -> int:
         """
-        Returns per-DP batch size from global batch size and dp_attn_chips.
+        Return the per-attention-domain batch (legacy name: per-DP batch).
+
+        Each attention DP replica is one attention domain.
         Enforces divisibility of the global batch by dp_attn_chips.
         """
         gb = self.global_batch_size
@@ -504,7 +538,8 @@ class WorkloadSpec(BaseModel):
     def infer_effective_micro_batch_size(self, dp_attn_chips: int) -> int:
         """
         Returns effective micro-batch size. micro_batch_size is required.
-        Validates that per-DP batch is divisible by micro_batch_size.
+        Validates that the per-attention-domain batch is divisible by
+        micro_batch_size.
         """
         per_dp = self.infer_batch_size_per_dp(dp_attn_chips)
         mb = getattr(self, "micro_batch_size", None)
@@ -574,7 +609,15 @@ class WorkloadSpec(BaseModel):
 
 @dataclass(frozen=True)
 class ResolvedBatchSizes:
+    """Canonical workload batch partition used by attention and MoE.
+
+    One attention DP replica is one attention domain, so
+    ``batch_size_per_dp`` is also the batch size per attention domain.
+    """
+
     global_batch_size: int
+    attention_domain_count: int
+    complete_expert_set_count: int
     batch_size_per_dp: int
     effective_micro_batch_size: int
     batch_size_per_full_expert_set: int
@@ -591,6 +634,8 @@ def resolve_batch_sizes_for_workload(
     )
     return ResolvedBatchSizes(
         global_batch_size=gb,
+        attention_domain_count=dp_attn_chips,
+        complete_expert_set_count=num_complete_expert_sets,
         batch_size_per_dp=per_dp,
         effective_micro_batch_size=eff_micro,
         batch_size_per_full_expert_set=per_set,
@@ -862,6 +907,17 @@ class InferenceDecodeSpec(WorkloadSpec):
     _parse_decode_moe_router_sync_mode = field_validator(
         "decode_moe_router_sync_mode", mode="before"
     )(parse_enum_by_name_or_value(MoERouterSyncMode))
+    decode_cross_domain_ep_mode: Optional[DecodeCrossDomainEPMode] = Field(
+        default=None,
+        description=(
+            "Exact decode exchange contract for an expert set spanning multiple attention "
+            "domains. Required for cross-scale-up-domain decode; omission retains fail-fast "
+            "behavior."
+        ),
+    )
+    _parse_decode_cross_domain_ep_mode = field_validator(
+        "decode_cross_domain_ep_mode", mode="before"
+    )(parse_enum_by_name_or_value(DecodeCrossDomainEPMode))
     # Note: K/V reduce-to-owner is always modeled as a single fused reduce on (K,V) concatenated
     # payload when decode_tp2d_kv_comm_mode='reduce_to_owner'. We do not expose this as a knob.
 

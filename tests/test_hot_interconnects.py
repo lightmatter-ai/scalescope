@@ -478,7 +478,7 @@ def test_passage_decode_256_experts(tmp_output_dir):
 #
 # All four "alternative" configs have full_expert_set_xpu_count = 512
 # (EP_SU=128, EP_SO=4) but scale_up_domain_size = 128, so the full expert set
-# does not fit in one scale-up domain. Cross-rack hierarchical dispatch +
+# does not fit in one scale-up domain. Scale-out-spanning wide-EP dispatch +
 # combine on EP_SO is not yet implemented in scalescope/comm_model.py, so
 # these tests are skipped. The expected_time_sec values below are kept as
 # legacy baselines from a comm model that silently zeroed multi-domain decode
@@ -487,7 +487,7 @@ def test_passage_decode_256_experts(tmp_output_dir):
 
 @pytest.mark.skip(
     reason=(
-        "Cross-rack centralized pool: full_expert_set_xpu_count=512 > "
+        "Scale-out-spanning wide-EP set: full_expert_set_xpu_count=512 > "
         "scale_up_domain_size=128. Hierarchical dispatch + combine on EP_SO "
         "is not yet implemented in scalescope/comm_model.py."
     )
@@ -510,7 +510,7 @@ def test_alternative_decode_32_experts(tmp_output_dir):
 
 @pytest.mark.skip(
     reason=(
-        "Cross-rack centralized pool: full_expert_set_xpu_count=512 > "
+        "Scale-out-spanning wide-EP set: full_expert_set_xpu_count=512 > "
         "scale_up_domain_size=128. Hierarchical dispatch + combine on EP_SO "
         "is not yet implemented in scalescope/comm_model.py."
     )
@@ -533,7 +533,7 @@ def test_alternative_decode_64_experts(tmp_output_dir):
 
 @pytest.mark.skip(
     reason=(
-        "Cross-rack centralized pool: full_expert_set_xpu_count=512 > "
+        "Scale-out-spanning wide-EP set: full_expert_set_xpu_count=512 > "
         "scale_up_domain_size=128. Hierarchical dispatch + combine on EP_SO "
         "is not yet implemented in scalescope/comm_model.py."
     )
@@ -556,7 +556,7 @@ def test_alternative_decode_128_experts(tmp_output_dir):
 
 @pytest.mark.skip(
     reason=(
-        "Cross-rack centralized pool: full_expert_set_xpu_count=512 > "
+        "Scale-out-spanning wide-EP set: full_expert_set_xpu_count=512 > "
         "scale_up_domain_size=128. Hierarchical dispatch + combine on EP_SO "
         "is not yet implemented in scalescope/comm_model.py."
     )
