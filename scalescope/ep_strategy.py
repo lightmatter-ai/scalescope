@@ -82,9 +82,19 @@ class ResolvedMoETokenScopes:
     global_batch_size: int
     tokens_per_sequence: int
     attention_domain_count: int
+    # Physical attention domains that carry at least one request/token. This
+    # equals attention_domain_count in dense mode. In sparse wide-EP decode it
+    # is smaller; inactive domains still retain their expert ownership.
+    active_attention_domain_count: int
     complete_expert_set_count: int
     attn_domains_per_full_expert_set: int
     full_expert_sets_per_attn_domain: int
+    # Number of attention-domain-to-expert-set feeder paths that carry tokens.
+    # Feeder paths from inactive sparse attention domains are excluded.
+    # This is separate from active_attention_domain_count because one active
+    # domain can feed multiple expert sets. It closes the token accounting:
+    # tokens_per_feeder_set * active_feeder_count == tokens_global.
+    active_feeder_count: int
     batch_size_per_attention_domain: int
     batch_size_per_full_expert_set: int
     batch_size_per_feeder_set: int
@@ -114,12 +124,14 @@ def resolve_moe_token_scopes(
 
     global_batch_size = resolved_batches.global_batch_size
     attention_domain_count = resolved_batches.attention_domain_count
+    active_attention_domain_count = resolved_batches.active_attention_domain_count
     complete_expert_set_count = resolved_batches.complete_expert_set_count
     batch_size_per_attention_domain = resolved_batches.batch_size_per_dp
     batch_size_per_full_expert_set = resolved_batches.batch_size_per_full_expert_set
     resolved_values = {
         "global_batch_size": global_batch_size,
         "attention_domain_count": attention_domain_count,
+        "active_attention_domain_count": active_attention_domain_count,
         "complete_expert_set_count": complete_expert_set_count,
         "batch_size_per_dp": batch_size_per_attention_domain,
         "batch_size_per_full_expert_set": batch_size_per_full_expert_set,
@@ -127,10 +139,16 @@ def resolve_moe_token_scopes(
     for name, value in resolved_values.items():
         if value <= 0:
             raise ValueError(f"resolved_batches.{name} must be > 0, got {value}")
-    if batch_size_per_attention_domain * attention_domain_count != global_batch_size:
+    if active_attention_domain_count > attention_domain_count:
         raise ValueError(
-            "Resolved DP batch does not reconstruct the global batch: "
-            f"{batch_size_per_attention_domain} * {attention_domain_count} "
+            "resolved_batches.active_attention_domain_count must not exceed "
+            f"attention_domain_count: {active_attention_domain_count} > "
+            f"{attention_domain_count}"
+        )
+    if batch_size_per_attention_domain * active_attention_domain_count != global_batch_size:
+        raise ValueError(
+            "Resolved active attention-domain batch does not reconstruct the global batch: "
+            f"{batch_size_per_attention_domain} * {active_attention_domain_count} "
             f"!= {global_batch_size}"
         )
     if batch_size_per_full_expert_set * complete_expert_set_count != global_batch_size:
@@ -148,63 +166,96 @@ def resolve_moe_token_scopes(
             f"{attention_domain_count} * {full_expert_sets_per_attn_domain} "
             f"!= {complete_expert_set_count} * {attn_domains_per_full_expert_set}"
         )
-    if batch_size_per_attention_domain % full_expert_sets_per_attn_domain != 0:
-        raise ValueError(
-            f"batch_size_per_attention_domain ({batch_size_per_attention_domain}) must be "
-            "divisible by full_expert_sets_per_attn_domain "
-            f"({full_expert_sets_per_attn_domain})"
-        )
-    if batch_size_per_full_expert_set % attn_domains_per_full_expert_set != 0:
-        raise ValueError(
-            f"batch_size_per_full_expert_set ({batch_size_per_full_expert_set}) must be "
-            "divisible by attn_domains_per_full_expert_set "
-            f"({attn_domains_per_full_expert_set})"
-        )
+    # Sparse attention domains occur in small-batch wide-EP decode when there
+    # are fewer active sequences than physical attention domains. One request
+    # is assigned to each active domain, while the remaining domains perform
+    # no attention work but still retain their expert ownership.
+    sparse_attention_domains = active_attention_domain_count < attention_domain_count
+    if sparse_attention_domains:
+        if complete_expert_set_count != 1:
+            raise ValueError(
+                "Sparse attention-domain token scopes require exactly one complete "
+                f"expert set, got {complete_expert_set_count}"
+            )
+        if full_expert_sets_per_attn_domain != 1:
+            raise ValueError(
+                "Sparse attention-domain token scopes require "
+                "full_expert_sets_per_attn_domain=1, got "
+                f"{full_expert_sets_per_attn_domain}"
+            )
+        if attn_domains_per_full_expert_set != attention_domain_count:
+            raise ValueError(
+                "Sparse attention-domain token scopes require one wide-EP set spanning "
+                "every physical attention domain: "
+                f"{attn_domains_per_full_expert_set} != {attention_domain_count}"
+            )
+        if batch_size_per_attention_domain != 1:
+            raise ValueError(
+                "Sparse attention-domain token scopes require one request per active "
+                f"feeder, got {batch_size_per_attention_domain}"
+            )
+        if active_attention_domain_count != global_batch_size:
+            raise ValueError(
+                "Sparse attention-domain token scopes require one active feeder per "
+                f"request: {active_attention_domain_count} != {global_batch_size}"
+            )
+        batch_size_per_feeder_set = 1
+        active_feeder_count = active_attention_domain_count
+    else:
+        if batch_size_per_attention_domain % full_expert_sets_per_attn_domain != 0:
+            raise ValueError(
+                f"batch_size_per_attention_domain ({batch_size_per_attention_domain}) must be "
+                "divisible by full_expert_sets_per_attn_domain "
+                f"({full_expert_sets_per_attn_domain})"
+            )
+        if batch_size_per_full_expert_set % attn_domains_per_full_expert_set != 0:
+            raise ValueError(
+                f"batch_size_per_full_expert_set ({batch_size_per_full_expert_set}) must be "
+                "divisible by attn_domains_per_full_expert_set "
+                f"({attn_domains_per_full_expert_set})"
+            )
 
-    # A feeder-set scope is one attention-domain -> expert-set edge. Derive
-    # its batch size independently from each endpoint of that edge:
-    #
-    #   attention-domain batch / sets fed by that domain
-    #   full-expert-set batch / domains feeding that set
-    #
-    # The incidence-closure check above guarantees equal edge counts globally;
-    # this equality verifies that the per-edge batch partition also closes.
-    batch_size_per_feeder_set_via_attention_domain = (
-        batch_size_per_attention_domain // full_expert_sets_per_attn_domain
-    )
-    batch_size_per_feeder_set_via_expert_set = (
-        batch_size_per_full_expert_set // attn_domains_per_full_expert_set
-    )
-    if batch_size_per_feeder_set_via_attention_domain != batch_size_per_feeder_set_via_expert_set:
-        raise AssertionError(
-            "Feeder-set batch derivations disagree: "
-            "via attention domain="
-            f"{batch_size_per_feeder_set_via_attention_domain}, "
-            f"via expert set={batch_size_per_feeder_set_via_expert_set}"
+        # A feeder-set scope is one attention-domain -> expert-set edge. Derive
+        # its batch size independently from each endpoint of that edge.
+        batch_size_per_feeder_set_via_attention_domain = (
+            batch_size_per_attention_domain // full_expert_sets_per_attn_domain
         )
-    batch_size_per_feeder_set = batch_size_per_feeder_set_via_attention_domain
+        batch_size_per_feeder_set_via_expert_set = (
+            batch_size_per_full_expert_set // attn_domains_per_full_expert_set
+        )
+        if (
+            batch_size_per_feeder_set_via_attention_domain
+            != batch_size_per_feeder_set_via_expert_set
+        ):
+            raise AssertionError(
+                "Feeder-set batch derivations disagree: "
+                "via attention domain="
+                f"{batch_size_per_feeder_set_via_attention_domain}, "
+                f"via expert set={batch_size_per_feeder_set_via_expert_set}"
+            )
+        batch_size_per_feeder_set = batch_size_per_feeder_set_via_attention_domain
+        active_feeder_count = active_attention_domain_count * full_expert_sets_per_attn_domain
 
     tokens_global = global_batch_size * tokens_per_sequence
     tokens_per_attention_domain = batch_size_per_attention_domain * tokens_per_sequence
     tokens_per_full_expert_set = batch_size_per_full_expert_set * tokens_per_sequence
     tokens_per_feeder_set = batch_size_per_feeder_set * tokens_per_sequence
-    if tokens_per_attention_domain * attention_domain_count != tokens_global:
+    if tokens_per_attention_domain * active_attention_domain_count != tokens_global:
         raise AssertionError("Attention-domain token scopes do not reconstruct global tokens")
     if tokens_per_full_expert_set * complete_expert_set_count != tokens_global:
         raise AssertionError("Expert-set token scopes do not reconstruct global tokens")
-    if (
-        tokens_per_feeder_set * attention_domain_count * full_expert_sets_per_attn_domain
-        != tokens_global
-    ):
+    if tokens_per_feeder_set * active_feeder_count != tokens_global:
         raise AssertionError("Feeder-set token scopes do not reconstruct global tokens")
 
     return ResolvedMoETokenScopes(
         global_batch_size=global_batch_size,
         tokens_per_sequence=tokens_per_sequence,
         attention_domain_count=attention_domain_count,
+        active_attention_domain_count=active_attention_domain_count,
         complete_expert_set_count=complete_expert_set_count,
         attn_domains_per_full_expert_set=attn_domains_per_full_expert_set,
         full_expert_sets_per_attn_domain=full_expert_sets_per_attn_domain,
+        active_feeder_count=active_feeder_count,
         batch_size_per_attention_domain=batch_size_per_attention_domain,
         batch_size_per_full_expert_set=batch_size_per_full_expert_set,
         batch_size_per_feeder_set=batch_size_per_feeder_set,
@@ -981,16 +1032,17 @@ def calculate_moe_decode_cross_domain_exchange(
     tokens_per_full_expert_set = token_scopes.tokens_per_full_expert_set
     tokens_per_feeder_set = token_scopes.tokens_per_feeder_set
     feeders_per_full_expert_set = token_scopes.attn_domains_per_full_expert_set
+    active_feeder_count = token_scopes.active_feeder_count
     if feeders_per_full_expert_set != moe_config.attn_domains_per_full_expert_set:
         raise ValueError(
             "Token-scope feeder count does not match expert placement: "
             f"{feeders_per_full_expert_set} != "
             f"{moe_config.attn_domains_per_full_expert_set}"
         )
-    if tokens_per_feeder_set * feeders_per_full_expert_set != tokens_per_full_expert_set:
+    if tokens_per_feeder_set * active_feeder_count != tokens_per_full_expert_set:
         raise ValueError(
-            "Feeder-set token scopes do not reconstruct full-expert-set tokens: "
-            f"{tokens_per_feeder_set} * {feeders_per_full_expert_set} "
+            "Active feeder-set token scopes do not reconstruct full-expert-set tokens: "
+            f"{tokens_per_feeder_set} * {active_feeder_count} "
             f"!= {tokens_per_full_expert_set}"
         )
     if feeders_per_full_expert_set <= 1:
@@ -1060,15 +1112,48 @@ def calculate_moe_decode_cross_domain_exchange(
         tokens_per_full_expert_set * selected_experts_per_token / groups_per_set
     )
     busiest_receiver_pairs = balanced_pairs_per_endpoint * effective_imbalance
+    groups_per_feeder_domain = groups_per_set // feeders_per_full_expert_set
+    balanced_sender_pairs = (
+        tokens_per_feeder_set * selected_experts_per_token / groups_per_feeder_domain
+    )
     bytes_per_token = transformer_config.d_model * float_size / tp_moe_y_shards
 
+    # Each feeder domain owns 1/D of the expert groups in the shared set
+    # (D = feeders_per_full_expert_set). Routes to that owner fraction are
+    # already local; all remaining token-expert pairs leave over EP_SO.
     local_owner_fraction = 1.0 / feeders_per_full_expert_set
-    remote_fraction = 1.0 - local_owner_fraction
+    sender_remote_fraction = 1.0 - local_owner_fraction
+
+    # Sparse wide-EP keeps expert owners on every physical feeder domain even
+    # when some domains have no input sequences and therefore send no tokens.
+    inactive_feeder_count = feeders_per_full_expert_set - active_feeder_count
+    if inactive_feeder_count > 0:
+        # An expert group on an inactive attention domain receives every routed
+        # pair over EP_SO. Since ownership does not pin the hottest group to an
+        # active domain, use this conservative busiest-receiver endpoint.
+        receiver_remote_fraction = 1.0
+    else:
+        # Every receiver domain is also an active sender, so its locally
+        # originated 1/D owner share does not consume EP_SO bandwidth.
+        receiver_remote_fraction = sender_remote_fraction
+
+    # Sender pressure starts from balanced routed pairs on one feeder endpoint;
+    # receiver pressure starts from the imbalance-scaled hottest expert group.
+    # Apply the side-specific remote fraction before comparing endpoints.
+    busiest_remote_sender_pairs = balanced_sender_pairs * sender_remote_fraction
+    busiest_remote_receiver_pairs = busiest_receiver_pairs * receiver_remote_fraction
+
+    # A2Av completes at the slower endpoint. Price the larger of the busiest
+    # sender's outbound load and the busiest receiver's inbound load.
+    bottleneck_remote_pairs = max(
+        busiest_remote_sender_pairs,
+        busiest_remote_receiver_pairs,
+    )
     # Local-owner routes are already resident after the deterministic handoff.
     # Keep the EP_SU trace record as an explicit no-op so the table documents
     # why the balanced 1/D owner fraction does not become network traffic.
     su_bytes_per_xpu = 0.0
-    so_bytes_per_xpu = busiest_receiver_pairs * remote_fraction * bytes_per_token
+    so_bytes_per_xpu = bottleneck_remote_pairs * bytes_per_token
 
     su_stats = CommStats()
     so_stats = hockney_model_send_recv_on_nd_topology(
@@ -1100,10 +1185,15 @@ def calculate_moe_decode_cross_domain_exchange(
         so_stats,
         note=(
             f"{a2a_leg}: busiest endpoint; remote_fraction="
-            f"{feeders_per_full_expert_set - 1}/{feeders_per_full_expert_set}; "
+            f"{feeders_per_full_expert_set - 1}/{feeders_per_full_expert_set} "
+            "per active sender; "
+            f"active_feeders={active_feeder_count}; "
+            f"inactive_feeders={inactive_feeder_count}; "
             f"balanced_pairs/endpoint={balanced_pairs_per_endpoint:g}; "
             f"effective_imbalance={effective_imbalance:g}; "
             f"busiest_receiver_pairs={busiest_receiver_pairs:g}; "
+            f"balanced_sender_pairs={balanced_sender_pairs:g}; "
+            f"bottleneck_remote_pairs={bottleneck_remote_pairs:g}; "
             f"bytes/token={bytes_per_token:g}"
         ),
     )
@@ -1144,13 +1234,15 @@ def calculate_moe_decode_cross_domain_exchange(
             "actual: explicit, evenly distributed expert-group ownership with "
             "busiest-endpoint timing; "
             f"local_owner_fraction={local_owner_fraction:g} (already local), "
-            f"SO_network_fraction={remote_fraction:g}; "
+            f"active_feeders={active_feeder_count}/"
+            f"{feeders_per_full_expert_set}; "
+            f"sender_SO_network_fraction={sender_remote_fraction:g}; "
             f"feeder-equivalent B={tokens_per_feeder_set}"
         ),
     )
     if not isclose(
         so_bytes_per_xpu,
-        busiest_receiver_pairs * remote_fraction * bytes_per_token,
+        bottleneck_remote_pairs * bytes_per_token,
         rel_tol=1e-12,
         abs_tol=0.0,
     ):

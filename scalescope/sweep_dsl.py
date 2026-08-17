@@ -929,6 +929,9 @@ def _verifier_batch_divides_dp_attn(
 
     if dp_chips <= 0:
         return False
+    if gb < dp_chips:
+        mode = getattr(ws, "decode_cross_domain_ep_mode", None)
+        return getattr(mode, "value", str(mode)) == "explicit_owner_a2av"
     return gb % dp_chips == 0
 
 
@@ -1021,7 +1024,10 @@ def _verifier_decode_cross_domain_ep_exact(
         return False
     if ep_so != attention_domains_per_set:
         return False
-    if global_batch_size % attention_domains_per_set != 0:
+    if (
+        global_batch_size >= attention_domains_per_set
+        and global_batch_size % attention_domains_per_set != 0
+    ):
         return False
     if (
         router_mode == "sharded_router"

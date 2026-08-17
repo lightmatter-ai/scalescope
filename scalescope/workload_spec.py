@@ -550,13 +550,22 @@ class WorkloadSpec(BaseModel):
         return mb
 
     def with_resolved_batches(
-        self, dp_attn_chips: int, num_complete_expert_sets: int
+        self,
+        dp_attn_chips: int,
+        num_complete_expert_sets: int,
+        *,
+        allow_sparse_attention_domains: bool,
     ) -> "WorkloadSpec":
         """
         Returns a new WorkloadSpec with resolved batch sizes attached (field 'resolved_batches').
         This preserves immutability of the original spec.
         """
-        rb = resolve_batch_sizes_for_workload(self, dp_attn_chips, num_complete_expert_sets)
+        rb = resolve_batch_sizes_for_workload(
+            self,
+            dp_attn_chips,
+            num_complete_expert_sets,
+            allow_sparse_attention_domains=allow_sparse_attention_domains,
+        )
         return self.model_copy(update={"resolved_batches": rb})
 
     def get_resolved_batches(self) -> "ResolvedBatchSizes":
@@ -611,12 +620,19 @@ class WorkloadSpec(BaseModel):
 class ResolvedBatchSizes:
     """Canonical workload batch partition used by attention and MoE.
 
-    One attention DP replica is one attention domain, so
-    ``batch_size_per_dp`` is also the batch size per attention domain.
+    One attention DP replica is one physical attention domain. Normally
+    ``batch_size_per_dp`` is the uniform batch on every domain. The narrow
+    sparse wide-EP decode case instead assigns one request to each active
+    domain and none to the remaining physical domains; in that case
+    ``batch_size_per_dp`` is the batch on an active domain.
     """
 
     global_batch_size: int
     attention_domain_count: int
+    # Number of physical attention domains assigned at least one request. It
+    # equals attention_domain_count for ordinary uniform partitioning and can
+    # be smaller only for the supported sparse wide-EP decode case.
+    active_attention_domain_count: int
     complete_expert_set_count: int
     batch_size_per_dp: int
     effective_micro_batch_size: int
@@ -624,17 +640,47 @@ class ResolvedBatchSizes:
 
 
 def resolve_batch_sizes_for_workload(
-    workload_spec: WorkloadSpec, dp_attn_chips: int, num_complete_expert_sets: int
+    workload_spec: WorkloadSpec,
+    dp_attn_chips: int,
+    num_complete_expert_sets: int,
+    *,
+    allow_sparse_attention_domains: bool,
 ) -> ResolvedBatchSizes:
     gb = workload_spec.infer_global_batch_size(dp_attn_chips)
-    per_dp = workload_spec.infer_batch_size_per_dp(dp_attn_chips)
-    eff_micro = workload_spec.infer_effective_micro_batch_size(dp_attn_chips)
+    if dp_attn_chips <= 0:
+        raise ValueError(f"dp_attn_chips must be > 0, got {dp_attn_chips}")
+    if gb < dp_attn_chips:
+        if not allow_sparse_attention_domains:
+            raise ValueError(
+                f"Global batch size {gb} is smaller than DP chips {dp_attn_chips}, "
+                "but sparse attention domains are not enabled for this workload."
+            )
+        if num_complete_expert_sets != 1:
+            raise ValueError(
+                "Sparse attention domains require exactly one complete expert set, "
+                f"got {num_complete_expert_sets}."
+            )
+        per_dp = 1
+        active_attention_domain_count = gb
+        micro_batch_size = getattr(workload_spec, "micro_batch_size", None)
+        if micro_batch_size is None:
+            raise ValueError("micro_batch_size must be set.")
+        if micro_batch_size != 1:
+            raise ValueError(
+                "Sparse attention domains require micro_batch_size=1, got " f"{micro_batch_size}."
+            )
+        eff_micro = micro_batch_size
+    else:
+        per_dp = workload_spec.infer_batch_size_per_dp(dp_attn_chips)
+        active_attention_domain_count = dp_attn_chips
+        eff_micro = workload_spec.infer_effective_micro_batch_size(dp_attn_chips)
     per_set = workload_spec.infer_batch_size_per_full_expert_set(
         dp_attn_chips, num_complete_expert_sets
     )
     return ResolvedBatchSizes(
         global_batch_size=gb,
         attention_domain_count=dp_attn_chips,
+        active_attention_domain_count=active_attention_domain_count,
         complete_expert_set_count=num_complete_expert_sets,
         batch_size_per_dp=per_dp,
         effective_micro_batch_size=eff_micro,

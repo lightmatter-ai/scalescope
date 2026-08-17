@@ -112,6 +112,7 @@ from scalescope.utils import (
     PassMode,
 )
 from scalescope.workload_spec import (
+    DecodeCrossDomainEPMode,
     InferenceDecodeSpec,
     InferencePrefillSpec,
     MoERouterSyncMode,
@@ -1121,10 +1122,22 @@ def get_model_stats(
     # MoE placement fields in `moe_config` drive both EP A2A and TP-MoE comm paths.
     # We intentionally use the same placement-locality semantics for both (smooth remote fraction
     # over DP feeder groups and colocated expert groups) so TP1D/TP2D comparisons are consistent.
+    # The only non-uniform attention-DP partition currently supported is the
+    # scale-out-spanning wide-EP decode case with B < D_feed. It assigns one
+    # request to each of B active feeders and leaves the other physical
+    # attention domains idle. All other paths retain exact DP divisibility.
+    allow_sparse_attention_domains = (
+        pass_mode == PassMode.INFERENCE_DECODE
+        and moe_config.attn_domains_per_full_expert_set > 1
+        and moe_config.full_expert_sets_per_attn_domain == 1
+        and moe_config.num_complete_expert_sets == 1
+        and workload_spec.decode_cross_domain_ep_mode == DecodeCrossDomainEPMode.EXPLICIT_OWNER_A2AV
+    )
     # Attach resolved batch sizes to the workload spec (global-first derivation)
     workload_spec = workload_spec.with_resolved_batches(
         attn_dp_topology_view.num_chips,
         moe_config.num_complete_expert_sets,
+        allow_sparse_attention_domains=allow_sparse_attention_domains,
     )
     batch_sizes = workload_spec.get_resolved_batches()
     batch_size_per_dp = batch_sizes.batch_size_per_dp
