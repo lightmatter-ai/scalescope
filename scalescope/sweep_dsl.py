@@ -373,9 +373,10 @@ def _verifier_decode_sharded_router_proj_y_eff_matches_moe_y(
     enforce projection-group effective Y (`Y_eff = TP_Proj_YZ / g`) to match MoE Y-shard size.
 
     Scope/intent:
-    - Only active for decode workload specs with `decode_moe_router_sync_mode=sharded_router`.
+    - Active for either decode sharded-router mode.
     - Only enforced for 1xY MoE shapes (`TP_MoE_X == 1`) where expert input availability
       depends directly on Y-group compatibility.
+    - The normalization-deferred mode additionally requires `TP_MoE_Y > 1`.
     - If not applicable (non-decode, replicated router, missing 2D splits), returns True.
     """
     specs = _resolve_specs(case, base_specs, applied_specs)
@@ -451,6 +452,8 @@ def _verifier_decode_sharded_router_proj_y_eff_matches_moe_y(
             return False
     if moe_y <= 0:
         return False
+    if "normalization_deferred_sharded_router" in router_mode_val and moe_y <= 1:
+        return False
 
     return y_eff == moe_y
 
@@ -467,8 +470,9 @@ def _verifier_decode_sharded_router_proj_y_eff_matches_moe_y_all_shapes(
     enforce projection-group effective Y (`Y_eff = TP_Proj_YZ / g`) to match MoE Y-shard size.
 
     Scope/intent:
-    - Only active for decode workload specs with `decode_moe_router_sync_mode=sharded_router`.
+    - Active for either decode sharded-router mode.
     - Enforced for all MoE TP shapes in sharded-router decode path.
+    - The normalization-deferred mode additionally requires `TP_MoE_Y > 1`.
     - If not applicable (non-decode, replicated router, missing 2D splits), returns True.
     """
     specs = _resolve_specs(case, base_specs, applied_specs)
@@ -530,6 +534,8 @@ def _verifier_decode_sharded_router_proj_y_eff_matches_moe_y_all_shapes(
         except Exception:
             return False
     if moe_y <= 0:
+        return False
+    if "normalization_deferred_sharded_router" in router_mode_val and moe_y <= 1:
         return False
 
     return y_eff == moe_y
@@ -862,16 +868,19 @@ def _verifier_decode_nx1_router_compat(
     if min(moe_x, moe_y, attn_y) <= 0:
         return False
 
-    # Only enforce for Nx1 shapes.
-    if not (moe_x > 1 and moe_y == 1):
-        return True
-
     router_mode = getattr(ws, "decode_moe_router_sync_mode", None)
     router_mode_val = (
         getattr(router_mode, "value", None)
         or getattr(router_mode, "name", None)
         or str(router_mode)
     ).lower()
+
+    if "normalization_deferred_sharded_router" in router_mode_val and moe_y <= 1:
+        return False
+
+    # Only enforce the remaining rules for Nx1 shapes.
+    if not (moe_x > 1 and moe_y == 1):
+        return True
 
     if "replicated_router" in router_mode_val:
         return True
@@ -958,7 +967,11 @@ def _verifier_decode_cross_domain_ep_exact(
     if getattr(mode, "value", str(mode)) != "explicit_owner_a2av":
         return False
     router_mode = getattr(ws.decode_moe_router_sync_mode, "value", "")
-    if router_mode not in {"replicated_router", "sharded_router"}:
+    sharded_router_modes = {
+        "sharded_router",
+        "normalization_deferred_sharded_router",
+    }
+    if router_mode not in {"replicated_router", *sharded_router_modes}:
         return False
 
     ownership = getattr(ws.moe_spec_v2, "expert_domain_placement", None)
@@ -1004,6 +1017,8 @@ def _verifier_decode_cross_domain_ep_exact(
     )
     if any(value <= 0 for value in values):
         return False
+    if router_mode == "normalization_deferred_sharded_router" and moe_y <= 1:
+        return False
     if experts % colocated != 0 or proj_y % projection_groups != 0:
         return False
 
@@ -1030,7 +1045,7 @@ def _verifier_decode_cross_domain_ep_exact(
     ):
         return False
     if (
-        router_mode == "sharded_router"
+        router_mode in sharded_router_modes
         and moe_y > 1
         and ep_so > 1
         and moe_y_physical_axis == ep_so_physical_axis

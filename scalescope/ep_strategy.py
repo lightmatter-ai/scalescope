@@ -66,7 +66,8 @@ class ExpertXPUPlacement:
     router_shard_factor: int = 1
     # Router synchronization policy consumed by TP comm strategies.
     # - replicated_router: router logits available locally
-    # - sharded_router: explicit router-sync collective required
+    # - sharded_router: separate normalization and router-sync collectives
+    # - normalization_deferred_sharded_router: one packed collective for both
     router_sync_mode: MoERouterSyncMode = MoERouterSyncMode.REPLICATED_ROUTER
     # TP-MoE redistribution optimization toggle:
     # - OFF: regular routed MoE A2A.
@@ -820,7 +821,8 @@ def infer_expert_placement_per_xpu(
     - ep_chips_per_pp_stage: total EP chips available per PP stage (DP_Attn * TP_Attn).
     - router_sync_mode: router synchronization policy for TP comm strategies.
     - router_shard_factor: number of ranks across which the router weight is sharded.
-      For replicated router: 1. For sharded router: Y_eff (2D TP) or attn_tp_size (1D TP).
+      For replicated router: 1. For a sharded router mode: Y_eff (2D TP), or
+      attn_tp_size for the ordinary 1D sharded router.
     - tp_moe_a2a_replication_optimization_enabled: enables TP-MoE expert-input redistribution optimization.
 
     Returns

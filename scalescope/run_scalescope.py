@@ -805,14 +805,18 @@ def _resolve_decode_trace_params(
         raise ValueError(
             "router_sync_mode must have .value or be str, got " f"{type(router_sync_mode).__name__}"
         )
-    if "sharded" in s:
-        router_mode = "sharded"
-    elif "replicated" in s:
-        router_mode = "replicated"
-    else:
-        raise ValueError(
-            f"router_sync_mode value must contain 'sharded' or 'replicated', got {s!r}"
-        )
+    match s:
+        case MoERouterSyncMode.SHARDED_ROUTER.value:
+            # Layout-trace name is shorter than the enum value.
+            router_mode = "sharded"
+        case MoERouterSyncMode.NORMALIZATION_DEFERRED_SHARDED_ROUTER.value:
+            # Layout-trace name drops the trailing "_router".
+            router_mode = "normalization_deferred_sharded"
+        case MoERouterSyncMode.REPLICATED_ROUTER.value:
+            # Layout-trace name is shorter than the enum value.
+            router_mode = "replicated"
+        case _:
+            raise ValueError("Unsupported router_sync_mode for decode layout trace: " f"{s!r}")
 
     return dict(
         tp_x=tp_x,
@@ -1059,11 +1063,15 @@ def get_model_stats(
 
     # Resolve router_shard_factor: number of ranks across which the router
     # weight is sharded.  After AG(X) in 2D TP the router sees D/Y_eff, so
-    # sharded_router uses Y_eff; replicated_router is always 1.
-    # For 1D TP, sharded_router uses the full attention TP size.
+    # sharded router modes use Y_eff; replicated_router is always 1.
+    # The normalization-deferred mode currently requires 2D TP with Y_eff > 1.
+    # For 1D TP, the ordinary sharded router uses the full attention TP size.
     if router_sync_mode == MoERouterSyncMode.REPLICATED_ROUTER:
         _router_shard_factor = 1
-    elif router_sync_mode == MoERouterSyncMode.SHARDED_ROUTER:
+    elif router_sync_mode in (
+        MoERouterSyncMode.SHARDED_ROUTER,
+        MoERouterSyncMode.NORMALIZATION_DEFERRED_SHARDED_ROUTER,
+    ):
         if moe_tp_variant == TensorParallelVariant.SHARD_WEIGHTS_2D:
             _resolved_moe_split = resolve_tp2d_split(
                 tp_view=moe_tp_topology_view,
@@ -1071,7 +1079,16 @@ def get_model_stats(
                 view_name="TP_MoE_router",
             )
             _router_shard_factor = _resolved_moe_split.tp_yz
+            if (
+                router_sync_mode == MoERouterSyncMode.NORMALIZATION_DEFERRED_SHARDED_ROUTER
+                and _router_shard_factor <= 1
+            ):
+                raise ValueError("normalization_deferred_sharded_router requires TP_MoE_Y > 1")
         else:
+            if router_sync_mode == MoERouterSyncMode.NORMALIZATION_DEFERRED_SHARDED_ROUTER:
+                raise ValueError(
+                    "normalization_deferred_sharded_router requires SHARD_WEIGHTS_2D MoE TP"
+                )
             _router_shard_factor = attn_tp_topology_view.num_chips
     else:
         raise ValueError(f"Unsupported router_sync_mode: {router_sync_mode}")

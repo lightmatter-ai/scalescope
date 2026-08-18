@@ -182,21 +182,38 @@ def _calculate_prefill_moe_compute(
 
     # Decode router mode policy for compute:
     # - replicated_router: each rank computes full router scores locally.
-    # - sharded_router: router compute is sharded by router_shard_factor.
+    # - sharded router modes: router projection compute is sharded by
+    #   router_shard_factor.
+    # - normalization_deferred_sharded_router additionally reconstructs every
+    #   reduced logit as (P - mean * G) / stddev + C on every participant.
     # router_shard_factor is set by the orchestrator: Y_eff for 2D TP (after
     # AG(X) the router is sharded only across Y_eff), attn_tp_size for 1D TP.
     router_compute_multiplier = 1.0
+    normalization_deferred_router_correction_flops = 0.0
     if isinstance(workload_spec, InferenceDecodeSpec):
         router_mode = workload_spec.decode_moe_router_sync_mode
         router_shard_factor = int(moe_config.router_shard_factor)
         if router_shard_factor < 1:
             raise ValueError(f"Invalid router_shard_factor: {router_shard_factor}")
-        if router_mode == MoERouterSyncMode.REPLICATED_ROUTER:
-            router_compute_multiplier = float(router_shard_factor)
-        elif router_mode == MoERouterSyncMode.SHARDED_ROUTER:
-            router_compute_multiplier = 1.0
-        else:
-            raise ValueError(f"Unsupported decode_moe_router_sync_mode: {router_mode}")
+        match router_mode:
+            case MoERouterSyncMode.REPLICATED_ROUTER:
+                # Each rank computes the full router GEMM + top-k locally,
+                # so aggregate FLOPs scale with the number of router shards.
+                router_compute_multiplier = float(router_shard_factor)
+            case MoERouterSyncMode.SHARDED_ROUTER:
+                # Projection is partitioned across router_shard_factor ranks;
+                # together they still do one full router GEMM.
+                router_compute_multiplier = 1.0
+            case MoERouterSyncMode.NORMALIZATION_DEFERRED_SHARDED_ROUTER:
+                # Same sharded projection as SHARDED_ROUTER, plus each
+                # participant reconstructs every reduced logit as
+                # (P - mean * G) / stddev + C (4 FLOPs per expert logit).
+                router_compute_multiplier = 1.0
+                normalization_deferred_router_correction_flops = (
+                    4.0 * n_batch * n_seq * num_routed_experts
+                )
+            case _:
+                raise ValueError(f"Unsupported decode_moe_router_sync_mode: {router_mode}")
     router_flops *= router_compute_multiplier
 
     # Expert computation per routed expert based on tokens_per_set/num_routed_experts and traffic multiplier.
@@ -239,6 +256,7 @@ def _calculate_prefill_moe_compute(
     attn_tp_size = tp_attn_topology.num_chips if tp_attn_topology is not None else 1
     total_flops = (
         router_flops / router_shard_denom
+        + normalization_deferred_router_correction_flops
         + per_expert_ffn_flops / moe_tp_size
         + expert_output_combine_flops / attn_tp_size
     )

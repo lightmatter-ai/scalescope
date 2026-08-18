@@ -57,6 +57,7 @@ class ActivationStorageOptimizationStrategy(StrEnum):
 class MoERouterSyncMode(StrEnum):
     REPLICATED_ROUTER = "replicated_router"
     SHARDED_ROUTER = "sharded_router"
+    NORMALIZATION_DEFERRED_SHARDED_ROUTER = "normalization_deferred_sharded_router"
 
 
 class TP2DProjAxisRole(StrEnum):
@@ -946,7 +947,10 @@ class InferenceDecodeSpec(WorkloadSpec):
             "Decode-only MoE router synchronization mode over the attention TP domain. "
             "'replicated_router' computes full router logits locally on each attention-TP rank "
             "(no router all-reduce). "
-            "'sharded_router' shards router logits across attention-TP ranks and requires an all-reduce."
+            "'sharded_router' shards router logits across attention-TP ranks and requires separate "
+            "normalization-statistics and router-logit all-reduces. "
+            "'normalization_deferred_sharded_router' computes partial logits from unnormalized "
+            "activations and packs them with normalization statistics into one all-reduce."
         ),
     )
 

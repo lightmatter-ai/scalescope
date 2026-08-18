@@ -45,6 +45,7 @@ _COMM_STAGE_DISPLAY_NAMES: Dict[str, str] = {
     "ln2_ag_yz": "Pre-MoE LayerNorm/router gather",
     "ln2_stats_ar_yz": "Pre-MoE LayerNorm stats",
     "moe_router_ar": "MoE router-logit all-reduce",
+    "ln2_router_packed_ar_yz": "Packed LayerNorm/router all-reduce",
     "moe_c1_ar_yz": "MoE up-projection C1 all-reduce",
     "moe_c2_rs_x": "MoE down-projection C2 reduce-scatter",
     "combine_rs_exact_groups": "MoE-to-residual layout reduce-scatter",
@@ -1038,43 +1039,61 @@ def _trace_moe_stages(
     )
 
     # Stage 6: router input — depends on router mode
-    if router_mode == "replicated":
-        trace.record(
-            "router_input",
-            "Replicated router: needs full D for W_gate matmul",
-            TensorRecord(
-                name="x_router",
-                global_shape={"B": set_tokens, "D": d_model},
-                partitions={
-                    "D": P("replicated"),
-                    "B": P("replicated", ("Y",)),
-                },
-                dtype_bytes=dtype_bytes,
-            ),
-            note=(
-                f"boundary AG(TP_Proj_X) plus AG(Y quotient), followed by "
-                f"LN/router AG(TP_MoE_Y), provides full d_model={d_model}."
-            ),
-        )
-    else:
-        _router_d_partitions = {"D": P("sharded", ("MoE_Y",))} if moe_tp_yz > 1 else {}
-        trace.record(
-            "router_input",
-            "Sharded router: AG(X) then partial logits + AR sync",
-            TensorRecord(
-                name="x_router",
-                global_shape={"B": set_tokens, "D": d_model},
-                partitions={
-                    **_router_d_partitions,
-                    "B": P("replicated", ("Y",)),
-                },
-                dtype_bytes=dtype_bytes,
-            ),
-            note=(
-                f"comm: AG(X) → D/TP_MoE_Y = {d_model // moe_tp_yz}. "
-                "Router uses W_gate[D/Y_eff, E] → partial logits → Phase B AR."
-            ),
-        )
+    match router_mode:
+        case "replicated":
+            # Each rank needs full D for the local W_gate matmul.
+            trace.record(
+                "router_input",
+                "Replicated router: needs full D for W_gate matmul",
+                TensorRecord(
+                    name="x_router",
+                    global_shape={"B": set_tokens, "D": d_model},
+                    partitions={
+                        "D": P("replicated"),
+                        "B": P("replicated", ("Y",)),
+                    },
+                    dtype_bytes=dtype_bytes,
+                ),
+                note=(
+                    f"boundary AG(TP_Proj_X) plus AG(Y quotient), followed by "
+                    f"LN/router AG(TP_MoE_Y), provides full d_model={d_model}."
+                ),
+            )
+        case "sharded" | "normalization_deferred_sharded":
+            # AG(X) then partial logits; D stays sharded across TP_MoE_Y.
+            # Normalization-deferred packs [sum, sumsq, partial logits]
+            # into one AR(Y) instead of a separate Phase B AR.
+            _router_d_partitions = {"D": P("sharded", ("MoE_Y",))} if moe_tp_yz > 1 else {}
+            normalization_deferred = router_mode == "normalization_deferred_sharded"
+            trace.record(
+                "router_input",
+                (
+                    "Normalization-deferred sharded router: AG(X), "
+                    "pre-normalized partial logits + packed AR"
+                    if normalization_deferred
+                    else "Sharded router: AG(X) then partial logits + AR sync"
+                ),
+                TensorRecord(
+                    name="x_router",
+                    global_shape={"B": set_tokens, "D": d_model},
+                    partitions={
+                        **_router_d_partitions,
+                        "B": P("replicated", ("Y",)),
+                    },
+                    dtype_bytes=dtype_bytes,
+                ),
+                note=(
+                    f"comm: AG(X) → D/TP_MoE_Y = {d_model // moe_tp_yz}. "
+                    + (
+                        "Router forms pre-normalized partial logits and packs "
+                        "[sum, sumsq, partial logits] into one AR(Y)."
+                        if normalization_deferred
+                        else "Router uses W_gate[D/Y_eff, E] → partial logits → Phase B AR."
+                    )
+                ),
+            )
+        case _:
+            raise ValueError(f"Unsupported router_mode: {router_mode!r}")
 
     # Cross-attention-domain dispatch A2A.
     # When one expert set spans multiple attention domains, the deterministic
@@ -1327,7 +1346,7 @@ def build_decode_2dtp_trace(
         attention TP domain. Equal to 1 means one set per attention domain;
         > 1 keeps the cross-set AG path (the existing "S_attn > 1" regime).
         At most one of these two ratios is > 1 at a time.
-    router_mode : "replicated" or "sharded"
+    router_mode : "replicated", "sharded", or "normalization_deferred_sharded"
     batch_tokens : number of decode tokens in the attention domain
     dtype_bytes : bytes per element (default 2 for bf16/fp16)
     context_len : KV-cache context length (prefill_seq_len)
@@ -1339,6 +1358,14 @@ def build_decode_2dtp_trace(
     """
     if tp_y % g != 0:
         raise ValueError(f"tp_y ({tp_y}) must be divisible by g ({g})")
+    if router_mode not in (
+        "replicated",
+        "sharded",
+        "normalization_deferred_sharded",
+    ):
+        raise ValueError(f"Unsupported router_mode: {router_mode!r}")
+    if router_mode == "normalization_deferred_sharded" and moe_tp_yz <= 1:
+        raise ValueError("normalization_deferred_sharded router trace requires moe_tp_yz > 1")
 
     mesh = build_decode_2dtp_mesh(
         tp_x,

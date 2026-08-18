@@ -2496,7 +2496,7 @@ class TP2DMoEStrategy(TensorParallelStrategy):
         # is needed when tp_yz > 1. When tp_yz == 1 the Hockney model returns zero
         # and the trace shows the collective as a noop.
         #
-        # Two strategies depending on router mode and pass type:
+        # Three strategies depending on router mode and pass type:
         # - Decode + replicated router: AG(Y_eff) → full D locally. One collective
         #   that serves both LN (computed locally with full D) and the replicated
         #   router (needs full D for W_gate[D, E] matmul). Saves one alpha vs
@@ -2504,98 +2504,151 @@ class TP2DMoEStrategy(TensorParallelStrategy):
         #   that the saved alpha dominates the extra volume.
         # - Sharded router / prefill / train: LN stats AR(Y_eff). Tiny payload
         #   (2 scalars × B × float_size). Router uses D/Y_eff with logits AR (Phase B).
+        # - Normalization-deferred sharded router: compute partial router logits from
+        #   unnormalized activations, then pack those logits with the two LN statistics
+        #   into one AR(Y_eff). This preserves the sharded router's payload while
+        #   eliminating one collective startup.
         router_sync_mode = moe_config.router_sync_mode
 
         # LN2 + router comm (Phase B), branched by router mode:
-        if router_sync_mode == MoERouterSyncMode.REPLICATED_ROUTER:
-            # Fused LN2 + replicated router: AG(Y_eff) gathers full D.
-            # One collective serves both LN (local with full D) and the
-            # replicated router (needs full D for W_gate[D, E]).
-            ln2_ag_yz_bytes = float_size * tokens_local * d_model
-            comm_ln2 = hockney_model_all_gather_on_nd_topology(
-                yz_topology, ln2_ag_yz_bytes, float_size_bytes=float_size
-            )
-            total_comm += comm_ln2
-            layout_trace.record_comm(
-                "ln2_ag_yz",
-                "AG",
-                f"YZ({yz_topology.num_chips})",
-                yz_topology.num_chips,
-                ln2_ag_yz_bytes,
-                comm_ln2,
-                note=(
-                    f"LN2 + replicated router fused: AG(Y_eff={tp_yz}) → "
-                    f"full D={d_model} per rank"
-                ),
-            )
-        elif router_sync_mode == MoERouterSyncMode.SHARDED_ROUTER:
-            # LN2 stats AR: tiny payload (2 scalars × B × float_size).
-            ln2_stats_bytes = 2 * float_size * tokens_local
-            comm_ln2 = hockney_model_all_reduce_on_nd_topology(
-                yz_topology, ln2_stats_bytes, float_size_bytes=float_size
-            )
-            total_comm += comm_ln2
-            layout_trace.record_comm(
-                "ln2_stats_ar_yz",
-                "AR",
-                f"YZ({yz_topology.num_chips})",
-                yz_topology.num_chips,
-                ln2_stats_bytes,
-                comm_ln2,
-                note=f"LN2 stats: mean+var across Y_eff={tp_yz}",
-            )
-
-            # Router logits AR: sync partial logits across Y_eff.
-            # After AG(X) in Phase A1, D is sharded only along Y_eff; X-ranks hold
-            # identical D/Y_eff slices and identical W_gate shards, producing identical
-            # partial logits. Only Y_eff-ranks contribute distinct partials.
-            # With <=1 routed experts, logits synchronization is unnecessary.
-            if n_experts > 1:
-                router_bytes = float_size * tokens_local * n_experts
-                comm_router_sync = hockney_model_all_reduce_on_nd_topology(
-                    yz_topology, router_bytes, float_size_bytes=float_size
+        match router_sync_mode:
+            case MoERouterSyncMode.REPLICATED_ROUTER:
+                # Fused LN2 + replicated router: AG(Y_eff) gathers full D.
+                # One collective serves both LN (local with full D) and the
+                # replicated router (needs full D for W_gate[D, E]).
+                ln2_ag_yz_bytes = float_size * tokens_local * d_model
+                comm_ln2 = hockney_model_all_gather_on_nd_topology(
+                    yz_topology, ln2_ag_yz_bytes, float_size_bytes=float_size
                 )
-                total_comm += comm_router_sync
+                total_comm += comm_ln2
                 layout_trace.record_comm(
-                    "moe_router_ar",
+                    "ln2_ag_yz",
+                    "AG",
+                    f"YZ({yz_topology.num_chips})",
+                    yz_topology.num_chips,
+                    ln2_ag_yz_bytes,
+                    comm_ln2,
+                    note=(
+                        f"LN2 + replicated router fused: AG(Y_eff={tp_yz}) → "
+                        f"full D={d_model} per rank"
+                    ),
+                )
+            case MoERouterSyncMode.SHARDED_ROUTER:
+                # LN2 stats AR: tiny payload (2 scalars × B × float_size).
+                ln2_stats_bytes = 2 * float_size * tokens_local
+                comm_ln2 = hockney_model_all_reduce_on_nd_topology(
+                    yz_topology, ln2_stats_bytes, float_size_bytes=float_size
+                )
+                total_comm += comm_ln2
+                layout_trace.record_comm(
+                    "ln2_stats_ar_yz",
                     "AR",
                     f"YZ({yz_topology.num_chips})",
                     yz_topology.num_chips,
-                    router_bytes,
-                    comm_router_sync,
-                    note="sharded router: sync logits across Y_eff",
+                    ln2_stats_bytes,
+                    comm_ln2,
+                    note=f"LN2 stats: mean+var across Y_eff={tp_yz}",
                 )
-        else:
-            raise ValueError(f"Unsupported router_sync_mode: {router_sync_mode}")
+
+                # Router logits AR: sync partial logits across Y_eff.
+                # After AG(X) in Phase A1, D is sharded only along Y_eff;
+                # X-ranks hold identical D/Y_eff slices and identical W_gate
+                # shards, producing identical partial logits. Only Y_eff-ranks
+                # contribute distinct partials. With <=1 routed experts,
+                # logits synchronization is unnecessary.
+                if n_experts > 1:
+                    router_bytes = float_size * tokens_local * n_experts
+                    comm_router_sync = hockney_model_all_reduce_on_nd_topology(
+                        yz_topology, router_bytes, float_size_bytes=float_size
+                    )
+                    total_comm += comm_router_sync
+                    layout_trace.record_comm(
+                        "moe_router_ar",
+                        "AR",
+                        f"YZ({yz_topology.num_chips})",
+                        yz_topology.num_chips,
+                        router_bytes,
+                        comm_router_sync,
+                        note="sharded router: sync logits across Y_eff",
+                    )
+            case MoERouterSyncMode.NORMALIZATION_DEFERRED_SHARDED_ROUTER:
+                # Algebraically defer normalization until after reducing both
+                # the stats and pre-normalized partial logits in one packed AR:
+                #   [S, Q, P_1, ..., P_E] = AR_Y([S_r, Q_r, P_1,r, ..., P_E,r])
+                # Same B*(E+2) element volume as the two ordinary sharded
+                # buffers, but one fewer collective startup.
+                if tp_yz <= 1:
+                    raise ValueError("normalization_deferred_sharded_router requires TP_MoE_Y > 1")
+                packed_router_bytes = float_size * tokens_local * (n_experts + 2)
+                comm_packed_router_sync = hockney_model_all_reduce_on_nd_topology(
+                    yz_topology,
+                    packed_router_bytes,
+                    float_size_bytes=float_size,
+                )
+                total_comm += comm_packed_router_sync
+                layout_trace.record_comm(
+                    "ln2_router_packed_ar_yz",
+                    "AR",
+                    f"YZ({yz_topology.num_chips})",
+                    yz_topology.num_chips,
+                    packed_router_bytes,
+                    comm_packed_router_sync,
+                    note=(
+                        "normalization-deferred sharded router: packed "
+                        "[sum, sumsq, partial logits]"
+                    ),
+                )
+            case _:
+                raise ValueError(f"Unsupported router_sync_mode: {router_sync_mode}")
 
         _d_yz = d_model // max(1, tp_yz)
         _dff_x = d_ff // max(1, tp_x)
-        if router_sync_mode == MoERouterSyncMode.REPLICATED_ROUTER:
-            layout_trace.record(
-                "router_input",
-                "Replicated router: needs full D",
-                TensorRecord(
-                    "x_router",
-                    {"B": s, "D": d_model},
-                    {"D": P("replicated"), "B": P("replicated", ("Y",))},
-                    dtype_bytes=float_size,
-                ),
-                note=f"actual: replicated router, full d_model={d_model}",
-            )
-        elif router_sync_mode == MoERouterSyncMode.SHARDED_ROUTER:
-            _router_d_part = (
-                {"D": P("sharded", ("MoE_Y",)), "B": P("replicated", ("Y",))}
-                if tp_yz > 1
-                else {"B": P("replicated", ("Y",))}
-            )
-            layout_trace.record(
-                "router_input",
-                "Sharded router: AG(X) then partial logits + AR",
-                TensorRecord(
-                    "x_router", {"B": s, "D": d_model}, _router_d_part, dtype_bytes=float_size
-                ),
-                note=f"actual: sharded router, D/tp_yz = {_d_yz} (tp_yz={tp_yz})",
-            )
+        match router_sync_mode:
+            case MoERouterSyncMode.REPLICATED_ROUTER:
+                # Each rank needs full D for the local W_gate matmul.
+                layout_trace.record(
+                    "router_input",
+                    "Replicated router: needs full D",
+                    TensorRecord(
+                        "x_router",
+                        {"B": s, "D": d_model},
+                        {"D": P("replicated"), "B": P("replicated", ("Y",))},
+                        dtype_bytes=float_size,
+                    ),
+                    note=f"actual: replicated router, full d_model={d_model}",
+                )
+            case (
+                MoERouterSyncMode.SHARDED_ROUTER
+                | MoERouterSyncMode.NORMALIZATION_DEFERRED_SHARDED_ROUTER
+            ):
+                # Same D/Y_eff activation layout. Deferred mode only changes
+                # how logits are formed (packed AR), not x_router partitioning.
+                _router_d_part = (
+                    {"D": P("sharded", ("MoE_Y",)), "B": P("replicated", ("Y",))}
+                    if tp_yz > 1
+                    else {"B": P("replicated", ("Y",))}
+                )
+                layout_trace.record(
+                    "router_input",
+                    (
+                        "Normalization-deferred sharded router: AG(X), "
+                        "pre-normalized partial logits + packed AR"
+                        if router_sync_mode
+                        == MoERouterSyncMode.NORMALIZATION_DEFERRED_SHARDED_ROUTER
+                        else "Sharded router: AG(X) then partial logits + AR"
+                    ),
+                    TensorRecord(
+                        "x_router",
+                        {"B": s, "D": d_model},
+                        _router_d_part,
+                        dtype_bytes=float_size,
+                    ),
+                    note=(
+                        f"actual: {router_sync_mode.value}, " f"D/tp_yz = {_d_yz} (tp_yz={tp_yz})"
+                    ),
+                )
+            case _:
+                raise ValueError(f"Unsupported router_sync_mode: {router_sync_mode}")
 
         _expert_d_part = (
             {"D": P("sharded", ("MoE_Y",)), "B": P("replicated", ("Y",))}

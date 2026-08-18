@@ -1170,25 +1170,43 @@ def _decode_router_weight_read_bytes(
     total_num_routed_experts: int,
     float_size: int,
 ) -> int:
-    """Per-rank decode router-weight read bytes for current router mode.
+    """Per-rank decode router-state read bytes for current router mode.
 
     Uses ``moe_config.router_shard_factor`` which the orchestrator sets to
     Y_eff for 2D TP (after AG(X) the router weight is sharded only across
-    Y_eff) or attn_tp_size for 1D TP.
+    Y_eff) or attn_tp_size for 1D TP. The normalization-deferred mode also
+    reads its precomputed correction vectors G and C.
     """
     if not isinstance(workload_spec, InferenceDecodeSpec):
+        if moe_config.router_sync_mode == MoERouterSyncMode.NORMALIZATION_DEFERRED_SHARDED_ROUTER:
+            raise ValueError(
+                "normalization_deferred_sharded_router is only valid for inference decode"
+            )
         return 0
 
     router_mode = workload_spec.decode_moe_router_sync_mode
     router_weight_full = d_model * total_num_routed_experts * float_size
     router_shard_factor = int(moe_config.router_shard_factor)
-    if router_mode == MoERouterSyncMode.REPLICATED_ROUTER:
-        return int(router_weight_full)
-    if router_mode == MoERouterSyncMode.SHARDED_ROUTER:
-        if router_shard_factor < 1:
-            raise ValueError(f"Invalid router_shard_factor: {router_shard_factor}")
-        return int(router_weight_full / router_shard_factor)
-    raise ValueError(f"Unsupported decode_moe_router_sync_mode: {router_mode}")
+    match router_mode:
+        case MoERouterSyncMode.REPLICATED_ROUTER:
+            # Each rank holds the full W_gate and reads it locally.
+            return int(router_weight_full)
+        case MoERouterSyncMode.SHARDED_ROUTER:
+            # W_gate is partitioned across router_shard_factor ranks.
+            if router_shard_factor < 1:
+                raise ValueError(f"Invalid router_shard_factor: {router_shard_factor}")
+            return int(router_weight_full / router_shard_factor)
+        case MoERouterSyncMode.NORMALIZATION_DEFERRED_SHARDED_ROUTER:
+            # Same sharded W_gate as SHARDED_ROUTER, plus the precomputed
+            # correction vectors G and C (one pair per routed expert).
+            if router_shard_factor <= 1:
+                raise ValueError(
+                    "normalization_deferred_sharded_router requires router_shard_factor > 1"
+                )
+            correction_vectors = 2 * total_num_routed_experts * float_size
+            return int(router_weight_full / router_shard_factor + correction_vectors)
+        case _:
+            raise ValueError(f"Unsupported decode_moe_router_sync_mode: {router_mode}")
 
 
 def _forward_pass_prefill_moe_ffn_tp_1d_memory_traffic(
@@ -1813,6 +1831,16 @@ def _forward_pass_prefill_moe_ffn_tp_2d_memory_traffic(
         router_scores = tokens_local * total_num_routed_experts * float_size
         traffic.activations.bytes_written += int(router_scores)
         traffic.activations.bytes_read += int(router_scores)
+        if moe_config.router_sync_mode == MoERouterSyncMode.NORMALIZATION_DEFERRED_SHARDED_ROUTER:
+            if not isinstance(workload_spec, InferenceDecodeSpec):
+                raise ValueError(
+                    "normalization_deferred_sharded_router is only valid for inference decode"
+                )
+            # The P portion reuses the router-score buffer above. Charge the
+            # two additional packed fields per token for sum and sum-of-squares.
+            packed_normalization_stats = 2 * tokens_local * float_size
+            traffic.activations.bytes_written += int(packed_normalization_stats)
+            traffic.activations.bytes_read += int(packed_normalization_stats)
 
         # Decode router mode can change router-weight reads over the attention TP domain.
         # Router weight matrix is approximated as [d_model, n_experts].

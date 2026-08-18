@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from pydantic import BaseModel, ConfigDict
 
 import scalescope.sweep_dsl as dsl
@@ -7,6 +9,66 @@ from scalescope.sweep_dsl import generate_cases, SweepConfig
 class _Dummy(BaseModel):
     model_config = ConfigDict(frozen=True)
     x: int = 0
+
+
+def _cross_domain_specs(router_mode: str, moe_y: int = 2):
+    mappings = {
+        "TP_Attn_X": SimpleNamespace(size=2, maps_to_physical_dimension_name="fast"),
+        "TP_Attn_Y": SimpleNamespace(size=2, maps_to_physical_dimension_name="fast"),
+        "TP_Proj_Y": SimpleNamespace(size=2, maps_to_physical_dimension_name="fast"),
+        "TP_MoE_X": SimpleNamespace(size=1, maps_to_physical_dimension_name="fast"),
+        "TP_MoE_Y": SimpleNamespace(size=moe_y, maps_to_physical_dimension_name="fast"),
+        "DP_Attn_SU": SimpleNamespace(size=1, maps_to_physical_dimension_name="fast"),
+        "DP_Attn_SO": SimpleNamespace(size=4, maps_to_physical_dimension_name="slow"),
+        "EP_SO": SimpleNamespace(size=4, maps_to_physical_dimension_name="slow"),
+    }
+
+    class _Topology:
+        physical_topology = SimpleNamespace(total_nodes=16)
+
+        @staticmethod
+        def get_mapping_for_tag(tag):
+            return mappings[tag]
+
+    workload = SimpleNamespace(
+        decode_cross_domain_ep_mode=SimpleNamespace(value="explicit_owner_a2av"),
+        decode_moe_router_sync_mode=SimpleNamespace(value=router_mode),
+        projection_groups=1,
+        global_batch_size=4,
+        moe_spec_v2=SimpleNamespace(
+            num_colocated_experts=1,
+            expert_domain_placement=SimpleNamespace(
+                kind=SimpleNamespace(value="balanced_expert_groups"),
+                domain_tag="EP_SO",
+            ),
+        ),
+    )
+    return {
+        "workload_spec": workload,
+        "logical_topology": _Topology(),
+        "model_spec": SimpleNamespace(num_regular_experts=8),
+    }
+
+
+def test_cross_domain_verifier_accepts_normalization_deferred_router():
+    specs = _cross_domain_specs("normalization_deferred_sharded_router")
+    assert dsl._verifier_decode_cross_domain_ep_exact(
+        None,
+        {},
+        applied_specs=specs,
+    )
+
+
+def test_cross_domain_verifier_rejects_normalization_deferred_router_at_y1():
+    specs = _cross_domain_specs(
+        "normalization_deferred_sharded_router",
+        moe_y=1,
+    )
+    assert not dsl._verifier_decode_cross_domain_ep_exact(
+        None,
+        {},
+        applied_specs=specs,
+    )
 
 
 def test_custom_verifier_receives_applied_specs(tmp_path):

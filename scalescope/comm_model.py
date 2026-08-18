@@ -340,7 +340,10 @@ def get_transformer_comm_stats(
                         "Scale-out-spanning wide-EP decode does not support multiple "
                         "complete expert sets inside one attention domain"
                     )
-                if moe_config.router_sync_mode == MoERouterSyncMode.SHARDED_ROUTER:
+                if moe_config.router_sync_mode in (
+                    MoERouterSyncMode.SHARDED_ROUTER,
+                    MoERouterSyncMode.NORMALIZATION_DEFERRED_SHARDED_ROUTER,
+                ):
                     if moe_config.router_shard_factor != tp_moe_y_shards:
                         raise ValueError(
                             "Feeder-local sharded router requires router_shard_factor "
