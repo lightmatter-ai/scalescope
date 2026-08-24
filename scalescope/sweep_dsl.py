@@ -474,6 +474,11 @@ def _verifier_decode_sharded_router_proj_y_eff_matches_moe_y_all_shapes(
     - Enforced for all MoE TP shapes in sharded-router decode path.
     - The normalization-deferred mode additionally requires `TP_MoE_Y > 1`.
     - If not applicable (non-decode, replicated router, missing 2D splits), returns True.
+
+    Retired from default generators. Nested unmatched `Y_eff > MoE_Y` is
+    already priced (`moe_input_ag_y` + combine RS) and remains legal under
+    `decode_proj_layout_coarsens_moe_layout`. Keep this verifier registered
+    so archived configs that still name it can run.
     """
     specs = _resolve_specs(case, base_specs, applied_specs)
     if specs is None:

@@ -25,70 +25,84 @@ def calculate_overlapped_time(
     comp_time: float,
     comm_time: float,
     mem_time: float,
-    comp_comm_efficiency: float = 1.0,
-    comp_mem_efficiency: float = 1.0,
-    comm_mem_efficiency: float = 1.0,
+    comp_comm_efficiency: float,
+    comp_mem_efficiency: float,
+    comm_mem_efficiency: float,
 ) -> dict:
+    """Minimum makespan for divisible compute/comm/memory with pairwise overlap caps.
+
+    Each efficiency is the maximum fraction of the shorter member of that pair
+    that may overlap. The returned total is
+
+        max(C, K, M,
+            C+K-aCK, C+M-aCM, K+M-aKM,
+            C+K+M-aCK-aCM-aKM)
+
+    with aij = eij * min(i, j). The inner max is required: subtracting all
+    pairwise credits alone can over-credit overlaps that compete for the same
+    interval.
     """
-    Calculate execution time and utilization with pairwise overlap efficiencies between operations.
-
-    The total time is returned in the same units as the input times.
-
-    Args:
-        comp_time: Time taken for computation
-        comm_time: Time taken for communication
-        mem_time: Time taken for memory operations
-        comp_comm_efficiency: Overlap efficiency between compute and communication (0.0 to 1.0)
-        comp_mem_efficiency: Overlap efficiency between compute and memory (0.0 to 1.0)
-        comm_mem_efficiency: Overlap efficiency between communication and memory (0.0 to 1.0)
-
-    Returns:
-        dict: Dictionary containing:
-            - total_time: Total execution time
-            - compute_utilization: Percentage of total time spent computing (0-100%)
-            - communication_utilization: Percentage of total time spent communicating (0-100%)
-            - memory_utilization: Percentage of total time spent in memory operations (0-100%)
-
-    """
-    for eff in [comp_comm_efficiency, comp_mem_efficiency, comm_mem_efficiency]:
+    for name, value in (
+        ("comp_time", comp_time),
+        ("comm_time", comm_time),
+        ("mem_time", mem_time),
+    ):
+        if value < 0:
+            raise ValueError(f"{name} must be >= 0, got {value}")
+    for name, eff in (
+        ("comp_comm_efficiency", comp_comm_efficiency),
+        ("comp_mem_efficiency", comp_mem_efficiency),
+        ("comm_mem_efficiency", comm_mem_efficiency),
+    ):
         if not 0.0 <= eff <= 1.0:
-            raise ValueError("Efficiency values must be between 0.0 and 1.0")
+            raise ValueError(f"{name} must be between 0.0 and 1.0, got {eff}")
 
-    # Start with the longest time as base
-    times = [comp_time, comm_time, mem_time]
-    max_time = max(times)
-    total_time = max_time
+    overlap_ck = comp_comm_efficiency * min(comp_time, comm_time)
+    overlap_cm = comp_mem_efficiency * min(comp_time, mem_time)
+    overlap_km = comm_mem_efficiency * min(comm_time, mem_time)
+    bounds = {
+        "compute": comp_time,
+        "communication": comm_time,
+        "memory": mem_time,
+        "compute_communication": comp_time + comm_time - overlap_ck,
+        "compute_memory": comp_time + mem_time - overlap_cm,
+        "communication_memory": comm_time + mem_time - overlap_km,
+        "total_work": (comp_time + comm_time + mem_time - overlap_ck - overlap_cm - overlap_km),
+    }
+    total_time = max(bounds.values())
+    binding_constraints = [name for name, value in bounds.items() if value == total_time]
 
-    # Add non-overlapped portions based on pairwise efficiencies
-    if max_time == comp_time:
-        total_time += comm_time * (1.0 - comp_comm_efficiency)
-        total_time += mem_time * (1.0 - comp_mem_efficiency)
-    elif max_time == comm_time:
-        total_time += comp_time * (1.0 - comp_comm_efficiency)
-        total_time += mem_time * (1.0 - comm_mem_efficiency)
-    else:  # memory_time is max
-        total_time += comp_time * (1.0 - comp_mem_efficiency)
-        total_time += comm_time * (1.0 - comm_mem_efficiency)
-
-    # Calculate utilizations
     if total_time == 0:
         return {
             "total_time": 0.0,
             "compute_utilization": 0.0,
             "communication_utilization": 0.0,
             "memory_utilization": 0.0,
+            "binding_constraints": binding_constraints,
         }
-
-    compute_utilization = (comp_time / total_time) * 100
-    communication_utilization = (comm_time / total_time) * 100
-    memory_utilization = (mem_time / total_time) * 100
 
     return {
         "total_time": total_time,
-        "compute_utilization": compute_utilization,
-        "communication_utilization": communication_utilization,
-        "memory_utilization": memory_utilization,
+        "compute_utilization": (comp_time / total_time) * 100,
+        "communication_utilization": (comm_time / total_time) * 100,
+        "memory_utilization": (mem_time / total_time) * 100,
+        "binding_constraints": binding_constraints,
     }
+
+
+def residual_after_accounted(*, total: float, accounted: float, name: str) -> float:
+    """Return total-accounted, failing if accounted exceeds total beyond float noise."""
+    if total < 0:
+        raise ValueError(f"{name} total must be >= 0, got {total}")
+    if accounted < 0:
+        raise ValueError(f"{name} accounted must be >= 0, got {accounted}")
+    residual = total - accounted
+    scale = max(abs(total), abs(accounted), 1.0)
+    if abs(residual) <= 1e-12 * scale:
+        return 0.0
+    if residual < 0:
+        raise ValueError(f"{name} accounted exceeds total: total={total}, accounted={accounted}")
+    return residual
 
 
 def format_with_units(key: str, value: float) -> str:

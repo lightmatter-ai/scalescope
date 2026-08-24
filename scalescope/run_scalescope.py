@@ -110,6 +110,7 @@ from scalescope.utils import (
     format_flops,
     format_time,
     PassMode,
+    residual_after_accounted,
 )
 from scalescope.workload_spec import (
     DecodeCrossDomainEPMode,
@@ -1255,8 +1256,9 @@ def get_model_stats(
                     f"projection_groups={g} could not be distributed across projection yz_tags={proj_yz_tags}."
                 )
 
-    # Per-layer host kernel-launch/dispatch floor, applied once per layer per pass.
-    kernel_launch_floor_per_pass = (
+    # Per-layer host kernel-launch/dispatch floor for one forward pass
+    # (one train/prefill pass, or one decode step).
+    kernel_floor_per_fwd_pass = (
         workload_spec.get_layers_per_pp_stage() * workload_spec.kernel_launch_latency_per_layer_sec
     )
 
@@ -1288,7 +1290,7 @@ def get_model_stats(
                 workload_spec,
             )
             batch_compute_time_forward_pass += (
-                kernel_launch_floor_per_pass + moe_runtime_overhead_per_pass
+                kernel_floor_per_fwd_pass + moe_runtime_overhead_per_pass
             )
             compute_time_moe_fwd += moe_runtime_overhead_per_pass
 
@@ -1338,7 +1340,7 @@ def get_model_stats(
                 workload_spec,
             )
             batch_compute_time_backward_pass += (
-                kernel_launch_floor_per_pass + moe_runtime_overhead_per_pass
+                kernel_floor_per_fwd_pass + moe_runtime_overhead_per_pass
             )
             compute_time_moe_bwd += moe_runtime_overhead_per_pass
             compute_time_param_update, flops_param_update = parameter_update_flops(
@@ -1373,7 +1375,7 @@ def get_model_stats(
                 workload_spec,
             )
             batch_compute_time_forward_pass += (
-                kernel_launch_floor_per_pass + moe_runtime_overhead_per_pass
+                kernel_floor_per_fwd_pass + moe_runtime_overhead_per_pass
             )
             compute_time_moe_fwd += moe_runtime_overhead_per_pass
 
@@ -1465,7 +1467,7 @@ def get_model_stats(
                     n_seq_so_far,
                 )
                 batch_compute_time_forward_pass += (
-                    step_time + kernel_launch_floor_per_pass + moe_runtime_overhead_per_step
+                    step_time + kernel_floor_per_fwd_pass + moe_runtime_overhead_per_step
                 )
                 batch_flops_forward_pass += step_flops
                 attn_flops_forward_pass += step_attn_flops
@@ -2115,6 +2117,8 @@ def get_model_stats(
                 "tp_attn_fwd_phase1": CommStats(),
                 "tp_attn_fwd_phase2": CommStats(),
                 "tp_attn_fwd_phase3": CommStats(),
+                "tp_attn_fwd_proj": CommStats(),
+                "tp_attn_fwd_core": CommStats(),
                 "tp_moe_fwd": CommStats(),
                 "tp_attn_bwd": CommStats(),
                 "tp_moe_bwd": CommStats(),
@@ -2177,9 +2181,11 @@ def get_model_stats(
 
     # Unpack dictionary for aggregated stats
     tp_attn_fwd = comm_stats["tp_attn_fwd"]
-    tp_attn_fwd_phase1 = comm_stats.get("tp_attn_fwd_phase1", CommStats())
-    tp_attn_fwd_phase2 = comm_stats.get("tp_attn_fwd_phase2", CommStats())
-    tp_attn_fwd_phase3 = comm_stats.get("tp_attn_fwd_phase3", CommStats())
+    tp_attn_fwd_phase1 = comm_stats["tp_attn_fwd_phase1"]
+    tp_attn_fwd_phase2 = comm_stats["tp_attn_fwd_phase2"]
+    tp_attn_fwd_phase3 = comm_stats["tp_attn_fwd_phase3"]
+    tp_attn_fwd_proj = comm_stats["tp_attn_fwd_proj"]
+    tp_attn_fwd_core = comm_stats["tp_attn_fwd_core"]
     tp_moe_fwd = comm_stats["tp_moe_fwd"]
     tp_attn_bwd = comm_stats["tp_attn_bwd"]
     tp_moe_bwd = comm_stats["tp_moe_bwd"]
@@ -2477,95 +2483,159 @@ def get_model_stats(
     comp_mem_efficiency = workload_spec.comp_mem_efficiency
     comm_mem_efficiency = workload_spec.comm_mem_efficiency
 
-    # Component-level time breakdowns (forward)
-    #
-    # These are intended for sweep reporting (BEST markers) where you want to optimize a sub-component
-    # (e.g. attention projection) without introducing global toggles.
-    attn_proj_comp_time_fwd = float(attn_proj_compute_time_fwd or 0.0)
-    attn_core_comp_time_fwd = float(attn_core_compute_time_fwd or 0.0)
-    attn_proj_mem_time_fwd = float(mem_stats.get("attn_fwd_mem_time_proj_s", 0.0) or 0.0)
-    attn_core_mem_time_fwd = float(mem_stats.get("attn_fwd_mem_time_core_s", 0.0) or 0.0)
-    attn_proj_comm_time_fwd = float(
-        (tp_attn_fwd_phase1.total_comm_time or 0.0) + (tp_attn_fwd_phase3.total_comm_time or 0.0)
-    )
-    attn_core_comm_time_fwd = float(tp_attn_fwd_phase2.total_comm_time or 0.0)
+    # Floors stay per-pass. Decode results cover N single-token forward passes.
+    match pass_mode:
+        case PassMode.TRAINING:
+            kernel_floor_per_bwd_pass = kernel_floor_per_fwd_pass
+            num_fwd_passes = 1
+        case PassMode.INFERENCE_PREFILL:
+            kernel_floor_per_bwd_pass = 0.0
+            num_fwd_passes = 1
+        case PassMode.INFERENCE_DECODE:
+            kernel_floor_per_bwd_pass = 0.0
+            if workload_spec.num_generated_tokens <= 0:
+                raise ValueError(
+                    "num_generated_tokens must be > 0 for inference_decode, "
+                    f"got {workload_spec.num_generated_tokens}."
+                )
+            num_fwd_passes = workload_spec.num_generated_tokens
+        case _:
+            raise ValueError(f"Unsupported pass mode for kernel-launch floor: {pass_mode}.")
 
-    attn_proj_overlapped_fwd = calculate_overlapped_time(
-        comp_time=attn_proj_comp_time_fwd,
-        comm_time=attn_proj_comm_time_fwd,
-        mem_time=attn_proj_mem_time_fwd,
-        comp_comm_efficiency=comp_comm_efficiency,
-        comp_mem_efficiency=comp_mem_efficiency,
-        comm_mem_efficiency=comm_mem_efficiency,
-    )
-    attn_core_overlapped_fwd = calculate_overlapped_time(
-        comp_time=attn_core_comp_time_fwd,
-        comm_time=attn_core_comm_time_fwd,
-        mem_time=attn_core_mem_time_fwd,
-        comp_comm_efficiency=comp_comm_efficiency,
-        comp_mem_efficiency=comp_mem_efficiency,
-        comm_mem_efficiency=comm_mem_efficiency,
-    )
+    def _overlapped_block(comp_time: float, comm_time: float, mem_time: float) -> dict:
+        return calculate_overlapped_time(
+            comp_time=comp_time,
+            comm_time=comm_time,
+            mem_time=mem_time,
+            comp_comm_efficiency=comp_comm_efficiency,
+            comp_mem_efficiency=comp_mem_efficiency,
+            comm_mem_efficiency=comm_mem_efficiency,
+        )
 
-    # FFN/MoE block totals (forward) for reporting
-    ffn_comp_time_fwd = float(compute_time_moe_fwd or 0.0)
-    ffn_mem_time_fwd = float(
-        (fwd_moe_layer_stats.get("fwd_moe_time_s", 0.0) or 0.0) * layers_per_stage
-    )
-    ffn_comm_time_fwd = float(
-        (tp_moe_fwd.total_comm_time or 0.0)
-        + (moe_a2a_fwd_1.total_comm_time or 0.0)
-        + (moe_a2a_fwd_2.total_comm_time or 0.0)
-    )
-    ffn_overlapped_fwd = calculate_overlapped_time(
-        comp_time=ffn_comp_time_fwd,
-        comm_time=ffn_comm_time_fwd,
-        mem_time=ffn_mem_time_fwd,
-        comp_comm_efficiency=comp_comm_efficiency,
-        comp_mem_efficiency=comp_mem_efficiency,
-        comm_mem_efficiency=comm_mem_efficiency,
+    attn_proj_comp_time_fwd = attn_proj_compute_time_fwd
+    attn_core_comp_time_fwd = attn_core_compute_time_fwd
+    ffn_comp_time_fwd = compute_time_moe_fwd
+    attn_proj_mem_time_fwd = fwd_attn_proj_traffic.get_stats(layers_per_stage)[
+        f"{fwd_attn_proj_traffic.name}_time_s"
+    ]
+    attn_core_mem_time_fwd = fwd_attn_core_traffic.get_stats(layers_per_stage)[
+        f"{fwd_attn_core_traffic.name}_time_s"
+    ]
+    ffn_mem_time_fwd = fwd_moe_traffic.get_stats(layers_per_stage)[f"{fwd_moe_traffic.name}_time_s"]
+    attn_proj_comm_time_fwd = tp_attn_fwd_proj.total_comm_time
+    attn_core_comm_time_fwd = tp_attn_fwd_core.total_comm_time
+    ffn_comm_time_fwd = (
+        tp_moe_fwd.total_comm_time + moe_a2a_fwd_1.total_comm_time + moe_a2a_fwd_2.total_comm_time
     )
 
-    batch_overlapped_time_forward_pass = calculate_overlapped_time(
-        comp_time=batch_compute_time_forward_pass,
-        comm_time=batch_comm_time_forward_pass,
-        mem_time=batch_mem_time_forward_pass,
-        comp_comm_efficiency=comp_comm_efficiency,
-        comp_mem_efficiency=comp_mem_efficiency,
-        comm_mem_efficiency=comm_mem_efficiency,
+    # Per-part overlap is diagnostic only. Official latency overlaps
+    # projection + core as one attention block, matching backward.
+    attn_proj_overlapped_fwd = _overlapped_block(
+        attn_proj_comp_time_fwd, attn_proj_comm_time_fwd, attn_proj_mem_time_fwd
     )
-    batch_time_to_train_sec_forward_pass = batch_overlapped_time_forward_pass["total_time"]
+    attn_core_overlapped_fwd = _overlapped_block(
+        attn_core_comp_time_fwd, attn_core_comm_time_fwd, attn_core_mem_time_fwd
+    )
+    attn_comp_time_fwd = attn_proj_comp_time_fwd + attn_core_comp_time_fwd
+    attn_comm_time_fwd = attn_proj_comm_time_fwd + attn_core_comm_time_fwd
+    attn_mem_time_fwd = attn_proj_mem_time_fwd + attn_core_mem_time_fwd
+    attn_overlapped_fwd = _overlapped_block(
+        attn_comp_time_fwd, attn_comm_time_fwd, attn_mem_time_fwd
+    )
+    ffn_overlapped_fwd = _overlapped_block(ffn_comp_time_fwd, ffn_comm_time_fwd, ffn_mem_time_fwd)
 
-    # Time-To-First-Token (TTFT) for inference prefill: time for one micro-batch to traverse PP
+    residual_comp_fwd = residual_after_accounted(
+        total=batch_compute_time_forward_pass,
+        accounted=(
+            attn_proj_comp_time_fwd
+            + attn_core_comp_time_fwd
+            + ffn_comp_time_fwd
+            + kernel_floor_per_fwd_pass * num_fwd_passes
+        ),
+        name="forward_compute",
+    )
+    residual_comm_fwd = residual_after_accounted(
+        total=batch_comm_time_forward_pass,
+        accounted=attn_proj_comm_time_fwd + attn_core_comm_time_fwd + ffn_comm_time_fwd,
+        name="forward_communication",
+    )
+    residual_mem_fwd = residual_after_accounted(
+        total=batch_mem_time_forward_pass,
+        accounted=attn_proj_mem_time_fwd + attn_core_mem_time_fwd + ffn_mem_time_fwd,
+        name="forward_memory",
+    )
+    residual_overlapped_fwd = _overlapped_block(
+        residual_comp_fwd, residual_comm_fwd, residual_mem_fwd
+    )
+
+    batch_time_to_train_sec_forward_pass = (
+        attn_overlapped_fwd["total_time"]
+        + ffn_overlapped_fwd["total_time"]
+        + residual_overlapped_fwd["total_time"]
+        + kernel_floor_per_fwd_pass * num_fwd_passes
+    )
+
+    # Prefill TTFT: first generated token after one batched prompt prefill
+    # (B sequences × S prompt tokens in one pass, not token-by-token).
+    # Uses the same overlapped T_fwd as official ITL (attn + MoE + residual
+    # + kernel floor). Waiting for the micro-batch does not disable C/K/M
+    # overlap. e is still the constant workload-spec value; a size-aware
+    # overlap model will replace that later. T_fwd is for the full DP batch
+    # on one PP stage: scale to one micro-batch, then multiply by stage
+    # count so the first micro-batch fills the pipeline.
     ttft_forward_sec = None
     if pass_mode == PassMode.INFERENCE_PREFILL:
-        batch_size_per_dp_val = batch_size_per_dp
+        if batch_size_per_dp <= 0:
+            raise ValueError(f"batch_size_per_dp must be > 0, got {batch_size_per_dp}")
         micro_batch_size_val = workload_spec.effective_micro_batch_size
-        micro_factor = micro_batch_size_val / batch_size_per_dp_val
-        micro_compute_time = batch_compute_time_forward_pass * micro_factor
-        micro_comm_time = batch_comm_time_forward_pass * micro_factor
-        micro_mem_time = batch_mem_time_forward_pass * micro_factor
-        micro_overlapped = calculate_overlapped_time(
-            comp_time=micro_compute_time,
-            comm_time=micro_comm_time,
-            mem_time=micro_mem_time,
-            comp_comm_efficiency=0,  # comp_comm_efficiency,
-            comp_mem_efficiency=0,  # comp_mem_efficiency,
-            comm_mem_efficiency=0,  # comm_mem_efficiency,
-        )
-        micro_time_forward = micro_overlapped["total_time"]
-        ttft_forward_sec = micro_time_forward * pp_stages
+        if micro_batch_size_val <= 0:
+            raise ValueError(f"effective_micro_batch_size must be > 0, got {micro_batch_size_val}")
+        micro_factor = micro_batch_size_val / batch_size_per_dp
+        # T_fwd is one PP stage for the full DP batch. micro_factor scales
+        # that to one micro-batch; × P is the fill until that micro-batch's
+        # prefill exits the last stage (first generated token). Later
+        # micro-batches finishing the pipe are other sequences becoming ready.
+        ttft_forward_sec = batch_time_to_train_sec_forward_pass * micro_factor * pp_stages
 
-    batch_overlapped_time_backward_pass = calculate_overlapped_time(
-        comp_time=batch_compute_time_backward_pass,
-        comm_time=batch_comm_time_backward_pass,
-        mem_time=batch_mem_time_backward_pass,
-        comp_comm_efficiency=comp_comm_efficiency,
-        comp_mem_efficiency=comp_mem_efficiency,
-        comm_mem_efficiency=comm_mem_efficiency,
+    attn_comp_time_bwd = compute_time_attn_bwd
+    ffn_comp_time_bwd = compute_time_moe_bwd
+    attn_comm_time_bwd = tp_attn_bwd.total_comm_time
+    ffn_comm_time_bwd = tp_moe_bwd.total_comm_time + moe_a2a_bwd.total_comm_time
+    attn_mem_time_bwd = bwd_attn_traffic.get_stats(layers_per_stage)[
+        f"{bwd_attn_traffic.name}_time_s"
+    ]
+    ffn_mem_time_bwd = bwd_moe_traffic.get_stats(layers_per_stage)[f"{bwd_moe_traffic.name}_time_s"]
+
+    attn_overlapped_bwd = _overlapped_block(
+        attn_comp_time_bwd, attn_comm_time_bwd, attn_mem_time_bwd
+    )
+    ffn_overlapped_bwd = _overlapped_block(ffn_comp_time_bwd, ffn_comm_time_bwd, ffn_mem_time_bwd)
+
+    residual_comp_bwd = residual_after_accounted(
+        total=batch_compute_time_backward_pass,
+        accounted=attn_comp_time_bwd + ffn_comp_time_bwd + kernel_floor_per_bwd_pass,
+        name="backward_compute",
+    )
+    residual_comm_bwd = residual_after_accounted(
+        total=batch_comm_time_backward_pass,
+        accounted=attn_comm_time_bwd + ffn_comm_time_bwd,
+        name="backward_communication",
+    )
+    residual_mem_bwd = residual_after_accounted(
+        total=batch_mem_time_backward_pass,
+        accounted=attn_mem_time_bwd + ffn_mem_time_bwd,
+        name="backward_memory",
+    )
+    residual_overlapped_bwd = _overlapped_block(
+        residual_comp_bwd, residual_comm_bwd, residual_mem_bwd
     )
 
-    batch_time_to_train_sec_backward_pass = batch_overlapped_time_backward_pass["total_time"]
+    batch_time_to_train_sec_backward_pass = (
+        attn_overlapped_bwd["total_time"]
+        + ffn_overlapped_bwd["total_time"]
+        + residual_overlapped_bwd["total_time"]
+        + kernel_floor_per_bwd_pass
+    )
 
     batch_time_to_train_sec = (
         batch_time_to_train_sec_forward_pass + batch_time_to_train_sec_backward_pass
@@ -2740,6 +2810,8 @@ def get_model_stats(
         plotting.comm_vol_tp_attn_fwd_phase1_label: tp_attn_fwd_phase1.comm_vol,
         plotting.comm_vol_tp_attn_fwd_phase2_label: tp_attn_fwd_phase2.comm_vol,
         plotting.comm_vol_tp_attn_fwd_phase3_label: tp_attn_fwd_phase3.comm_vol,
+        plotting.comm_vol_tp_attn_fwd_proj_label: tp_attn_fwd_proj.comm_vol,
+        plotting.comm_vol_tp_attn_fwd_core_label: tp_attn_fwd_core.comm_vol,
         plotting.comm_vol_tp_moe_fwd_label: tp_moe_fwd.comm_vol,
         plotting.comm_vol_tp_attn_bwd_label: tp_attn_bwd.comm_vol,
         plotting.comm_vol_tp_moe_bwd_label: tp_moe_bwd.comm_vol,
@@ -2753,6 +2825,8 @@ def get_model_stats(
         plotting.comm_time_tp_attn_fwd_phase1_label: tp_attn_fwd_phase1.total_comm_time,
         plotting.comm_time_tp_attn_fwd_phase2_label: tp_attn_fwd_phase2.total_comm_time,
         plotting.comm_time_tp_attn_fwd_phase3_label: tp_attn_fwd_phase3.total_comm_time,
+        plotting.comm_time_tp_attn_fwd_proj_label: tp_attn_fwd_proj.total_comm_time,
+        plotting.comm_time_tp_attn_fwd_core_label: tp_attn_fwd_core.total_comm_time,
         plotting.comm_time_tp_moe_fwd_label: tp_moe_fwd.total_comm_time,
         plotting.comm_time_tp_attn_bwd_label: tp_attn_bwd.total_comm_time,
         plotting.comm_time_tp_moe_bwd_label: tp_moe_bwd.total_comm_time,
@@ -2821,12 +2895,18 @@ def get_model_stats(
         plotting.moe_to_experts_time_label: moe_a2a_fwd_1.total_comm_time,
         plotting.moe_from_experts_time_label: moe_a2a_fwd_2.total_comm_time,
         # --- Component-level timing breakdowns (forward) ---
-        # Attention projection (QKV + output projection)
+        # Official attention block: projection + core overlapped together.
+        "Attn_Fwd_Compute_Time_Sec": attn_comp_time_fwd,
+        "Attn_Fwd_Mem_Time_Sec": attn_mem_time_fwd,
+        "Attn_Fwd_Comm_Time_Sec": attn_comm_time_fwd,
+        "Attn_Fwd_Total_Time_Overlapped_Sec": attn_overlapped_fwd["total_time"],
+        # Attention projection (QKV + output projection). Overlapped
+        # totals here are isolated-block diagnostics, not latency.
         "Attn_Proj_Fwd_Compute_Time_Sec": attn_proj_comp_time_fwd,
         "Attn_Proj_Fwd_Mem_Time_Sec": attn_proj_mem_time_fwd,
         "Attn_Proj_Fwd_Comm_Time_Sec": attn_proj_comm_time_fwd,
         "Attn_Proj_Fwd_Total_Time_Overlapped_Sec": attn_proj_overlapped_fwd["total_time"],
-        # Attention core (KV-cache attention)
+        # Attention core (KV-cache attention). Isolated-block diagnostic.
         "Attn_Core_Fwd_Compute_Time_Sec": attn_core_comp_time_fwd,
         "Attn_Core_Fwd_Mem_Time_Sec": attn_core_mem_time_fwd,
         "Attn_Core_Fwd_Comm_Time_Sec": attn_core_comm_time_fwd,
@@ -2836,6 +2916,26 @@ def get_model_stats(
         "FFN_Fwd_Mem_Time_Sec": ffn_mem_time_fwd,
         "FFN_Fwd_Comm_Time_Sec": ffn_comm_time_fwd,
         "FFN_Fwd_Total_Time_Overlapped_Sec": ffn_overlapped_fwd["total_time"],
+        "Fwd_Residual_Compute_Time_Sec": residual_comp_fwd,
+        "Fwd_Residual_Mem_Time_Sec": residual_mem_fwd,
+        "Fwd_Residual_Comm_Time_Sec": residual_comm_fwd,
+        "Fwd_Residual_Total_Time_Overlapped_Sec": residual_overlapped_fwd["total_time"],
+        "Fwd_Kernel_Launch_Floor_Sec": kernel_floor_per_fwd_pass * num_fwd_passes,
+        "Fwd_Block_Latency_Sec": batch_time_to_train_sec_forward_pass,
+        "Attn_Bwd_Compute_Time_Sec": attn_comp_time_bwd,
+        "Attn_Bwd_Mem_Time_Sec": attn_mem_time_bwd,
+        "Attn_Bwd_Comm_Time_Sec": attn_comm_time_bwd,
+        "Attn_Bwd_Total_Time_Overlapped_Sec": attn_overlapped_bwd["total_time"],
+        "FFN_Bwd_Compute_Time_Sec": ffn_comp_time_bwd,
+        "FFN_Bwd_Mem_Time_Sec": ffn_mem_time_bwd,
+        "FFN_Bwd_Comm_Time_Sec": ffn_comm_time_bwd,
+        "FFN_Bwd_Total_Time_Overlapped_Sec": ffn_overlapped_bwd["total_time"],
+        "Bwd_Residual_Compute_Time_Sec": residual_comp_bwd,
+        "Bwd_Residual_Mem_Time_Sec": residual_mem_bwd,
+        "Bwd_Residual_Comm_Time_Sec": residual_comm_bwd,
+        "Bwd_Residual_Total_Time_Overlapped_Sec": residual_overlapped_bwd["total_time"],
+        "Bwd_Kernel_Launch_Floor_Sec": kernel_floor_per_bwd_pass,
+        "Bwd_Block_Latency_Sec": batch_time_to_train_sec_backward_pass,
     }
 
     # Per-component comm timing triplets.
@@ -2858,6 +2958,8 @@ def get_model_stats(
         plotting.comm_time_tp_attn_fwd_phase1_label: tp_attn_fwd_phase1,
         plotting.comm_time_tp_attn_fwd_phase2_label: tp_attn_fwd_phase2,
         plotting.comm_time_tp_attn_fwd_phase3_label: tp_attn_fwd_phase3,
+        plotting.comm_time_tp_attn_fwd_proj_label: tp_attn_fwd_proj,
+        plotting.comm_time_tp_attn_fwd_core_label: tp_attn_fwd_core,
         plotting.comm_time_tp_moe_fwd_label: tp_moe_fwd,
         plotting.comm_time_tp_attn_bwd_label: tp_attn_bwd,
         plotting.comm_time_tp_moe_bwd_label: tp_moe_bwd,
@@ -3521,6 +3623,15 @@ def structure_run_results(row, human_readable=False):
         },
         "time_breakdown": {
             "forward": {
+                "total_time": fmt_t(get_val("Fwd_Block_Latency_Sec")),
+                "total_time_seconds": get_val("Fwd_Block_Latency_Sec"),
+                "attn": {
+                    "total_time": fmt_t(get_val("Attn_Fwd_Total_Time_Overlapped_Sec")),
+                    "total_time_seconds": get_val("Attn_Fwd_Total_Time_Overlapped_Sec"),
+                    "compute_s": get_val("Attn_Fwd_Compute_Time_Sec"),
+                    "memory_s": get_val("Attn_Fwd_Mem_Time_Sec"),
+                    "communication_s": get_val("Attn_Fwd_Comm_Time_Sec"),
+                },
                 "attn_projection": {
                     "total_time": fmt_t(get_val("Attn_Proj_Fwd_Total_Time_Overlapped_Sec")),
                     "total_time_seconds": get_val("Attn_Proj_Fwd_Total_Time_Overlapped_Sec"),
@@ -3542,7 +3653,47 @@ def structure_run_results(row, human_readable=False):
                     "memory_s": get_val("FFN_Fwd_Mem_Time_Sec"),
                     "communication_s": get_val("FFN_Fwd_Comm_Time_Sec"),
                 },
-            }
+                "residual": {
+                    "total_time": fmt_t(get_val("Fwd_Residual_Total_Time_Overlapped_Sec")),
+                    "total_time_seconds": get_val("Fwd_Residual_Total_Time_Overlapped_Sec"),
+                    "compute_s": get_val("Fwd_Residual_Compute_Time_Sec"),
+                    "memory_s": get_val("Fwd_Residual_Mem_Time_Sec"),
+                    "communication_s": get_val("Fwd_Residual_Comm_Time_Sec"),
+                },
+                "kernel_launch_floor": {
+                    "total_time": fmt_t(get_val("Fwd_Kernel_Launch_Floor_Sec")),
+                    "total_time_seconds": get_val("Fwd_Kernel_Launch_Floor_Sec"),
+                },
+            },
+            "backward": {
+                "total_time": fmt_t(get_val("Bwd_Block_Latency_Sec")),
+                "total_time_seconds": get_val("Bwd_Block_Latency_Sec"),
+                "attn": {
+                    "total_time": fmt_t(get_val("Attn_Bwd_Total_Time_Overlapped_Sec")),
+                    "total_time_seconds": get_val("Attn_Bwd_Total_Time_Overlapped_Sec"),
+                    "compute_s": get_val("Attn_Bwd_Compute_Time_Sec"),
+                    "memory_s": get_val("Attn_Bwd_Mem_Time_Sec"),
+                    "communication_s": get_val("Attn_Bwd_Comm_Time_Sec"),
+                },
+                "ffn": {
+                    "total_time": fmt_t(get_val("FFN_Bwd_Total_Time_Overlapped_Sec")),
+                    "total_time_seconds": get_val("FFN_Bwd_Total_Time_Overlapped_Sec"),
+                    "compute_s": get_val("FFN_Bwd_Compute_Time_Sec"),
+                    "memory_s": get_val("FFN_Bwd_Mem_Time_Sec"),
+                    "communication_s": get_val("FFN_Bwd_Comm_Time_Sec"),
+                },
+                "residual": {
+                    "total_time": fmt_t(get_val("Bwd_Residual_Total_Time_Overlapped_Sec")),
+                    "total_time_seconds": get_val("Bwd_Residual_Total_Time_Overlapped_Sec"),
+                    "compute_s": get_val("Bwd_Residual_Compute_Time_Sec"),
+                    "memory_s": get_val("Bwd_Residual_Mem_Time_Sec"),
+                    "communication_s": get_val("Bwd_Residual_Comm_Time_Sec"),
+                },
+                "kernel_launch_floor": {
+                    "total_time": fmt_t(get_val("Bwd_Kernel_Launch_Floor_Sec")),
+                    "total_time_seconds": get_val("Bwd_Kernel_Launch_Floor_Sec"),
+                },
+            },
         },
         "compute_per_batch_per_xpu": {
             "total_time": fmt_t(get_val(plotting.compute_time_label)),
@@ -4236,83 +4387,17 @@ def structure_run_results(row, human_readable=False):
                         ),
                     },
                     "projection_total": {
-                        "timing_per_pp_stage": {
-                            "total_time": fmt_t(
-                                (get_val(plotting.comm_time_tp_attn_fwd_phase1_label) or 0.0)
-                                + (get_val(plotting.comm_time_tp_attn_fwd_phase3_label) or 0.0)
-                            ),
-                            "total_time_seconds": (
-                                (get_val(plotting.comm_time_tp_attn_fwd_phase1_label) or 0.0)
-                                + (get_val(plotting.comm_time_tp_attn_fwd_phase3_label) or 0.0)
-                            ),
-                            "startup_latency": fmt_t(
-                                (
-                                    get_val(
-                                        f"{plotting.comm_time_tp_attn_fwd_phase1_label}_Startup_Latency"
-                                    )
-                                    or 0.0
-                                )
-                                + (
-                                    get_val(
-                                        f"{plotting.comm_time_tp_attn_fwd_phase3_label}_Startup_Latency"
-                                    )
-                                    or 0.0
-                                )
-                            ),
-                            "startup_latency_seconds": (
-                                (
-                                    get_val(
-                                        f"{plotting.comm_time_tp_attn_fwd_phase1_label}_Startup_Latency"
-                                    )
-                                    or 0.0
-                                )
-                                + (
-                                    get_val(
-                                        f"{plotting.comm_time_tp_attn_fwd_phase3_label}_Startup_Latency"
-                                    )
-                                    or 0.0
-                                )
-                            ),
-                            "data_transfer_time": fmt_t(
-                                (
-                                    get_val(
-                                        f"{plotting.comm_time_tp_attn_fwd_phase1_label}_Data_Transfer"
-                                    )
-                                    or 0.0
-                                )
-                                + (
-                                    get_val(
-                                        f"{plotting.comm_time_tp_attn_fwd_phase3_label}_Data_Transfer"
-                                    )
-                                    or 0.0
-                                )
-                            ),
-                            "data_transfer_time_seconds": (
-                                (
-                                    get_val(
-                                        f"{plotting.comm_time_tp_attn_fwd_phase1_label}_Data_Transfer"
-                                    )
-                                    or 0.0
-                                )
-                                + (
-                                    get_val(
-                                        f"{plotting.comm_time_tp_attn_fwd_phase3_label}_Data_Transfer"
-                                    )
-                                    or 0.0
-                                )
-                            ),
-                        },
-                        "time_per_pp_stage_seconds": (
-                            (get_val(plotting.comm_time_tp_attn_fwd_phase1_label) or 0.0)
-                            + (get_val(plotting.comm_time_tp_attn_fwd_phase3_label) or 0.0)
+                        "timing_per_pp_stage": comm_triplet(
+                            plotting.comm_time_tp_attn_fwd_proj_label
+                        ),
+                        "time_per_pp_stage_seconds": get_val(
+                            plotting.comm_time_tp_attn_fwd_proj_label
                         ),
                         "time_per_pp_stage": fmt_t(
-                            (get_val(plotting.comm_time_tp_attn_fwd_phase1_label) or 0.0)
-                            + (get_val(plotting.comm_time_tp_attn_fwd_phase3_label) or 0.0)
+                            get_val(plotting.comm_time_tp_attn_fwd_proj_label)
                         ),
                         "volume_bytes_per_pp_stage": fmt_b(
-                            (get_val(plotting.comm_vol_tp_attn_fwd_phase1_label) or 0)
-                            + (get_val(plotting.comm_vol_tp_attn_fwd_phase3_label) or 0)
+                            get_val(plotting.comm_vol_tp_attn_fwd_proj_label)
                         ),
                     },
                 },

@@ -279,10 +279,13 @@ def get_transformer_comm_stats(
         case _:
             raise ValueError(f"Unrecognized pass_mode: {pass_mode}")
 
-    # Per-phase breakdown for attention TP comm
+    # Per-phase breakdown for attention TP comm. Named proj/core piles are
+    # the overlap-path inputs; numbered phases stay diagnostic.
     tp_attn_fwd_phase1 = num_layers_per_pp_stage * phases.phase1_input_proj
     tp_attn_fwd_phase2 = num_layers_per_pp_stage * phases.phase2_attn_core
     tp_attn_fwd_phase3 = num_layers_per_pp_stage * phases.phase3_output_proj
+    tp_attn_fwd_proj = num_layers_per_pp_stage * phases.projection_total
+    tp_attn_fwd_core = num_layers_per_pp_stage * phases.attn_core_total
 
     # MoE communication cost for the forward pass
     resolved_batches = workload_spec.get_resolved_batches()
@@ -556,6 +559,8 @@ def get_transformer_comm_stats(
         "tp_attn_fwd_phase1": tp_attn_fwd_phase1,
         "tp_attn_fwd_phase2": tp_attn_fwd_phase2,
         "tp_attn_fwd_phase3": tp_attn_fwd_phase3,
+        "tp_attn_fwd_proj": tp_attn_fwd_proj,
+        "tp_attn_fwd_core": tp_attn_fwd_core,
         "tp_moe_fwd": tp_moe_fwd_comm,
         "tp_attn_bwd": tp_attn_bwd_comm,
         "tp_moe_bwd": tp_moe_bwd_comm,

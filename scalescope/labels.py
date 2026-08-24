@@ -85,6 +85,12 @@ comm_time_tp_attn_fwd_phase3_label = "Comm_Time_TP_Attn_Fwd_Phase3"
 comm_vol_tp_attn_fwd_phase1_label = "Comm_Volume_TP_Attn_Fwd_Phase1"
 comm_vol_tp_attn_fwd_phase2_label = "Comm_Volume_TP_Attn_Fwd_Phase2"
 comm_vol_tp_attn_fwd_phase3_label = "Comm_Volume_TP_Attn_Fwd_Phase3"
+# Named proj/core piles (phase1+phase3 and phase2). Overlap and YAML report
+# consume these; numbered phases stay diagnostic.
+comm_time_tp_attn_fwd_proj_label = "Comm_Time_TP_Attn_Fwd_Proj"
+comm_time_tp_attn_fwd_core_label = "Comm_Time_TP_Attn_Fwd_Core"
+comm_vol_tp_attn_fwd_proj_label = "Comm_Volume_TP_Attn_Fwd_Proj"
+comm_vol_tp_attn_fwd_core_label = "Comm_Volume_TP_Attn_Fwd_Core"
 
 # Pipeline-parallel (PP) boundary transfers (activation / activation-grad) across stages.
 comm_vol_pp_fwd_label = "Comm_Volume_PP_Fwd"
