@@ -16,12 +16,12 @@
 #   - decode_moe_router_sync_mode = replicated_router: cheap-routing
 #     assumption, valid for top-2 / top-8 routing where the router
 #     GEMM is not the bottleneck.
-#   - tp_*_spec.variant = SHARD_WEIGHTS_1D: matches the parallelism
-#     hypothesis in the logical topologies (TP=1, 2, or 8 along a
-#     single axis). 2D TP would require split_2d annotations.
-#   - Overlap efficiencies = 0.0: pure additive composition for clean
-#     comparison. Real systems achieve 0.5-0.8 overlap; the driver
-#     reports this as a known model-vs-system gap.
+#   - tp_*_spec.variant = SHARD_WEIGHTS_2D: decode combine is 2D-only.
+#   - overlap_model = token_saturating:
+#     e(N) = e_max * max(0, 1 - N_wave / N). Panel e_max is 0.1 on CK/CM/KM
+#     (near-serial; not the paper token-sat ceiling). wave_tokens is one
+#     pipeline tile. Attention N is tokens_per_attention_domain; MoE N is
+#     hot-rank routed tokens.
 
 global_batch_size: 1            # OVERRIDDEN per record by the driver.
 micro_batch_size: 1
@@ -51,19 +51,38 @@ memory_device_map_footprint:
   transient_forward_peak: xpu_memory
   transient_backward_peak: xpu_memory
 
-comp_comm_efficiency: 0.0
-comp_mem_efficiency: 0.0
-comm_mem_efficiency: 0.0
+overlap_model:
+  kind: token_saturating
+  compute_communication:
+    max_efficiency: 0.1
+    wave_tokens: 64
+  compute_memory:
+    max_efficiency: 0.1
+    wave_tokens: 64
+  communication_memory:
+    max_efficiency: 0.1
+    wave_tokens: 64
 tp_moe_a2a_replication_optimization: false
+projection_groups: 1
+decode_tp2d_kv_comm_mode: reduce_to_owner
 
 tp_attn_spec:
-  variant: SHARD_WEIGHTS_1D
+  variant: SHARD_WEIGHTS_2D
+  split_2d:
+    x_tags: ["TP_Attn_X"]
+    yz_tags: ["TP_Attn_Y"]
 
 tp_proj_spec:
-  variant: SHARD_WEIGHTS_1D
+  variant: SHARD_WEIGHTS_2D
+  split_2d:
+    x_tags: ["TP_Proj_X"]
+    yz_tags: ["TP_Proj_Y"]
 
 tp_moe_spec:
-  variant: SHARD_WEIGHTS_1D
+  variant: SHARD_WEIGHTS_2D
+  split_2d:
+    x_tags: ["TP_MoE_X"]
+    yz_tags: ["TP_MoE_Y"]
 
 dp_spec:
   variant: DDP

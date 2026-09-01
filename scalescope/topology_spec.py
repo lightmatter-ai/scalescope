@@ -217,22 +217,37 @@ class LogicalTopology(BaseModel):
         else:
             raise ValueError(f"Unknown sharing context: {context}")
 
+    def get_hockney_link_params(
+        self,
+        tag_in_view: Union[LogicalDimensionTag, str],
+        context: str = "concurrent_baseline",
+    ) -> Tuple[int, float, float]:
+        """Return (dim size, alpha, effective bandwidth) with no compute lookup.
+
+        Send/recv and other byte-only Hockney legs need the link, not FLOPS.
+        Int32 size-vector A2A must not require an fp32 peak the node may omit.
+        """
+        mapping = self.get_mapping_for_tag(tag_in_view)
+        interconnect = self.get_interconnect_for_tag(tag_in_view)
+        bandwidth_Bps = self.get_effective_bandwidth(tag_in_view, context=context)
+        return mapping.size, interconnect.latency_sec, bandwidth_Bps
+
     def get_hockney_model_params(
         self,
         tag_in_view: Union[LogicalDimensionTag, str],
         float_size_bytes: float,
         context: str = "concurrent_baseline",
     ) -> Tuple[int, float, float, float]:
-        mapping = self.get_mapping_for_tag(tag_in_view)
-        interconnect = self.get_interconnect_for_tag(tag_in_view)
+        mapping_size, latency_sec, bandwidth_Bps = self.get_hockney_link_params(
+            tag_in_view, context=context
+        )
         node_def = self.physical_topology.node_definition
 
         gamma = (
             node_def.get_time_per_flop(float_size_bytes) / float_size_bytes if node_def else None
         )
-        bandwidth_Bps = self.get_effective_bandwidth(tag_in_view, context=context)
 
-        return mapping.size, interconnect.latency_sec, bandwidth_Bps, gamma or float("inf")
+        return mapping_size, latency_sec, bandwidth_Bps, gamma or float("inf")
 
     @computed_field
     @property

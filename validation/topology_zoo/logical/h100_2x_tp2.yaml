@@ -3,8 +3,8 @@
 # large for one chip's HBM at FP8 with KV headroom).
 #
 # TP_Attn_X = 2 means weights are sharded across 2 ranks along the X
-# axis (head dim). TP_Proj_X = 2 mirrors this for QKV/O projections.
-# We use the 1D TP variant (SHARD_WEIGHTS_1D) — single-axis split.
+# axis (head dim). TP_Attn_Y = 1. TP_Proj_X = 2 mirrors this for QKV/O
+# projections. We use the 2D TP variant (SHARD_WEIGHTS_2D).
 
 name: "H100_2x_TP2"
 

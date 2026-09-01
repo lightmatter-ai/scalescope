@@ -22,9 +22,11 @@ memory_device_map_footprint:
   transient_forward_peak: xpu_memory
   transient_backward_peak: xpu_memory
 
-comp_comm_efficiency: 0.7
-comp_mem_efficiency: 0.7
-comm_mem_efficiency: 0.7
+overlap_model:
+  kind: fixed
+  comp_comm_efficiency: 0.7
+  comp_mem_efficiency: 0.7
+  comm_mem_efficiency: 0.7
 kernel_launch_latency_per_layer_sec: 0.0  # per-layer host kernel-launch floor (0.0 = not modeled)
 moe_token_pair_overhead_sec: 0.0  # per routed token-expert pair per MoE layer per pass
 tp_moe_a2a_replication_optimization: true  # on: send to expert shard then all-gather across expert TP shards; off: regular routed MoE A2A

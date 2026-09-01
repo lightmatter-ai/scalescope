@@ -79,7 +79,7 @@ def pipeline_parallel_comm_forward_backward(
 
     # Simple P2P send/recv model on the PP interconnect slice (implemented in low-level net model).
     per_boundary = hockney_model_send_recv_on_nd_topology(
-        topology=pp_topology, bytes_per_sender=bytes_per_chip, float_size_bytes=float_size_bytes
+        topology=pp_topology, bytes_per_sender=bytes_per_chip
     )
 
     num_boundaries = pp_size - 1

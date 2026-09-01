@@ -28,6 +28,11 @@ from scalescope.workload_spec import (
     ResolvedBatchSizes,
 )
 
+# Bytes per entry in the A2Av size vector: one int32 send or recv count
+# per remote peer, exchanged before the variable-size payload so each
+# destination can post its recv.
+A2AV_SIZE_VECTOR_DTYPE_BYTES = 4
+
 
 @dataclass
 class ExpertXPUPlacement:
@@ -969,7 +974,8 @@ def calculate_moe_comm_second_total_exchange(
     workload_spec=None,
     layout_trace=NULL_LAYOUT_TRACE,
 ):
-    # assume for now that we get the same stats when we are returning tokens after they are processed by teh experts
+    # Return payload matches dispatch (same routed tokens, transpose).
+    # Size-vector A2A is dispatch-only; combine reuses those counts.
     return calculate_moe_comm_first_total_exchange(
         ep_topology_view,
         transformer_config,
@@ -980,6 +986,66 @@ def calculate_moe_comm_second_total_exchange(
         tp_moe_y_shards=tp_moe_y_shards,
         layout_trace=layout_trace,
         a2a_leg="combine",
+    )
+
+
+def _price_dispatch_size_vector_or_zero(
+    *,
+    a2a_leg: str,
+    topology: LogicalTopology,
+    participant_count: int,
+    layout_trace,
+    stage: str,
+    fabric: str,
+    note: str,
+) -> CommStats:
+    """Charge the A2Av size vector on dispatch only.
+
+    Combine is the transpose of dispatch: both sides already know the
+    per-peer lengths from the outbound send / inbound recv counts, so
+    the return leg does not post a second size collective.
+    """
+    if a2a_leg != "dispatch":
+        return CommStats()
+    size_stats = price_a2av_size_vector_exchange(
+        topology=topology,
+        participant_count=participant_count,
+    )
+    layout_trace.record_comm(
+        stage,
+        "A2A",
+        fabric,
+        participant_count,
+        (participant_count - 1) * A2AV_SIZE_VECTOR_DTYPE_BYTES,
+        size_stats,
+        note=note,
+    )
+    return size_stats
+
+
+def price_a2av_size_vector_exchange(
+    *,
+    topology: LogicalTopology,
+    participant_count: int,
+) -> CommStats:
+    """Price the A2Av size-vector collective (per-peer send/recv counts).
+
+    Variable-size dispatch cannot post the payload recv until every destination
+    knows its inbound length. That is one integer of
+    ``A2AV_SIZE_VECTOR_DTYPE_BYTES`` to each of the other
+    ``participant_count - 1`` ranks on ``topology``. Payload activations are
+    priced separately. ``participant_count`` must be > 1; D=1 decode never
+    calls this. Combine must not call this: return recvs reuse dispatch counts.
+    """
+    if participant_count <= 1:
+        raise ValueError(
+            "A2Av size-vector exchange requires participant_count > 1, " f"got {participant_count}"
+        )
+    remote_peers = participant_count - 1
+    bytes_per_sender = remote_peers * A2AV_SIZE_VECTOR_DTYPE_BYTES
+    return hockney_model_send_recv_on_nd_topology(
+        topology=topology,
+        bytes_per_sender=bytes_per_sender,
     )
 
 
@@ -1005,8 +1071,12 @@ def calculate_moe_decode_cross_domain_exchange(
     The exact per-feeder handoff prepositions each ``D / TP_MoE_Y`` token shard
     at every aligned local expert group. Therefore, the ``1/D`` local-owner
     fraction needs no EP_SU dispatch or return. Only the remote ``(D-1)/D``
-    fraction is charged to EP_SO. After the return, the exact reduce-scatter
-    and replica all-reduce restore the residual layout.
+    fraction is charged to EP_SO. Dispatch EP_SO is two Hockney phases: an
+    int32 size-vector all-to-all among the ``D`` feeders, then the payload
+    A2Av. Destinations cannot post the payload recv without the counts.
+    Combine payload is the transpose of dispatch, so return recvs reuse those
+    counts; no second size collective. After the return, the exact
+    reduce-scatter and replica all-reduce restore the residual layout.
 
     This path assumes direct per-XPU EP_SO endpoints with no local
     ingress/egress staging. Topologies with centralized scale-out endpoints
@@ -1158,12 +1228,10 @@ def calculate_moe_decode_cross_domain_exchange(
     so_bytes_per_xpu = bottleneck_remote_pairs * bytes_per_token
 
     su_stats = CommStats()
-    so_stats = hockney_model_send_recv_on_nd_topology(
+    payload_stats = hockney_model_send_recv_on_nd_topology(
         topology=so_view,
         bytes_per_sender=so_bytes_per_xpu,
-        float_size_bytes=float_size,
     )
-
     stage_prefix = "decode_dispatch" if a2a_leg == "dispatch" else "decode_combine"
     layout_trace.record_comm(
         f"{stage_prefix}_su",
@@ -1178,13 +1246,28 @@ def calculate_moe_decode_cross_domain_exchange(
             "every aligned local expert group; EP_SU network bytes=0"
         ),
     )
+    size_stats = _price_dispatch_size_vector_or_zero(
+        a2a_leg=a2a_leg,
+        topology=so_view,
+        participant_count=feeders_per_full_expert_set,
+        layout_trace=layout_trace,
+        stage=f"{stage_prefix}_so_size",
+        fabric=f"EP_SO({so_view.num_chips})",
+        note=(
+            f"{a2a_leg}: A2Av size vector; "
+            f"{feeders_per_full_expert_set - 1} remote peers × "
+            f"{A2AV_SIZE_VECTOR_DTYPE_BYTES} B int32 counts; "
+            "required before the payload recv can be posted"
+        ),
+    )
+    so_stats = size_stats + payload_stats
     layout_trace.record_comm(
         f"{stage_prefix}_so",
         "A2Av",
         f"EP_SO({so_view.num_chips})",
         so_view.num_chips,
         so_bytes_per_xpu,
-        so_stats,
+        payload_stats,
         note=(
             f"{a2a_leg}: busiest endpoint; remote_fraction="
             f"{feeders_per_full_expert_set - 1}/{feeders_per_full_expert_set} "
@@ -1631,7 +1714,10 @@ def calculate_moe_comm_hierarchical_total_exchange(
     ``a2a_leg`` labels the layout-trace stage emitted by this call:
     ``"dispatch"`` (token routing to experts) or ``"combine"`` (return leg).
     Per-set token volume comes from the canonical ``token_scopes`` rather than
-    being reconstructed from topology dimensions.
+    being reconstructed from topology dimensions. On dispatch, each fabric that
+    carries a routing-dependent payload also pays an int32 size-vector A2A
+    among that fabric's participants before the payload exchange. Combine is
+    the transpose of dispatch, so return recvs reuse those counts.
     """
     if transformer_config.num_regular_experts == 0:
         return CommStats()
@@ -1745,30 +1831,46 @@ def calculate_moe_comm_hierarchical_total_exchange(
         raise ValueError(f"tp_moe_y_shards must be > 0, got {tp_moe_y_shards}")
     bytes_per_token = (d_model * float_size) / tp_moe_y_shards
 
-    # Stage name in the layout trace.  Mirrors the TensorRecord stages
-    # emitted by `decode_layout_trace._trace_moe_stages`:
-    #   - decode_dispatch  (a2a_leg="dispatch")
-    #   - decode_combine_a2a (a2a_leg="combine")
     # Prefill and single-attention-domain decode also pass through here; the
     # records are still emitted (NULL_LAYOUT_TRACE is a no-op for callers that
     # don't pass a real trace).
-    trace_stage = "decode_dispatch" if a2a_leg == "dispatch" else "decode_combine_a2a"
+    trace_stage = "decode_dispatch_a2a" if a2a_leg == "dispatch" else "decode_combine_a2a"
 
     if moe_a2a_comm_mode == MoEA2ACommMode.FUSED_ND:
-        # Experimental path: model MoE exchange as a single fused N-D total-exchange on EP topology.
+        # fused_nd: one total-exchange on the full EP topology, not two
+        # staged SU/SO collectives. "Fused" means flatten the hierarchical
+        # split; it is not kernel fusion. The N-D Hockney walk prices hops
+        # on every mesh dimension. Experimental; current sweeps use
+        # hierarchical_split.
         payload_bytes_per_xpu = tokens_per_xpu * bytes_per_token
-        per_layer = hockney_model_total_exchange_on_nd_topology(
+        payload_stats = hockney_model_total_exchange_on_nd_topology(
             ep_topology_view,
             P_total_send_bytes_per_node=payload_bytes_per_xpu,
             float_size_bytes=float_size,
         )
+        per_layer = payload_stats
+        if payload_bytes_per_xpu > 0 and ep_total_xpus > 1:
+            size_stats = _price_dispatch_size_vector_or_zero(
+                a2a_leg=a2a_leg,
+                topology=ep_topology_view,
+                participant_count=ep_total_xpus,
+                layout_trace=layout_trace,
+                stage=f"{trace_stage}_fused_size",
+                fabric="EP_FUSED",
+                note=(
+                    f"{a2a_leg}: A2Av size vector; "
+                    f"{ep_total_xpus - 1} remote peers × "
+                    f"{A2AV_SIZE_VECTOR_DTYPE_BYTES} B int32 counts"
+                ),
+            )
+            per_layer = size_stats + payload_stats
         layout_trace.record_comm(
             f"{trace_stage}_fused",
             "A2A",
             "EP_FUSED",
             ep_total_xpus,
             payload_bytes_per_xpu,
-            per_layer,
+            payload_stats,
             note=(
                 f"{a2a_leg} A2A fused over EP topology; "
                 f"tokens_per_xpu={tokens_per_xpu:.3g}, bytes/token={bytes_per_token:.3g}, "
@@ -1803,18 +1905,32 @@ def calculate_moe_comm_hierarchical_total_exchange(
                 virtual_size=ep_su_domain_size_xpus,
                 global_sharing_context="max_exclusive",
             )
-            su_fabric_stats_per_layer = hockney_model_total_exchange_on_nd_topology(
+            su_payload_stats = hockney_model_total_exchange_on_nd_topology(
                 su_fabric_view,
                 P_total_send_bytes_per_node=su_fabric_bytes_per_xpu,
                 float_size_bytes=float_size,
             )
+            su_size_stats = _price_dispatch_size_vector_or_zero(
+                a2a_leg=a2a_leg,
+                topology=su_fabric_view,
+                participant_count=ep_su_domain_size_xpus,
+                layout_trace=layout_trace,
+                stage=f"{trace_stage}_intra_size",
+                fabric=f"{su_fabric_fastest_tag}({ep_su_domain_size_xpus})",
+                note=(
+                    f"{a2a_leg}: A2Av size vector on EP_SU; "
+                    f"{ep_su_domain_size_xpus - 1} remote peers × "
+                    f"{A2AV_SIZE_VECTOR_DTYPE_BYTES} B int32 counts"
+                ),
+            )
+            su_fabric_stats_per_layer = su_size_stats + su_payload_stats
             layout_trace.record_comm(
                 f"{trace_stage}_intra",
                 "A2A",
                 f"{su_fabric_fastest_tag}({ep_su_domain_size_xpus})",
                 ep_su_domain_size_xpus,
                 su_fabric_bytes_per_xpu,
-                su_fabric_stats_per_layer,
+                su_payload_stats,
                 note=(
                     f"{a2a_leg} A2A on EP_SU (scale-up, intra-rack); "
                     f"su_fabric_fraction={su_fabric_fraction:.3f}, "
@@ -1832,18 +1948,32 @@ def calculate_moe_comm_hierarchical_total_exchange(
                 virtual_size=so_fabric_participant_xpus,
                 global_sharing_context="max_exclusive",
             )
-            so_fabric_stats_per_layer = hockney_model_total_exchange_on_nd_topology(
+            so_payload_stats = hockney_model_total_exchange_on_nd_topology(
                 so_fabric_view,
                 P_total_send_bytes_per_node=so_fabric_bytes_per_xpu,
                 float_size_bytes=float_size,
             )
+            so_size_stats = _price_dispatch_size_vector_or_zero(
+                a2a_leg=a2a_leg,
+                topology=so_fabric_view,
+                participant_count=so_fabric_participant_xpus,
+                layout_trace=layout_trace,
+                stage=f"{trace_stage}_inter_size",
+                fabric=f"{so_fabric_tag}({so_fabric_participant_xpus})",
+                note=(
+                    f"{a2a_leg}: A2Av size vector on second-fastest EP tag; "
+                    f"{so_fabric_participant_xpus - 1} remote peers × "
+                    f"{A2AV_SIZE_VECTOR_DTYPE_BYTES} B int32 counts"
+                ),
+            )
+            so_fabric_stats_per_layer = so_size_stats + so_payload_stats
             layout_trace.record_comm(
                 f"{trace_stage}_inter",
                 "A2A",
                 f"{so_fabric_tag}({so_fabric_participant_xpus})",
                 so_fabric_participant_xpus,
                 so_fabric_bytes_per_xpu,
-                so_fabric_stats_per_layer,
+                so_payload_stats,
                 note=(
                     f"{a2a_leg} A2A on second-fastest EP tag (scale-out, "
                     f"typically EP_SO; cross-rack); "

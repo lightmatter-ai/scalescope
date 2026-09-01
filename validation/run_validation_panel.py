@@ -98,6 +98,25 @@ WORKLOAD_TEMPLATES = {
     "fp8": VALIDATION_DIR / "inference_decode_specs" / "fp8_decode_template.yaml",
     "fp4": VALIDATION_DIR / "inference_decode_specs" / "fp4_decode_template.yaml",
 }
+
+
+def _require_2d_workload_templates() -> None:
+    """Decode combine is 2D-only."""
+    required_keys = ("tp_attn_spec", "tp_proj_spec", "tp_moe_spec")
+    for name, path in WORKLOAD_TEMPLATES.items():
+        spec = yaml.safe_load(path.read_text())
+        for key in required_keys:
+            block = spec[key]
+            variant = block["variant"]
+            if variant != "SHARD_WEIGHTS_2D":
+                raise ValueError(
+                    f"{path}: {key}.variant must be SHARD_WEIGHTS_2D; "
+                    f"got {variant!r} in the {name} template."
+                )
+            if block.get("split_2d") is None:
+                raise ValueError(f"{path}: {key}.split_2d is required for SHARD_WEIGHTS_2D.")
+
+
 MODEL_ZOO = VALIDATION_DIR / "model_zoo"
 TOPO_PHYS = VALIDATION_DIR / "topology_zoo" / "physical"
 TOPO_LOG = VALIDATION_DIR / "topology_zoo" / "logical"
@@ -117,20 +136,17 @@ KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER: dict[str, float] = {
     "gpt_oss_120b": 32e-6,
 }
 
-# Per-model MoE software overhead (seconds per routed token-expert pair per
-# layer per pass), injected into each generated workload spec. It models
-# host/framework routing bookkeeping and permutation kernel-dispatch work,
-# independently of whether network A2A runs. Dense shapes are structurally
-# zero. The gpt_oss_120b value is a decode-serving non-negative least-squares
-# fit of the EP-case TPOT residuals across all dp-attn+EP panel cells (see
-# validation/fit_ep_dispatch_overhead.py). Fail-fast lookup, like the kernel
-# floor above.
+# Per-model MoE software overhead (seconds per *remote* routed token-expert
+# pair per layer per pass). Volume is N_rows × (D−1)/D on decode. Dense
+# shapes are structurally zero. gpt_oss_120b is an EP2 single-DP ISL=1024
+# NNLS of the zero-pair residuals (186 ns; all-EP NNLS was 163 ns, 1.14×,
+# accepted). See validation/fit_ep_dispatch_overhead.py.
 MOE_TOKEN_PAIR_OVERHEAD_SEC: dict[str, float] = {
     "llama3_70b": 0.0,
     "llama3_1_405b": 0.0,
     "llama3_1_8b": 0.0,
     "minimax_m2_5": 0.0,
-    "gpt_oss_120b": 85e-9,
+    "gpt_oss_120b": 186e-9,
 }
 
 # FP4 model_ids explicitly promoted into the canonical panel despite the
@@ -1259,6 +1275,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    _require_2d_workload_templates()
 
     # Auto-suffix partial runs so smoke tests don't clobber the canonical
     # summary. The full panel is "--source=all with no filters"; anything

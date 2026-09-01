@@ -43,6 +43,7 @@ from scalescope.decode_layout_trace import (
 from scalescope.ep_strategy import (
     compute_expert_activation_cardinality,
     infer_expert_placement_per_xpu,
+    resolve_moe_token_scopes,
     validate_expert_imbalance_realizability,
 )
 from scalescope.hardware_spec import HardwareRegistry
@@ -87,7 +88,10 @@ from scalescope.model_spec import (
     TransformerConfig,
 )
 from scalescope.pp_strategy import get_pp_strategy
-from scalescope.runtime_overhead_model import moe_token_pair_overhead_per_pass
+from scalescope.runtime_overhead_model import (
+    hot_rank_routed_tokens_for_overlap,
+    moe_token_pair_overhead_per_pass,
+)
 from scalescope.stats import CommStats
 from scalescope.sweep_dsl import (
     apply_case_to_specs,
@@ -114,9 +118,11 @@ from scalescope.utils import (
 )
 from scalescope.workload_spec import (
     DecodeCrossDomainEPMode,
+    efficiencies_for_overlap_model,
     InferenceDecodeSpec,
     InferencePrefillSpec,
     MoERouterSyncMode,
+    ResolvedOverlapEfficiencies,
     TensorParallelVariant,
     TP2DProjAxisRole,
     TrainSpec,
@@ -1261,6 +1267,8 @@ def get_model_stats(
     kernel_floor_per_fwd_pass = (
         workload_spec.get_layers_per_pp_stage() * workload_spec.kernel_launch_latency_per_layer_sec
     )
+    moe_pair_overhead_fwd = 0.0
+    moe_pair_overhead_bwd = 0.0
 
     match pass_mode:
         case PassMode.TRAINING:
@@ -1273,6 +1281,7 @@ def get_model_stats(
                 moe_config=moe_config,
                 workload_spec=workload_spec,
                 n_seq=seq_length,
+                pass_mode=pass_mode,
             )
             (
                 batch_compute_time_forward_pass,
@@ -1292,7 +1301,7 @@ def get_model_stats(
             batch_compute_time_forward_pass += (
                 kernel_floor_per_fwd_pass + moe_runtime_overhead_per_pass
             )
-            compute_time_moe_fwd += moe_runtime_overhead_per_pass
+            moe_pair_overhead_fwd = moe_runtime_overhead_per_pass
 
             # Attention compute breakdown: projection vs core attention (per-batch, per-chip)
             attn_proj_compute_time_fwd_per_layer, _, attn_core_compute_time_fwd_per_layer, _ = (
@@ -1342,7 +1351,7 @@ def get_model_stats(
             batch_compute_time_backward_pass += (
                 kernel_floor_per_fwd_pass + moe_runtime_overhead_per_pass
             )
-            compute_time_moe_bwd += moe_runtime_overhead_per_pass
+            moe_pair_overhead_bwd = moe_runtime_overhead_per_pass
             compute_time_param_update, flops_param_update = parameter_update_flops(
                 attn_tp_topology_view, model_spec, moe_config, workload_spec
             )
@@ -1358,6 +1367,7 @@ def get_model_stats(
                 moe_config=moe_config,
                 workload_spec=workload_spec,
                 n_seq=seq_length,
+                pass_mode=pass_mode,
             )
             (
                 batch_compute_time_forward_pass,
@@ -1377,7 +1387,7 @@ def get_model_stats(
             batch_compute_time_forward_pass += (
                 kernel_floor_per_fwd_pass + moe_runtime_overhead_per_pass
             )
-            compute_time_moe_fwd += moe_runtime_overhead_per_pass
+            moe_pair_overhead_fwd = moe_runtime_overhead_per_pass
 
             # Attention compute breakdown: projection vs core attention (per-batch, per-chip)
             attn_proj_compute_time_fwd_per_layer, _, attn_core_compute_time_fwd_per_layer, _ = (
@@ -1420,6 +1430,7 @@ def get_model_stats(
                 moe_config=moe_config,
                 workload_spec=workload_spec,
                 n_seq=1,
+                pass_mode=pass_mode,
             )
 
             batch_compute_time_forward_pass = 0.0
@@ -1473,7 +1484,8 @@ def get_model_stats(
                 attn_flops_forward_pass += step_attn_flops
                 moe_flops_forward_pass += step_moe_flops
                 compute_time_attn_fwd += step_attn_time
-                compute_time_moe_fwd += step_moe_time + moe_runtime_overhead_per_step
+                compute_time_moe_fwd += step_moe_time
+                moe_pair_overhead_fwd += moe_runtime_overhead_per_step
 
                 # Embedding/Unembedding compute per decode step with explicit seq_len=1
                 embedding_time, embedding_flops_chip = calculate_embedding_compute(
@@ -2478,10 +2490,51 @@ def get_model_stats(
             }
         )
 
-    # Overlap/efficiency settings sourced from workload spec
-    comp_comm_efficiency = workload_spec.comp_comm_efficiency
-    comp_mem_efficiency = workload_spec.comp_mem_efficiency
-    comm_mem_efficiency = workload_spec.comm_mem_efficiency
+    match pass_mode:
+        case PassMode.INFERENCE_DECODE:
+            overlap_tokens_per_sequence = 1
+        case PassMode.TRAINING | PassMode.INFERENCE_PREFILL:
+            overlap_tokens_per_sequence = seq_length
+        case _:
+            raise ValueError(f"Unsupported pass mode for overlap token scope: {pass_mode}.")
+    if overlap_tokens_per_sequence <= 0:
+        raise ValueError(
+            "overlap tokens_per_sequence must be > 0, " f"got {overlap_tokens_per_sequence}."
+        )
+    # Local token counts for overlap e(N): attention-domain tokens for
+    # attn/residual, full-expert-set tokens for the MoE hot-rank path
+    # below. Decode uses 1 token/sequence; train/prefill use seq_length.
+    overlap_token_scopes = resolve_moe_token_scopes(
+        resolved_batches=batch_sizes,
+        tokens_per_sequence=overlap_tokens_per_sequence,
+        attn_domains_per_full_expert_set=moe_config.attn_domains_per_full_expert_set,
+        full_expert_sets_per_attn_domain=moe_config.full_expert_sets_per_attn_domain,
+    )
+    n_tokens_attn = overlap_token_scopes.tokens_per_attention_domain
+    # MoE/FFN e(N) uses tokens on the busiest rank after routing:
+    # (tokens_per_set / E) × ρ × c. tokens_per_set is
+    # (global_batch / num_complete_sets) × seq_len. Dense E=1, ρ=1,
+    # c=1: that product is already N.
+    n_tokens_moe = hot_rank_routed_tokens_for_overlap(
+        tokens_per_full_expert_set=overlap_token_scopes.tokens_per_full_expert_set,
+        num_regular_experts=model_spec.num_regular_experts,
+        regular_expert_traffic_multiplier=moe_config.regular_expert_traffic_multiplier,
+        num_colocated_experts=moe_config.num_colocated_experts,
+    )
+    if n_tokens_attn <= 0:
+        raise ValueError(
+            "tokens_per_attention_domain must be > 0 for overlap, " f"got {n_tokens_attn}."
+        )
+    if n_tokens_moe <= 0:
+        raise ValueError(
+            "hot-rank routed MoE tokens must be > 0 for overlap, " f"got {n_tokens_moe}."
+        )
+    attn_overlap_efficiencies = efficiencies_for_overlap_model(
+        overlap_model=workload_spec.overlap_model, n_tokens=n_tokens_attn
+    )
+    moe_overlap_efficiencies = efficiencies_for_overlap_model(
+        overlap_model=workload_spec.overlap_model, n_tokens=n_tokens_moe
+    )
 
     # Floors stay per-pass. Decode results cover N single-token forward passes.
     match pass_mode:
@@ -2502,14 +2555,20 @@ def get_model_stats(
         case _:
             raise ValueError(f"Unsupported pass mode for kernel-launch floor: {pass_mode}.")
 
-    def _overlapped_block(comp_time: float, comm_time: float, mem_time: float) -> dict:
+    def _overlapped_block(
+        comp_time: float,
+        comm_time: float,
+        mem_time: float,
+        *,
+        efficiencies: ResolvedOverlapEfficiencies,
+    ) -> dict:
         return calculate_overlapped_time(
             comp_time=comp_time,
             comm_time=comm_time,
             mem_time=mem_time,
-            comp_comm_efficiency=comp_comm_efficiency,
-            comp_mem_efficiency=comp_mem_efficiency,
-            comm_mem_efficiency=comm_mem_efficiency,
+            comp_comm_efficiency=efficiencies.comp_comm_efficiency,
+            comp_mem_efficiency=efficiencies.comp_mem_efficiency,
+            comm_mem_efficiency=efficiencies.comm_mem_efficiency,
         )
 
     attn_proj_comp_time_fwd = attn_proj_compute_time_fwd
@@ -2531,19 +2590,26 @@ def get_model_stats(
     # Per-part overlap is diagnostic only. Official latency overlaps
     # projection + core as one attention block, matching backward.
     attn_proj_overlapped_fwd = _overlapped_block(
-        attn_proj_comp_time_fwd, attn_proj_comm_time_fwd, attn_proj_mem_time_fwd
+        attn_proj_comp_time_fwd,
+        attn_proj_comm_time_fwd,
+        attn_proj_mem_time_fwd,
+        efficiencies=attn_overlap_efficiencies,
     )
     attn_core_overlapped_fwd = _overlapped_block(
-        attn_core_comp_time_fwd, attn_core_comm_time_fwd, attn_core_mem_time_fwd
+        attn_core_comp_time_fwd,
+        attn_core_comm_time_fwd,
+        attn_core_mem_time_fwd,
+        efficiencies=attn_overlap_efficiencies,
     )
     attn_comp_time_fwd = attn_proj_comp_time_fwd + attn_core_comp_time_fwd
     attn_comm_time_fwd = attn_proj_comm_time_fwd + attn_core_comm_time_fwd
     attn_mem_time_fwd = attn_proj_mem_time_fwd + attn_core_mem_time_fwd
     attn_overlapped_fwd = _overlapped_block(
-        attn_comp_time_fwd, attn_comm_time_fwd, attn_mem_time_fwd
+        attn_comp_time_fwd,
+        attn_comm_time_fwd,
+        attn_mem_time_fwd,
+        efficiencies=attn_overlap_efficiencies,
     )
-    ffn_overlapped_fwd = _overlapped_block(ffn_comp_time_fwd, ffn_comm_time_fwd, ffn_mem_time_fwd)
-
     residual_comp_fwd = residual_after_accounted(
         total=batch_compute_time_forward_pass,
         accounted=(
@@ -2551,6 +2617,7 @@ def get_model_stats(
             + attn_core_comp_time_fwd
             + ffn_comp_time_fwd
             + kernel_floor_per_fwd_pass * num_fwd_passes
+            + moe_pair_overhead_fwd
         ),
         name="forward_compute",
     )
@@ -2565,22 +2632,48 @@ def get_model_stats(
         name="forward_memory",
     )
     residual_overlapped_fwd = _overlapped_block(
-        residual_comp_fwd, residual_comm_fwd, residual_mem_fwd
+        residual_comp_fwd,
+        residual_comm_fwd,
+        residual_mem_fwd,
+        efficiencies=attn_overlap_efficiencies,
     )
+    # fold_residual_into_moe_overlap: leftover residual C/K/M joins
+    # the MoE pot, then one _overlapped_block. Isolated residual
+    # overlap stays in the dump; residual_latency_* is 0 so the pass
+    # does not add that block again. Default: MoE and residual
+    # overlap separately.
+    fold_residual_into_moe = workload_spec.fold_residual_into_moe_overlap
+    if fold_residual_into_moe:
+        ffn_overlapped_fwd = _overlapped_block(
+            ffn_comp_time_fwd + residual_comp_fwd,
+            ffn_comm_time_fwd + residual_comm_fwd,
+            ffn_mem_time_fwd + residual_mem_fwd,
+            efficiencies=moe_overlap_efficiencies,
+        )
+        residual_latency_fwd = 0.0
+    else:
+        ffn_overlapped_fwd = _overlapped_block(
+            ffn_comp_time_fwd,
+            ffn_comm_time_fwd,
+            ffn_mem_time_fwd,
+            efficiencies=moe_overlap_efficiencies,
+        )
+        residual_latency_fwd = residual_overlapped_fwd["total_time"]
 
     batch_time_to_train_sec_forward_pass = (
         attn_overlapped_fwd["total_time"]
         + ffn_overlapped_fwd["total_time"]
-        + residual_overlapped_fwd["total_time"]
+        + residual_latency_fwd
         + kernel_floor_per_fwd_pass * num_fwd_passes
+        + moe_pair_overhead_fwd
     )
 
     # Prefill TTFT: first generated token after one batched prompt prefill
     # (B sequences × S prompt tokens in one pass, not token-by-token).
     # Uses the same overlapped T_fwd as official ITL (attn + MoE + residual
     # + kernel floor). Waiting for the micro-batch does not disable C/K/M
-    # overlap. e is still the constant workload-spec value; a size-aware
-    # overlap model will replace that later. T_fwd is for the full DP batch
+    # overlap. e comes from overlap_model (fixed or token-saturating).
+    # T_fwd is for the full DP batch
     # on one PP stage: scale to one micro-batch, then multiply by stage
     # count so the first micro-batch fills the pipeline.
     ttft_forward_sec = None
@@ -2607,13 +2700,20 @@ def get_model_stats(
     ffn_mem_time_bwd = bwd_moe_traffic.get_stats(layers_per_stage)[f"{bwd_moe_traffic.name}_time_s"]
 
     attn_overlapped_bwd = _overlapped_block(
-        attn_comp_time_bwd, attn_comm_time_bwd, attn_mem_time_bwd
+        attn_comp_time_bwd,
+        attn_comm_time_bwd,
+        attn_mem_time_bwd,
+        efficiencies=attn_overlap_efficiencies,
     )
-    ffn_overlapped_bwd = _overlapped_block(ffn_comp_time_bwd, ffn_comm_time_bwd, ffn_mem_time_bwd)
 
     residual_comp_bwd = residual_after_accounted(
         total=batch_compute_time_backward_pass,
-        accounted=attn_comp_time_bwd + ffn_comp_time_bwd + kernel_floor_per_bwd_pass,
+        accounted=(
+            attn_comp_time_bwd
+            + ffn_comp_time_bwd
+            + kernel_floor_per_bwd_pass
+            + moe_pair_overhead_bwd
+        ),
         name="backward_compute",
     )
     residual_comm_bwd = residual_after_accounted(
@@ -2627,14 +2727,36 @@ def get_model_stats(
         name="backward_memory",
     )
     residual_overlapped_bwd = _overlapped_block(
-        residual_comp_bwd, residual_comm_bwd, residual_mem_bwd
+        residual_comp_bwd,
+        residual_comm_bwd,
+        residual_mem_bwd,
+        efficiencies=attn_overlap_efficiencies,
     )
+    # Same fold as forward: residual into the MoE pot when the spec
+    # flag is on; isolated residual overlap is dump-only.
+    if fold_residual_into_moe:
+        ffn_overlapped_bwd = _overlapped_block(
+            ffn_comp_time_bwd + residual_comp_bwd,
+            ffn_comm_time_bwd + residual_comm_bwd,
+            ffn_mem_time_bwd + residual_mem_bwd,
+            efficiencies=moe_overlap_efficiencies,
+        )
+        residual_latency_bwd = 0.0
+    else:
+        ffn_overlapped_bwd = _overlapped_block(
+            ffn_comp_time_bwd,
+            ffn_comm_time_bwd,
+            ffn_mem_time_bwd,
+            efficiencies=moe_overlap_efficiencies,
+        )
+        residual_latency_bwd = residual_overlapped_bwd["total_time"]
 
     batch_time_to_train_sec_backward_pass = (
         attn_overlapped_bwd["total_time"]
         + ffn_overlapped_bwd["total_time"]
-        + residual_overlapped_bwd["total_time"]
+        + residual_latency_bwd
         + kernel_floor_per_bwd_pass
+        + moe_pair_overhead_bwd
     )
 
     batch_time_to_train_sec = (
@@ -2921,6 +3043,7 @@ def get_model_stats(
         "Fwd_Residual_Comm_Time_Sec": residual_comm_fwd,
         "Fwd_Residual_Total_Time_Overlapped_Sec": residual_overlapped_fwd["total_time"],
         "Fwd_Kernel_Launch_Floor_Sec": kernel_floor_per_fwd_pass * num_fwd_passes,
+        "Fwd_MoE_Token_Pair_Overhead_Sec": moe_pair_overhead_fwd,
         "Fwd_Block_Latency_Sec": batch_time_to_train_sec_forward_pass,
         "Attn_Bwd_Compute_Time_Sec": attn_comp_time_bwd,
         "Attn_Bwd_Mem_Time_Sec": attn_mem_time_bwd,
@@ -2935,6 +3058,7 @@ def get_model_stats(
         "Bwd_Residual_Comm_Time_Sec": residual_comm_bwd,
         "Bwd_Residual_Total_Time_Overlapped_Sec": residual_overlapped_bwd["total_time"],
         "Bwd_Kernel_Launch_Floor_Sec": kernel_floor_per_bwd_pass,
+        "Bwd_MoE_Token_Pair_Overhead_Sec": moe_pair_overhead_bwd,
         "Bwd_Block_Latency_Sec": batch_time_to_train_sec_backward_pass,
     }
 
@@ -2987,9 +3111,19 @@ def get_model_stats(
     # it won't appear in summary.csv unless we surface it here.
     stats["base.model_spec.num_heads"] = model_spec.num_heads
     stats["base.model_spec.num_kv_heads"] = model_spec.num_kv_heads
-    stats["base.workload_spec.comp_comm_efficiency"] = workload_spec.comp_comm_efficiency
-    stats["base.workload_spec.comp_mem_efficiency"] = workload_spec.comp_mem_efficiency
-    stats["base.workload_spec.comm_mem_efficiency"] = workload_spec.comm_mem_efficiency
+    stats["base.workload_spec.overlap_model"] = workload_spec.overlap_model.model_dump(mode="json")
+    stats["base.workload_spec.fold_residual_into_moe_overlap"] = (
+        workload_spec.fold_residual_into_moe_overlap
+    )
+    stats["overlap.fold_residual_into_moe_overlap"] = fold_residual_into_moe
+    stats["overlap.n_tokens_attn"] = n_tokens_attn
+    stats["overlap.n_tokens_moe"] = n_tokens_moe
+    stats["overlap.attn.comp_comm_efficiency"] = attn_overlap_efficiencies.comp_comm_efficiency
+    stats["overlap.attn.comp_mem_efficiency"] = attn_overlap_efficiencies.comp_mem_efficiency
+    stats["overlap.attn.comm_mem_efficiency"] = attn_overlap_efficiencies.comm_mem_efficiency
+    stats["overlap.moe.comp_comm_efficiency"] = moe_overlap_efficiencies.comp_comm_efficiency
+    stats["overlap.moe.comp_mem_efficiency"] = moe_overlap_efficiencies.comp_mem_efficiency
+    stats["overlap.moe.comm_mem_efficiency"] = moe_overlap_efficiencies.comm_mem_efficiency
     # Decode-only knobs (surface even when not explicitly swept).
     stats["base.workload_spec.decode_tp2d_kv_comm_mode"] = getattr(
         workload_spec, "decode_tp2d_kv_comm_mode", None
@@ -3567,9 +3701,10 @@ def structure_run_results(row, human_readable=False):
                 "num_kv_heads": get_val("base.model_spec.num_kv_heads"),
             },
             "workload_spec": {
-                "comp_comm_efficiency": get_val("base.workload_spec.comp_comm_efficiency"),
-                "comp_mem_efficiency": get_val("base.workload_spec.comp_mem_efficiency"),
-                "comm_mem_efficiency": get_val("base.workload_spec.comm_mem_efficiency"),
+                "overlap_model": get_val("base.workload_spec.overlap_model"),
+                "fold_residual_into_moe_overlap": get_val(
+                    "base.workload_spec.fold_residual_into_moe_overlap"
+                ),
                 "decode_tp2d_kv_comm_mode": get_val("base.workload_spec.decode_tp2d_kv_comm_mode"),
                 "decode_moe_router_sync_mode": get_val(
                     "base.workload_spec.decode_moe_router_sync_mode"
@@ -3664,6 +3799,10 @@ def structure_run_results(row, human_readable=False):
                     "total_time": fmt_t(get_val("Fwd_Kernel_Launch_Floor_Sec")),
                     "total_time_seconds": get_val("Fwd_Kernel_Launch_Floor_Sec"),
                 },
+                "moe_token_pair_overhead": {
+                    "total_time": fmt_t(get_val("Fwd_MoE_Token_Pair_Overhead_Sec")),
+                    "total_time_seconds": get_val("Fwd_MoE_Token_Pair_Overhead_Sec"),
+                },
             },
             "backward": {
                 "total_time": fmt_t(get_val("Bwd_Block_Latency_Sec")),
@@ -3693,6 +3832,25 @@ def structure_run_results(row, human_readable=False):
                     "total_time": fmt_t(get_val("Bwd_Kernel_Launch_Floor_Sec")),
                     "total_time_seconds": get_val("Bwd_Kernel_Launch_Floor_Sec"),
                 },
+                "moe_token_pair_overhead": {
+                    "total_time": fmt_t(get_val("Bwd_MoE_Token_Pair_Overhead_Sec")),
+                    "total_time_seconds": get_val("Bwd_MoE_Token_Pair_Overhead_Sec"),
+                },
+            },
+        },
+        "overlap": {
+            "fold_residual_into_moe_overlap": get_val("overlap.fold_residual_into_moe_overlap"),
+            "n_tokens_attn": get_val("overlap.n_tokens_attn"),
+            "n_tokens_moe": get_val("overlap.n_tokens_moe"),
+            "attn": {
+                "comp_comm_efficiency": get_val("overlap.attn.comp_comm_efficiency"),
+                "comp_mem_efficiency": get_val("overlap.attn.comp_mem_efficiency"),
+                "comm_mem_efficiency": get_val("overlap.attn.comm_mem_efficiency"),
+            },
+            "moe": {
+                "comp_comm_efficiency": get_val("overlap.moe.comp_comm_efficiency"),
+                "comp_mem_efficiency": get_val("overlap.moe.comp_mem_efficiency"),
+                "comm_mem_efficiency": get_val("overlap.moe.comm_mem_efficiency"),
             },
         },
         "compute_per_batch_per_xpu": {

@@ -726,7 +726,7 @@ def hockney_model_total_exchange_on_nd_topology(
 
 
 def hockney_model_send_recv_on_nd_topology(
-    topology: LogicalTopology, bytes_per_sender: float, float_size_bytes: float
+    topology: LogicalTopology, bytes_per_sender: float
 ) -> CommStats:
     """Estimate a simple point-to-point send/recv on a (typically 1D) topology view.
 
@@ -753,8 +753,8 @@ def hockney_model_send_recv_on_nd_topology(
         if l_dim_map.size <= 1:
             continue
         any_multi = True
-        _, alpha_sec, effective_B_Bps, _ = topology.get_hockney_model_params(
-            l_dim_map.logical_tag, float_size_bytes, context="concurrent_baseline"
+        _, alpha_sec, effective_B_Bps = topology.get_hockney_link_params(
+            l_dim_map.logical_tag, context="concurrent_baseline"
         )
         worst_alpha = max(worst_alpha, alpha_sec)
         worst_B = min(worst_B, effective_B_Bps)

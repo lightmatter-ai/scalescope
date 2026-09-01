@@ -3,9 +3,9 @@
 # ~405 GB at FP8, which forces TP=8 to fit in 8×80 GB H100s with
 # KV-cache headroom (≈ 150 GB free for KV across the box).
 #
-# TP_Attn_X = 8 splits attention weights along the X (head) axis;
-# TP_Proj_X = 8 mirrors this for QKV/O projections. SHARD_WEIGHTS_1D
-# variant (single-axis split, all-reduce after each block).
+# TP_Attn_X = 8 means weights are sharded across 8 ranks along the X
+# axis (head dim). TP_Attn_Y = 1. TP_Proj_X = 8 mirrors this for QKV/O
+# projections. We use the 2D TP variant (SHARD_WEIGHTS_2D).
 
 name: "H100_8x_TP8"
 

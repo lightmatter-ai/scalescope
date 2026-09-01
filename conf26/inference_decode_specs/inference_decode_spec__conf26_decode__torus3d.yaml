@@ -30,9 +30,11 @@ memory_device_map_footprint:
   transient_forward_peak: xpu_memory
   transient_backward_peak: xpu_memory
 
-comp_comm_efficiency: 0.0
-comp_mem_efficiency: 0.0
-comm_mem_efficiency: 0.0
+overlap_model:
+  kind: fixed
+  comp_comm_efficiency: 0.0
+  comp_mem_efficiency: 0.0
+  comm_mem_efficiency: 0.0
 
 tp_moe_a2a_replication_optimization: true
 

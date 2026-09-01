@@ -39,19 +39,38 @@ memory_device_map_footprint:
   transient_forward_peak: xpu_memory
   transient_backward_peak: xpu_memory
 
-comp_comm_efficiency: 0.0
-comp_mem_efficiency: 0.0
-comm_mem_efficiency: 0.0
+overlap_model:
+  kind: token_saturating
+  compute_communication:
+    max_efficiency: 0.1
+    wave_tokens: 64
+  compute_memory:
+    max_efficiency: 0.1
+    wave_tokens: 64
+  communication_memory:
+    max_efficiency: 0.1
+    wave_tokens: 64
 tp_moe_a2a_replication_optimization: false
+projection_groups: 1
+decode_tp2d_kv_comm_mode: reduce_to_owner
 
 tp_attn_spec:
-  variant: SHARD_WEIGHTS_1D
+  variant: SHARD_WEIGHTS_2D
+  split_2d:
+    x_tags: ["TP_Attn_X"]
+    yz_tags: ["TP_Attn_Y"]
 
 tp_proj_spec:
-  variant: SHARD_WEIGHTS_1D
+  variant: SHARD_WEIGHTS_2D
+  split_2d:
+    x_tags: ["TP_Proj_X"]
+    yz_tags: ["TP_Proj_Y"]
 
 tp_moe_spec:
-  variant: SHARD_WEIGHTS_1D
+  variant: SHARD_WEIGHTS_2D
+  split_2d:
+    x_tags: ["TP_MoE_X"]
+    yz_tags: ["TP_MoE_Y"]
 
 dp_spec:
   variant: DDP

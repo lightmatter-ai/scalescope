@@ -52,9 +52,24 @@ _COMM_STAGE_DISPLAY_NAMES: Dict[str, str] = {
     "combine_ar_projection_replicas": "MoE projection-replica synchronization",
     "combine_ag_cross_set": "MoE cross-set batch all-gather",
     "decode_dispatch_su": "MoE local-owner dispatch (already resident)",
+    "decode_dispatch_so_size": "MoE dispatch A2Av size vector",
     "decode_dispatch_so": "MoE dispatch across attention domains",
     "decode_combine_su": "MoE local-owner return (already resident)",
     "decode_combine_so": "MoE return across attention domains",
+    # Hierarchical vs fused are the two moe_a2a_comm_mode values.
+    # hierarchical_split: two A2As (EP_SU intra, then EP_SO inter).
+    # fused_nd: one A2A on the full EP mesh. "Fused" means flatten the
+    # SU/SO split into a single N-D total-exchange, not kernel fusion.
+    # Size-vector stages are dispatch-only; combine reuses those counts.
+    "decode_dispatch_a2a_intra_size": "MoE dispatch A2A hierarchical SU size vector",
+    "decode_dispatch_a2a_intra": "MoE dispatch A2A hierarchical SU payload",
+    "decode_dispatch_a2a_inter_size": "MoE dispatch A2A hierarchical SO size vector",
+    "decode_dispatch_a2a_inter": "MoE dispatch A2A hierarchical SO payload",
+    "decode_dispatch_a2a_fused_size": "MoE dispatch A2A fused N-D size vector",
+    "decode_dispatch_a2a_fused": "MoE dispatch A2A fused N-D payload",
+    "decode_combine_a2a_intra": "MoE return hierarchical SU payload",
+    "decode_combine_a2a_inter": "MoE return hierarchical SO payload",
+    "decode_combine_a2a_fused": "MoE return fused payload",
 }
 
 _LAYOUT_STAGE_DISPLAY_NAMES: Dict[str, str] = {

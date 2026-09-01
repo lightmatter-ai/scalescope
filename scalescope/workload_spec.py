@@ -8,7 +8,7 @@ sequence length, numeric precision/efficiency knobs).
 
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Literal, Optional, Type, TypeVar
+from typing import Annotated, Any, Dict, Literal, Optional, Type, TypeVar, Union
 
 import yaml
 
@@ -370,6 +370,147 @@ class MoESpecV2(BaseModel):
     )(parse_enum_by_name_or_value(ExpertRoutingDistribution))
 
 
+class OverlapModelKind(StrEnum):
+    FIXED = "fixed"
+    TOKEN_SATURATING = "token_saturating"
+
+
+class OverlapPairCurve(BaseModel):
+    """One pairwise pipeline overlap curve: e(N) = e_max * max(0, 1 - N_wave / N)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    max_efficiency: float = Field(..., ge=0.0, le=1.0)
+    wave_tokens: int = Field(..., gt=0)
+
+
+@dataclass(frozen=True)
+class OverlapPairSpec:
+    """One pairwise curve for token-saturating overlap.
+
+    e(N) = max_efficiency * max(0, 1 - wave_tokens / N).
+    """
+
+    # Asymptotic fraction of the shorter resource that may hide (0..1).
+    max_efficiency: float
+    # Tokens in one pipeline tile. N == wave_tokens → e = 0;
+    # N == 2 * wave_tokens → e = max_efficiency / 2.
+    wave_tokens: int
+
+
+@dataclass(frozen=True)
+class ResolvedOverlapEfficiencies:
+    comp_comm_efficiency: float
+    comp_mem_efficiency: float
+    comm_mem_efficiency: float
+
+
+def resolve_overlap_pair_efficiency(*, n_tokens: float, pair_spec: OverlapPairSpec) -> float:
+    """Pipeline pairwise efficiency: e(N) = e_max * max(0, 1 - N_wave / N).
+
+    N_wave is one tile of work. A single wave cannot hide anything; two
+    waves reach e_max / 2; large N approaches e_max.
+    """
+    if n_tokens <= 0:
+        raise ValueError(f"n_tokens must be > 0, got {n_tokens}")
+    if pair_spec.wave_tokens <= 0:
+        raise ValueError(f"wave_tokens must be > 0, got {pair_spec.wave_tokens}")
+    if not 0.0 <= pair_spec.max_efficiency <= 1.0:
+        raise ValueError(
+            "max_efficiency must be between 0.0 and 1.0, " f"got {pair_spec.max_efficiency}"
+        )
+    hidden_fraction = 1.0 - pair_spec.wave_tokens / n_tokens
+    if hidden_fraction <= 0.0:
+        return 0.0
+    return pair_spec.max_efficiency * hidden_fraction
+
+
+def resolve_overlap_efficiencies(
+    *,
+    n_tokens: float,
+    compute_communication: OverlapPairSpec,
+    compute_memory: OverlapPairSpec,
+    communication_memory: OverlapPairSpec,
+) -> ResolvedOverlapEfficiencies:
+    return ResolvedOverlapEfficiencies(
+        comp_comm_efficiency=resolve_overlap_pair_efficiency(
+            n_tokens=n_tokens, pair_spec=compute_communication
+        ),
+        comp_mem_efficiency=resolve_overlap_pair_efficiency(
+            n_tokens=n_tokens, pair_spec=compute_memory
+        ),
+        comm_mem_efficiency=resolve_overlap_pair_efficiency(
+            n_tokens=n_tokens, pair_spec=communication_memory
+        ),
+    )
+
+
+class FixedOverlapModel(BaseModel):
+    """Fixed pairwise overlap efficiencies, independent of local token count."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal[OverlapModelKind.FIXED]
+    comp_comm_efficiency: float = Field(..., ge=0.0, le=1.0)
+    comp_mem_efficiency: float = Field(..., ge=0.0, le=1.0)
+    comm_mem_efficiency: float = Field(..., ge=0.0, le=1.0)
+
+
+class TokenSaturatingOverlapModel(BaseModel):
+    """Pairwise overlap efficiencies that grow with local pipeline waves.
+
+    Attention/residual use tokens_per_attention_domain. MoE/FFN use hot-rank
+    routed tokens: (tokens_per_set / E) * traffic_multiplier * colocated.
+    wave_tokens is in those same units for each block.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal[OverlapModelKind.TOKEN_SATURATING]
+    compute_communication: OverlapPairCurve
+    compute_memory: OverlapPairCurve
+    communication_memory: OverlapPairCurve
+
+
+OverlapModel = Annotated[
+    Union[FixedOverlapModel, TokenSaturatingOverlapModel],
+    Field(discriminator="kind"),
+]
+
+
+def efficiencies_for_overlap_model(
+    *, overlap_model: OverlapModel, n_tokens: float
+) -> ResolvedOverlapEfficiencies:
+    """Resolve block efficiencies from an explicit overlap_model and local N."""
+    if n_tokens <= 0:
+        raise ValueError(f"n_tokens must be > 0, got {n_tokens}")
+    match overlap_model.kind:
+        case OverlapModelKind.FIXED:
+            return ResolvedOverlapEfficiencies(
+                comp_comm_efficiency=overlap_model.comp_comm_efficiency,
+                comp_mem_efficiency=overlap_model.comp_mem_efficiency,
+                comm_mem_efficiency=overlap_model.comm_mem_efficiency,
+            )
+        case OverlapModelKind.TOKEN_SATURATING:
+            return resolve_overlap_efficiencies(
+                n_tokens=n_tokens,
+                compute_communication=OverlapPairSpec(
+                    max_efficiency=overlap_model.compute_communication.max_efficiency,
+                    wave_tokens=overlap_model.compute_communication.wave_tokens,
+                ),
+                compute_memory=OverlapPairSpec(
+                    max_efficiency=overlap_model.compute_memory.max_efficiency,
+                    wave_tokens=overlap_model.compute_memory.wave_tokens,
+                ),
+                communication_memory=OverlapPairSpec(
+                    max_efficiency=overlap_model.communication_memory.max_efficiency,
+                    wave_tokens=overlap_model.communication_memory.wave_tokens,
+                ),
+            )
+        case _:
+            raise ValueError(f"Unsupported overlap_model.kind: {overlap_model.kind}")
+
+
 class PipelineParallelSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
     variant: PipelineParallelVariant = PipelineParallelVariant.NONE
@@ -428,10 +569,17 @@ class WorkloadSpec(BaseModel):
         description="Mapping for footprint components to memory tiers (weights, optimizer_states, saved_activations, gradient_buffers, transient_forward_peak, transient_backward_peak)",
     )
 
-    # Overlap/efficiency settings for time overlap model
-    comp_comm_efficiency: float = Field(..., ge=0.0, le=1.0)
-    comp_mem_efficiency: float = Field(..., ge=0.0, le=1.0)
-    comm_mem_efficiency: float = Field(..., ge=0.0, le=1.0)
+    overlap_model: OverlapModel
+    fold_residual_into_moe_overlap: bool = Field(
+        default=False,
+        description=(
+            "When true, leftover residual C/K/M is added to the MoE overlap "
+            "pot on both the forward and backward passes, and residual is "
+            "not a separate latency block. Isolated residual C/K/M and "
+            "isolated residual overlapped time remain diagnostics. Default "
+            "false keeps residual as its own overlapped block."
+        ),
+    )
     kernel_launch_latency_per_layer_sec: float = Field(
         ...,
         ge=0,
@@ -448,12 +596,14 @@ class WorkloadSpec(BaseModel):
         ge=0,
         description=(
             "MoE software/runtime overhead in seconds per routed token-expert "
-            "pair per MoE layer per pass. Applied to training forward and backward, "
-            "inference prefill, and every decode step using the modeled hot-rank routed "
-            "load (including top-k and colocation-diluted routing imbalance). This covers "
-            "routing bookkeeping and permutation/unpermutation kernel-dispatch overhead; "
-            "it is independent of whether network A2A is required and is not part of "
-            "Hockney communication or HBM byte accounting. Set 0.0 where not modeled."
+            "pair that leaves this rank, per MoE layer per pass. Volume is "
+            "N_rows × remote_frac: decode uses (D−1)/D after the handoff, "
+            "prefill/train use (G−1)/G. D=1 decode and G=1 prefill/train "
+            "are zero. Dense E<=1 pays zero. Applied serially outside "
+            "C/K/M overlap, like the kernel-launch floor. Uses the modeled "
+            "hot-rank routed load (top-k and colocation-diluted imbalance). "
+            "This is pack/dispatch bookkeeping, not Hockney communication "
+            "or HBM bytes. Set 0.0 where not modeled."
         ),
     )
     # TP-MoE expert-input redistribution optimization toggle (mode-agnostic).
@@ -471,8 +621,9 @@ class WorkloadSpec(BaseModel):
         default=MoEA2ACommMode.HIERARCHICAL_SPLIT,
         description=(
             "MoE all-to-all communication model: "
-            "'hierarchical_split' uses the original intra/inter split logic; "
-            "'fused_nd' uses a fused N-D total-exchange model."
+            "'hierarchical_split' prices two A2As (EP_SU intra, then EP_SO inter); "
+            "'fused_nd' prices one A2A on the full EP mesh (flatten the SU/SO "
+            "split; not kernel fusion)."
         ),
     )
 
