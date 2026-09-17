@@ -433,8 +433,9 @@ class ExpertActivationCardinality:
     - e_support: full expert-set size ``E`` (``num_regular_experts``). The
       distribution has full support.
     - e_active: expected count of distinct experts touched on the worst-loaded
-      colocated group this step (the ``c`` hottest experts; collector's-problem
-      expectation ``max(1, sum_{k=1..c} (1 - (1 - p_k)^m))``).
+      colocated group this step. For assignment share ``p_k``, top-k distinct
+      routing gives per-token selection probability ``top_k * p_k`` and active
+      probability ``1 - (1 - top_k * p_k)^tokens_per_set``.
     - active_expert_fraction: ``e_active / num_colocated_experts`` (i.e.
       ``e_active / c``) in ``[0, 1]``. The multiplier applied to resident-weight
       memory-traffic terms under ``RESIDENT_ACTIVE_SUBSET``; dividing by ``c``
@@ -569,16 +570,21 @@ def _solve_zipf_exponent(*, num_regular_experts: int, expert_imbalance: float) -
 def _zipf_active_experts_the_hottest_plus_random(
     *,
     num_regular_experts: int,
+    num_selected_experts: int,
     expert_imbalance: float,
     num_colocated_experts: int,
-    m: float,
+    tokens_per_set: float,
 ) -> float:
     """Expected distinct active experts on the straggler under *random* placement.
 
     Under load-agnostic (random/hash) placement the worst-loaded chip holds the
     single hottest expert (#1, placement-invariant — it is hot wherever it lands)
     plus ``c - 1`` experts sampled from the *tail* of the global Zipf, rather than
-    the ``c`` globally hottest. With ``a_k = 1 - (1 - p_k)^m`` the expected
+    the ``c`` globally hottest. Here ``p_k`` is expert ``k``'s share of all
+    token-expert assignments. Because top-k routing selects distinct experts, a
+    token selects expert ``k`` with marginal probability
+    ``num_selected_experts * p_k``. With
+    ``a_k = 1 - (1 - num_selected_experts * p_k)^tokens_per_set``, the expected
     distinct active count is
 
         E_active_chip = a_1 + (c - 1) * mean_{k=2..E} a_k
@@ -587,33 +593,33 @@ def _zipf_active_experts_the_hottest_plus_random(
     the cold-tail mean ``mean a_{2..E}`` (not the next-hottest ``a_2..a_c``).
 
     ``E_active`` is left unfloored: this is an *expectation* over random placement
-    and routing, so a value below 1.0 is the honest answer. At small ``m`` even
-    the hottest expert is hit with probability ``a_1 = 1 - (1 - p_1)^m ≈ m·p_1 <
-    1``, and the tail fillers are smaller still, so the expected distinct-active
-    count is genuinely fractional (the straggler reads less than one full expert's
-    weights per step on average). Flooring at 1.0 would force a full per-expert
-    HBM read every step in that regime, over-counting weight traffic and inflating
-    decode step time at small batch / low top-k. Leaving it unfloored keeps the
-    correct small-``m`` asymptote (linear in ``m``) while still rising to the full
-    Zipf active count as ``m`` grows.
+    and routing, so a value below 1.0 is the honest answer. At small token count
+    even the hottest expert can be missed, and the tail fillers are smaller still,
+    so the expected distinct-active count is genuinely fractional (the straggler
+    reads less than one full expert's weights per step on average). Flooring at
+    1.0 would force a full per-expert HBM read every step in that regime,
+    over-counting weight traffic and inflating decode step time at small batch /
+    low top-k. Leaving it unfloored keeps the correct small-token asymptote while
+    still rising to the full Zipf active count as the token count grows.
 
     Corners:
       c = 1     : a_1
       c = E     : a_1 + (E-1)·mean_{k≥2} a_k = sum_{k=1..E} a_k (full Zipf count)
       rho = 1   : all a_k equal ⇒ plain coupon collector (c·a)
     """
-    if m <= 0:
+    if tokens_per_set <= 0:
         return 0.0
     s = _solve_zipf_exponent(
         num_regular_experts=num_regular_experts, expert_imbalance=expert_imbalance
     )
     if s == 0.0:
-        # Uniform routing (rho == 1): every expert has probability p = 1/E, so the
-        # hottest expert and the cold-tail average coincide and the hottest-plus-
-        # random split collapses to the plain coupon collector (c experts, each
-        # active w.p. 1 - (1 - 1/E)^m). No floor here (or below): this is an
-        # expectation, so a value < 1 at tiny m is intentional.
-        per_expert_active = 1.0 - (1.0 - 1.0 / num_regular_experts) ** m
+        # Uniform routing (rho == 1): every expert has assignment share 1/E and
+        # per-token selection probability top_k/E. The hottest expert and the
+        # cold-tail average therefore coincide. No floor here (or below): this
+        # is an expectation, so a value < 1 at tiny token count is intentional.
+        per_expert_active = (
+            1.0 - (1.0 - num_selected_experts / num_regular_experts) ** tokens_per_set
+        )
         return num_colocated_experts * per_expert_active
     # Skewed routing (rho > 1, s > 0). Zipf normalizer over all E experts:
     # H_{E,s} = sum_{k=1..E} k^{-s}, giving per-expert probability p_k = k^{-s}/H.
@@ -621,9 +627,17 @@ def _zipf_active_experts_the_hottest_plus_random(
     for k in range(1, num_regular_experts + 1):
         h_es += k ** (-s)
     # The hottest expert (k = 1, p_1 = 1/H_{E,s}) is placement-invariant — it is
-    # hot wherever it lands, so it always sits on the straggler. a_1 is its
-    # probability of being hit by >= 1 of the m draws.
-    a_1 = 1.0 - (1.0 - (1.0 ** (-s)) / h_es) ** m
+    # hot wherever it lands, so it always sits on the straggler. Its per-token
+    # selection probability is top_k * p_1.
+    p_1 = (1.0 ** (-s)) / h_es
+    hottest_selection_probability = num_selected_experts * p_1
+    if not 0.0 <= hottest_selection_probability <= 1.0:
+        raise ValueError(
+            "Hottest-expert selection probability must be in [0, 1], got "
+            f"{hottest_selection_probability} for E={num_regular_experts}, "
+            f"top_k={num_selected_experts}, rho={expert_imbalance}"
+        )
+    a_1 = 1.0 - (1.0 - hottest_selection_probability) ** tokens_per_set
     if num_colocated_experts == 1 or num_regular_experts == 1:
         # Only the hottest expert is hosted (c = 1) or it is the sole expert.
         return a_1
@@ -633,7 +647,15 @@ def _zipf_active_experts_the_hottest_plus_random(
     tail_sum = 0.0
     for k in range(2, num_regular_experts + 1):
         p_k = (k ** (-s)) / h_es
-        tail_sum += 1.0 - (1.0 - p_k) ** m
+        selection_probability = num_selected_experts * p_k
+        if not 0.0 <= selection_probability <= 1.0:
+            raise ValueError(
+                "Expert selection probability must be in [0, 1], got "
+                f"{selection_probability} for expert_rank={k}, "
+                f"E={num_regular_experts}, top_k={num_selected_experts}, "
+                f"rho={expert_imbalance}"
+            )
+        tail_sum += 1.0 - (1.0 - selection_probability) ** tokens_per_set
     tail_mean = tail_sum / (num_regular_experts - 1)
     # Expected distinct-active count = the always-present hottest expert plus the
     # c - 1 random tail fillers at their average activation. Left unfloored on
@@ -656,26 +678,24 @@ def compute_expert_activation_cardinality(
       bottleneck_group_collector_random (expected straggler under random
       placement; holds hottest #1 + (c-1) random tail experts, unfloored):
           p_k       = k^{-s} / H_{E,s},  s solved from E / H_{E,s} = rho
-          a_k       = 1 - (1 - p_k)^m
+          q_k       = top_k * p_k
+          a_k       = 1 - (1 - q_k)^tokens_per_set
           E_active  = a_1 + (c - 1) * mean_{k=2..E} a_k
           frac      = E_active / c
       An expectation (so unfloored); corner-exact at c=1, c=E, and rho=1.
       See `_zipf_active_experts_the_hottest_plus_random`.
 
-    Why coupon collector. ``m = tokens_per_set * num_selected_experts`` is the
-    number of routing "draws" (token->expert assignments) that hit one full
-    expert set this step. The quantity we need is how many *distinct* experts
-    those ``m`` draws touch — which is exactly the coupon-collector (occupancy)
-    problem, generalized to *unequal* coupon probabilities. Expert ``k`` is
-    missed by one draw with probability ``1 - p_k``, missed by all ``m``
-    independent draws with probability ``(1 - p_k)^m``, and therefore hit at
-    least once with probability ``1 - (1 - p_k)^m``. Summing that hit
+    Why occupancy. ``p_k`` is expert ``k``'s share of all routing assignments.
+    Each token selects ``num_selected_experts`` distinct experts, so its
+    marginal probability of selecting expert ``k`` is ``q_k = top_k * p_k``.
+    Across ``tokens_per_set`` independent tokens, expert ``k`` is missed with
+    probability ``(1 - q_k)^tokens_per_set`` and therefore hit at least once
+    with probability ``1 - (1 - q_k)^tokens_per_set``. Summing that hit
     probability over the ``c`` hosted experts gives the expected number of
-    distinct experts collected, i.e. how many distinct weight shards the worst
-    chip must read this step. The skew sets how fast coupons saturate: under a
-    steep Zipf only the few hot coupons are ever collected (the chip reads ~1
-    shard no matter how large ``m`` gets), while under uniform routing enough
-    draws eventually collect all ``c`` (the textbook coupon-collector limit).
+    distinct weight shards the worst chip must read this step. The skew sets
+    how fast experts saturate: under a steep Zipf only the few hot experts are
+    commonly selected, while under uniform routing enough tokens eventually
+    touch all ``c``.
 
       Step time is set by the worst-loaded chip, so this multiplier is the
       physically-grounded choice. The memory model multiplies resident weight
@@ -722,8 +742,6 @@ def compute_expert_activation_cardinality(
         num_selected_experts=num_selected_experts,
     )
 
-    m = tokens_per_set * num_selected_experts
-
     # Distinct active experts on the straggler chip. Dividing by c makes the
     # memory model's `resident * frac` equal `e_active * (w/TP_MoE)`, exposing the
     # per-shard weight read so finer sharding (2D TP_MoE) shrinks the outlier
@@ -736,15 +754,16 @@ def compute_expert_activation_cardinality(
             raise ValueError(f"Unsupported routing_distribution: {routing_distribution}")
 
     e_support = float(num_regular_experts)
-    if m <= 0:
+    if tokens_per_set <= 0:
         e_active = 0.0
         per_chip_frac = 0.0
     else:
         e_active = active_experts_estimator(
             num_regular_experts=num_regular_experts,
+            num_selected_experts=num_selected_experts,
             expert_imbalance=expert_imbalance,
             num_colocated_experts=num_colocated_experts,
-            m=m,
+            tokens_per_set=tokens_per_set,
         )
         per_chip_frac = e_active / num_colocated_experts
     active_expert_fraction = per_chip_frac
