@@ -1091,6 +1091,25 @@ class InferenceDecodeSpec(WorkloadSpec):
             "via the YZ all-reduce and then discarded on non-owner ranks."
         ),
     )
+    decode_attention_context_correction_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable the empirical long-context decode attention-memory efficiency "
+            "correction. Default false preserves the analytical C/M/K model. When "
+            "enabled, decode_attention_context_reference_tokens is required and "
+            "num_generated_tokens must be 1. The correction is calibrated for "
+            "TP-YZ=1; TP-YZ>1 uses the documented inverse-local-work extrapolation."
+        ),
+    )
+    decode_attention_context_reference_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Explicit decode context anchor for the attention-memory correction. "
+            "Required exactly when decode_attention_context_correction_enabled is "
+            "true. Contexts at or below the anchor receive zero correction."
+        ),
+    )
 
     decode_moe_router_sync_mode: MoERouterSyncMode = Field(
         ...,
@@ -1121,6 +1140,29 @@ class InferenceDecodeSpec(WorkloadSpec):
     )(parse_enum_by_name_or_value(DecodeCrossDomainEPMode))
     # Note: K/V reduce-to-owner is always modeled as a single fused reduce on (K,V) concatenated
     # payload when decode_tp2d_kv_comm_mode='reduce_to_owner'. We do not expose this as a knob.
+
+    @model_validator(mode="after")
+    def _validate_decode_attention_context_correction(self) -> "InferenceDecodeSpec":
+        enabled = self.decode_attention_context_correction_enabled
+        reference = self.decode_attention_context_reference_tokens
+        if enabled:
+            if reference is None:
+                raise ValueError(
+                    "decode_attention_context_reference_tokens is required when "
+                    "decode_attention_context_correction_enabled is true"
+                )
+            if self.num_generated_tokens != 1:
+                raise ValueError(
+                    "decode attention context correction currently requires "
+                    "num_generated_tokens=1; use an explicit representative decode "
+                    f"step, got {self.num_generated_tokens}"
+                )
+        elif reference is not None:
+            raise ValueError(
+                "decode_attention_context_reference_tokens must be omitted when "
+                "decode_attention_context_correction_enabled is false"
+            )
+        return self
 
     @property
     def effective_micro_batch_size(self) -> int:

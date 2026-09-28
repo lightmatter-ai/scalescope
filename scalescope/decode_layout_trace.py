@@ -23,7 +23,7 @@ from functools import reduce
 from operator import mul
 from typing import ClassVar, Dict, List, Optional, Sequence, Tuple
 
-from scalescope.model_spec import AttentionLayerClass
+from scalescope.model_spec import AttentionLayerClass, resolve_kv_heads_per_partition
 from scalescope.stats import CommStats
 
 logger = logging.getLogger(__name__)
@@ -795,7 +795,7 @@ def _trace_attention_stages(
     # For decode (s=1), the single token's K,V go to one Y-rank (the cache owner).
     # With GQA (n_kv_heads < tp_x), multiple X-ranks share one KV head — we model
     # the per-rank KV size as a flat dimension to avoid fractional head sharding.
-    kv_heads_per_x = max(1, n_kv_heads // tp_x)
+    kv_heads_per_x, _kv_rep = resolve_kv_heads_per_partition(num_kv_heads=n_kv_heads, tp_x=tp_x)
     kv_dim = kv_heads_per_x * d_head
     trace.record(
         "after_qkv_proj",

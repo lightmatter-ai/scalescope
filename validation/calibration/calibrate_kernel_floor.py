@@ -100,13 +100,37 @@ def _implied_floor_sec(row: dict, floor_current: float, n_layers: int) -> float:
     return floor_current + gap_sec_per_layer
 
 
-def _load_floor_table() -> dict[str, float]:
+def _load_floor_table() -> dict[str, dict[str, float]]:
     """Import KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER from the panel driver."""
     spec = importlib.util.spec_from_file_location("_rmp_floor", DRIVER)
     module = importlib.util.module_from_spec(spec)
     sys.modules["_rmp_floor"] = module
     spec.loader.exec_module(module)
-    return dict(module.KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER)
+    table = module.KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER
+    out: dict[str, dict[str, float]] = {}
+    for model_id, by_gpu in table.items():
+        if not isinstance(by_gpu, dict) or not by_gpu:
+            raise TypeError(
+                f"KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER[{model_id!r}] must be "
+                f"a non-empty {{gpu_class: seconds}} map, got {by_gpu!r}"
+            )
+        out[model_id] = dict(by_gpu)
+    return out
+
+
+def _floor_for_row(floor_table: dict[str, dict[str, float]], row: dict) -> float:
+    model_id = row["model_id"]
+    gpu = row["gpu"]
+    if model_id not in floor_table:
+        raise KeyError(
+            f"No kernel-launch floor for model {model_id!r} " f"(known: {sorted(floor_table)})"
+        )
+    by_gpu = floor_table[model_id]
+    if gpu not in by_gpu:
+        raise KeyError(
+            f"No kernel-launch floor for ({model_id}, {gpu}). " f"Known GPUs: {sorted(by_gpu)}"
+        )
+    return by_gpu[gpu]
 
 
 def _decode_rows(panel: dict) -> list[dict]:
@@ -178,17 +202,15 @@ def _decode_rows(panel: dict) -> list[dict]:
 def _audit_model_floor(
     model_id: str,
     rows: list[dict],
-    floor: float | None,
+    floor_by_gpu: dict[str, float] | None,
     small_batch_conc: int,
     flag_threshold: float,
 ) -> None:
     """Print the kernel-floor diagnostic for one model and flag floor errors.
 
-    Context: `KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER` carries ONE value per model,
-    applied to every GPU class that model runs on. Kernel-launch/dispatch
-    latency has a real per-GPU (host + runtime) component, so a single shared
-    value can be mis-centered on some GPUs. This function quantifies that,
-    using small-batch decode rows where the floor dominates per-token latency.
+    Context: `KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER` is keyed on (model, gpu).
+    This function audits whether each listed GPU's current floor is
+    centered, using small-batch decode rows where the floor dominates.
     It does NOT judge which GPU is "better" hardware — `tpot_ratio` is
     predicted/measured, so the question is purely whether ScaleScope's floor is
     correctly centered, per GPU.
@@ -218,7 +240,12 @@ def _audit_model_floor(
     for r in rows:
         by_gpu[r["gpu"]].append(r)
 
-    floor_str = f"{floor * 1e6:.0f} us/layer" if floor is not None else "n/a"
+    if floor_by_gpu is None:
+        floor_str = "n/a"
+    else:
+        floor_str = ", ".join(
+            f"{gpu} {val * 1e6:.0f} us/layer" for gpu, val in sorted(floor_by_gpu.items())
+        )
     regimes = sorted({"disagg" if r["disagg"] else "non-disagg" for r in rows})
     print(f"\n=== {model_id}  ({'+'.join(regimes)}, current floor: {floor_str}) ===")
     print(f"  GPU classes in panel: {', '.join(sorted(by_gpu))}")
@@ -289,18 +316,16 @@ def _audit_model_floor(
 def _report_fitted_floors(
     models: list[str],
     by_model: dict[str, list[dict]],
-    floor_table: dict[str, float],
+    floor_table: dict[str, dict[str, float]],
     small_batch_conc: int,
 ) -> None:
-    """Print the fitted kernel-launch floor (us/layer) for every model.
+    """Print the fitted kernel-launch floor (us/layer) per (model, gpu).
 
-    This is the script's primary output: it inverts the audit. For each model
-    it takes the clean, small-batch decode rows (where the floor dominates and
-    the prefill α-correction is ~1) and, per row, computes the exact additive
+    Inverts the audit. For each listed (model, gpu) it takes the clean
+    small-batch decode rows and, per row, computes the exact additive
     floor that lands ScaleScope's prediction on the measured TPOT (see
-    `_implied_floor_sec`). The reported value is the MEDIAN of those per-row
-    floors — robust to outliers — alongside a per-GPU median and the spread, so
-    a single shared floor vs a per-(model, gpu_class) split is an easy call.
+    `_implied_floor_sec`). The reported value is the MEDIAN of those
+    per-row floors.
 
     These are suggestions for `KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER`; this script
     never edits the driver. Throughput-only models (no measured TPOT) cannot be
@@ -312,8 +337,7 @@ def _report_fitted_floors(
         f"over clean rows with conc <= {small_batch_conc}. Units: us/layer."
     )
     for model_id in models:
-        floor_current = floor_table.get(model_id)
-        if floor_current is None:
+        if model_id not in floor_table:
             print(
                 f"  {model_id:14}: no current floor in KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER; skipping."
             )
@@ -325,19 +349,17 @@ def _report_fitted_floors(
         if not clean_sb:
             print(f"  {model_id:14}: no clean small-batch rows; cannot fit.")
             continue
-        implied_us = [_implied_floor_sec(r, floor_current, n_layers) * 1e6 for r in clean_sb]
-        fit_us = _median(implied_us)
-        cur_us = floor_current * 1e6
-        by_gpu: dict[str, list[float]] = defaultdict(list)
-        for r, f_us in zip(clean_sb, implied_us):
-            by_gpu[r["gpu"]].append(f_us)
-        gpu_str = ", ".join(
-            f"{gpu} {_median(v):.0f} (N={len(v)})" for gpu, v in sorted(by_gpu.items())
-        )
-        print(
-            f"  {model_id:14} (n_layers={n_layers}): current {cur_us:.0f} -> fit {fit_us:.0f} us/layer  "
-            f"[range {min(implied_us):.0f}-{max(implied_us):.0f}, N={len(clean_sb)}; per-GPU: {gpu_str}]"
-        )
+        by_gpu: dict[str, list[dict]] = defaultdict(list)
+        for r in clean_sb:
+            by_gpu[r["gpu"]].append(r)
+        for gpu, gpu_rows in sorted(by_gpu.items()):
+            current = _floor_for_row(floor_table, gpu_rows[0])
+            implied_us = [_implied_floor_sec(r, current, n_layers) * 1e6 for r in gpu_rows]
+            print(
+                f"  {model_id:14} {gpu:6} (n_layers={n_layers}): "
+                f"current {current * 1e6:.0f} -> fit {_median(implied_us):.0f} us/layer  "
+                f"[range {min(implied_us):.0f}-{max(implied_us):.0f}, N={len(gpu_rows)}]"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -393,7 +415,9 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _report_coverage(panel: dict, floor_table: dict[str, float], *, audited: set[str]) -> None:
+def _report_coverage(
+    panel: dict, floor_table: dict[str, dict[str, float]], *, audited: set[str]
+) -> None:
     """Cross-check every floor-table model against what the audit covered.
 
     A model carries a kernel-launch floor but is auditable only if the panel

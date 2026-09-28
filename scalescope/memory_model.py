@@ -1531,7 +1531,12 @@ def _forward_pass_prefill_attention_attn_tp_2d_memory_traffic(
                 f"TP-X ({attn_tp_size_x}) must be divisible by num_kv_heads ({num_kv_heads}) for KV duplication"
             )
         kv_heads_per_x = 1
-    heads_per_x = num_heads // attn_tp_size_x if attn_tp_size_x else num_heads
+    if num_heads % attn_tp_size_x != 0:
+        raise ValueError(
+            f"num_heads ({num_heads}) must be divisible by TP-X ({attn_tp_size_x}); "
+            f"query-head replication across X is not modeled."
+        )
+    heads_per_x = num_heads // attn_tp_size_x
 
     # Read QKV for attention (produced by projections).
     qkv_out_elems = q_proj_out_dim + 2 * (num_kv_heads * head_dim)
@@ -1703,7 +1708,12 @@ def _decode_attention_attn_tp_2d_memory_traffic(
     # - Communication is modeled in the TP strategy (YZ all-reduce with a custom op).
     # - HBM traffic for these scalars is omitted here (assumed register/shared-memory).
     traffic.activations.bytes_read += int(qkv_output_sharded_size)
-    heads_per_x_attn = num_heads // attn_tp_size_x if attn_tp_size_x else num_heads
+    if num_heads % attn_tp_size_x != 0:
+        raise ValueError(
+            f"num_heads ({num_heads}) must be divisible by TP-X ({attn_tp_size_x}); "
+            f"query-head replication across X is not modeled."
+        )
+    heads_per_x_attn = num_heads // attn_tp_size_x
     # Score buffer is linear in the local KV span, so the blended span is exact here.
     attn_score_sharded_size = (
         n_batch * heads_per_x_attn * step_seq * blended_kv_len_local * float_size

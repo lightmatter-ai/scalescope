@@ -4,7 +4,8 @@
 # Per-record overrides applied by the driver (in-place, on a YAML
 # copy):
 #   - global_batch_size      (= InferenceX conc / TRT-LLM sweep batch)
-#   - prefill_seq_len        (= record ISL)
+#   - prefill_seq_len        (= record ISL + OSL/2 midpoint context)
+#   - decode_attention_context_reference_tokens (= 1024 + record OSL/2)
 #   - moe_spec_v2.num_colocated_experts (set per case-table entry)
 #
 # Constants (do NOT override per-record):
@@ -28,6 +29,8 @@ micro_batch_size: 1
 prefill_seq_len: 1024           # OVERRIDDEN per record by the driver.
 num_generated_tokens: 1
 seq_length: 1
+decode_attention_context_correction_enabled: true
+decode_attention_context_reference_tokens: 1536  # OVERRIDDEN per record by the driver.
 decode_moe_router_sync_mode: replicated_router
 # MoE software/runtime overhead per routed token-expert pair per layer per pass.
 # Applies independently of network A2A; 0.0 = not modeled.

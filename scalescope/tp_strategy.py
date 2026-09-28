@@ -626,6 +626,11 @@ def _tp2d_attn_comm_phase2_decode_yz_reductions(
 
     n_batch = workload_spec.get_resolved_batches().batch_size_per_dp
     num_heads = transformer_config.num_heads
+    if num_heads % tp_x != 0:
+        raise ValueError(
+            f"num_heads ({num_heads}) must be divisible by TP-X size ({tp_x}); "
+            f"query-head replication across X is not modeled."
+        )
     heads_per_x = num_heads // tp_x
     head_dim = transformer_config.head_dim
 
@@ -1853,7 +1858,7 @@ class TP2DAttnStrategy(TensorParallelStrategy):
             ),
             note=f"actual: heads/X = {n_heads // tp_x_attn}",
         )
-        kv_per_x = max(1, n_kv_heads // tp_x_attn)
+        kv_per_x, _kv_rep = resolve_kv_heads_per_partition(num_kv_heads=n_kv_heads, tp_x=tp_x_attn)
         kv_dim = kv_per_x * d_head
         layout_trace.record(
             "after_qkv_proj",

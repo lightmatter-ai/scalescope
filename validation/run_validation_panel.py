@@ -94,6 +94,9 @@ _MPL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(_MPL_CACHE_DIR))
 
 HARDWARE_LIB = REPO_ROOT / "hardware_specs" / "hardware_library.yaml"
+# Validation enables the empirical long-context attention-memory correction
+# unless main() is invoked with --disable-decode-attention-context-correction.
+DECODE_ATTENTION_CONTEXT_CORRECTION_ENABLED = True
 WORKLOAD_TEMPLATES = {
     "fp8": VALIDATION_DIR / "inference_decode_specs" / "fp8_decode_template.yaml",
     "fp4": VALIDATION_DIR / "inference_decode_specs" / "fp4_decode_template.yaml",
@@ -121,19 +124,19 @@ MODEL_ZOO = VALIDATION_DIR / "model_zoo"
 TOPO_PHYS = VALIDATION_DIR / "topology_zoo" / "physical"
 TOPO_LOG = VALIDATION_DIR / "topology_zoo" / "logical"
 
-# Per-model host kernel-launch/dispatch floor (seconds per layer per decode
-# step), injected into each generated workload spec. This is an empirical
-# runtime overhead the roofline does not model; it is fit to the clean
-# small-batch (TP=1, conc <= 8) latency-bound residual of each model in the
-# measured panel. The lookup is intentionally fail-fast (no silent default):
-# every model with a Case must be listed here. llama3_1_405b and llama3_1_8b
-# carry representative values for the TRT-LLM throughput regime.
-KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER: dict[str, float] = {
-    "llama3_70b": 42e-6,
-    "llama3_1_405b": 45e-6,
-    "llama3_1_8b": 24e-6,
-    "minimax_m2_5": 90e-6,
-    "gpt_oss_120b": 32e-6,
+# Host kernel-launch/dispatch floor (seconds per layer per decode step),
+# keyed on (model, gpu_class). Every GPU a model runs on must be listed;
+# lookup fails if either key is missing. Fit: clean conc<=8 residual, see
+# validation/calibration/README.md. llama3_70b is split (B200 40 us, H100
+# 23 us) after the KV-correction e_mem refit. MiniMax B200 is 91 us.
+# llama3_1_405b / llama3_1_8b are
+# TRT-LLM throughput-regime values.
+KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER: dict[str, dict[str, float]] = {
+    "llama3_70b": {"H100": 23e-6, "B200": 40e-6},
+    "llama3_1_405b": {"H100": 45e-6},
+    "llama3_1_8b": {"H100": 24e-6},
+    "minimax_m2_5": {"B200": 91e-6},
+    "gpt_oss_120b": {"GB200": 32e-6},
 }
 
 # Per-model MoE software overhead (seconds per *remote* routed token-expert
@@ -202,6 +205,14 @@ HBM_CAPACITY_BYTES: dict[str, int] = {
 # still catching real saturation (typically ≥2× when the cap actually
 # bites).
 QUEUEING_FACTOR_SATURATED_THRESHOLD: float = 1.5
+# Independent throughput cross-check for the same failure mode. In an ideal
+# steady-state decode run, aggregate output TPS × per-user TPOT reconstructs
+# the number of requests resident in decode. Median-vs-mean aggregation and
+# benchmark ramp/drain make the reconstruction imperfect, so use the reciprocal
+# of the deliberately loose 1.5× Q-factor threshold rather than requiring 100%.
+# A smaller fraction means offered `conc` materially exceeds the
+# median-TPOT-equivalent resident batch.
+MIN_RESIDENT_BATCH_FRACTION: float = 1.0 / QUEUEING_FACTOR_SATURATED_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +657,13 @@ class Record:
     precision: str | None = None
     mean_e2el_s: float | None = None
     conc: int | None = None
+    # InferenceX-only throughput diagnostics. `measured_sys_tps` above is the
+    # independently measured decode output rate. `synthetic_sys_tps` is the
+    # historical `conc / median_tpot` value retained only for auditing; it is
+    # valid as throughput only when all offered requests are resident.
+    synthetic_sys_tps: float | None = None
+    resident_batch_fraction: float | None = None
+    decode_num_workers: int | None = None
 
 
 # Maps a TRT-LLM table row "model_id" to the ScaleScope model-zoo name.
@@ -732,14 +750,44 @@ def _load_inferencex_records() -> list[Record]:
             decode_tp = int(row["decode_tp"])
             decode_ep = int(row["decode_ep"])
             decode_dp_attention = bool(row["decode_dp_attention"])
+            decode_num_workers = int(row["decode_num_workers"])
             metrics = row.get("metrics") or {}
             median_tpot_s = metrics.get("median_tpot")
             if median_tpot_s is None:
                 continue
+            output_tput_per_gpu = metrics.get("output_tput_per_gpu")
+            if output_tput_per_gpu is None:
+                raise ValueError(
+                    f"{json_path}: InferenceX row at conc={row.get('conc')!r} "
+                    "is missing required metrics.output_tput_per_gpu"
+                )
             mean_e2el_s = metrics.get("mean_e2el")  # may be None for some rows
             isl = int(row["isl"])
             osl = int(row["osl"])
             conc = int(row["conc"])
+            if conc <= 0:
+                raise ValueError(f"{json_path}: conc must be > 0, got {conc}")
+            if num_decode_gpu <= 0:
+                raise ValueError(f"{json_path}: num_decode_gpu must be > 0, got {num_decode_gpu}")
+            # InferenceX uses zero for this field on single-node/non-disagg
+            # rows, where there is no separate decode-worker pool. A
+            # disaggregated record must name at least one decode worker.
+            if disagg and decode_num_workers <= 0:
+                raise ValueError(
+                    f"{json_path}: disagg decode_num_workers must be > 0, "
+                    f"got {decode_num_workers}"
+                )
+            median_tpot_s = float(median_tpot_s)
+            output_tput_per_gpu = float(output_tput_per_gpu)
+            if median_tpot_s <= 0:
+                raise ValueError(
+                    f"{json_path}: metrics.median_tpot must be > 0, got {median_tpot_s}"
+                )
+            if output_tput_per_gpu <= 0:
+                raise ValueError(
+                    f"{json_path}: metrics.output_tput_per_gpu must be > 0, "
+                    f"got {output_tput_per_gpu}"
+                )
             precision = row["precision"]
             framework = row["framework"]
             date = row.get("date", "")
@@ -756,18 +804,19 @@ def _load_inferencex_records() -> list[Record]:
                 f"inferencex__{ss_model_id}__{gpu_class.lower()}_{num_decode_gpu}x_{shape_suffix}"
                 f"__{precision}__isl{isl}_osl{osl}__conc{conc}__{framework}__{date}"
             )
-            # ScaleScope's `tokens_per_second` at global_batch=N is the
-            # per-decode-step aggregate output rate `N / TPOT_user`. The
-            # equivalent on the measurement side is `conc / median_tpot`
-            # (algebraically equal to `conc × median_intvty`, since
-            # intvty == 1/TPOT in steady state).
+            # InferenceX publishes the decode output rate independently as
+            # `output_tput_per_gpu`. Use that value, scaled by decode GPUs, for
+            # measured system TPS. Do not use `tput_per_gpu`: that combines
+            # input and output tokens and averages across both prefill and
+            # decode GPUs.
             #
-            # We deliberately do NOT use InferenceX's `tput_per_gpu` here:
-            # that metric is `(input + output tokens) / runtime / total
-            # deployment GPUs` (i.e. averaged over prefill + decode pools),
-            # and would give numbers ~6-9× higher than the decode pool's
-            # actual output rate at long ISL.
-            measured_sys_tps = float(conc) / float(median_tpot_s)
+            # `conc / median_tpot` is retained separately as a diagnostic. It
+            # equals real output TPS only when every offered request is resident
+            # in decode. Their ratio reconstructs a median-TPOT-equivalent
+            # resident batch and automatically exposes admission saturation.
+            measured_sys_tps = output_tput_per_gpu * num_decode_gpu
+            synthetic_sys_tps = conc / median_tpot_s
+            resident_batch_fraction = measured_sys_tps * median_tpot_s / conc
             out.append(
                 Record(
                     record_id=record_id,
@@ -781,7 +830,7 @@ def _load_inferencex_records() -> list[Record]:
                     isl=isl,
                     osl=osl,
                     measured_sys_tps=measured_sys_tps,
-                    measured_tpot_ms=float(median_tpot_s) * 1000.0,
+                    measured_tpot_ms=median_tpot_s * 1000.0,
                     decode_tp=decode_tp,
                     decode_ep=decode_ep,
                     decode_dp_attention=decode_dp_attention,
@@ -789,6 +838,9 @@ def _load_inferencex_records() -> list[Record]:
                     precision=precision,
                     mean_e2el_s=float(mean_e2el_s) if mean_e2el_s is not None else None,
                     conc=conc,
+                    synthetic_sys_tps=synthetic_sys_tps,
+                    resident_batch_fraction=resident_batch_fraction,
+                    decode_num_workers=decode_num_workers,
                 )
             )
     return out
@@ -840,6 +892,8 @@ def _patch_workload(
     is_dense: bool,
     kernel_launch_latency_per_layer_sec: float,
     moe_token_pair_overhead_sec: float,
+    decode_attention_context_correction_enabled: bool,
+    decode_attention_context_reference_tokens: int,
 ) -> None:
     with template.open() as f:
         spec = yaml.safe_load(f)
@@ -847,6 +901,21 @@ def _patch_workload(
     spec["prefill_seq_len"] = int(prefill_seq_len)
     spec["kernel_launch_latency_per_layer_sec"] = float(kernel_launch_latency_per_layer_sec)
     spec["moe_token_pair_overhead_sec"] = float(moe_token_pair_overhead_sec)
+    # Validation enables the empirical long-context attention correction
+    # unless the caller disables it. Production workloads default the flag
+    # off. The anchor is passed per record because this panel models one
+    # representative midpoint step: ISL=1024 corresponds to context
+    # 1024 + OSL/2, not context 1024. When the correction is off the
+    # reference token field must be omitted (workload-spec validator).
+    spec["decode_attention_context_correction_enabled"] = (
+        decode_attention_context_correction_enabled
+    )
+    if decode_attention_context_correction_enabled:
+        spec["decode_attention_context_reference_tokens"] = (
+            decode_attention_context_reference_tokens
+        )
+    else:
+        spec.pop("decode_attention_context_reference_tokens", None)
     spec["moe_spec_v2"]["num_colocated_experts"] = int(num_colocated_experts)
     if is_dense:
         # A dense (single-expert) model has no routing skew: all tokens go to
@@ -882,6 +951,12 @@ def _run_scalescope(record: Record, case: Case, *, global_batch: int) -> dict:
             f"Add it to KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER in run_validation_panel.py "
             f"(known: {sorted(KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER)})."
         )
+    floor_by_gpu = KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER[case.model_yaml]
+    if record.gpu_class not in floor_by_gpu:
+        raise KeyError(
+            f"No kernel-launch floor for ({case.model_yaml}, {record.gpu_class}). "
+            f"Known GPUs for this model: {sorted(floor_by_gpu)}."
+        )
     if case.model_yaml not in MOE_TOKEN_PAIR_OVERHEAD_SEC:
         raise KeyError(
             f"No EP dispatch overhead calibrated for model '{case.model_yaml}'. "
@@ -898,6 +973,7 @@ def _run_scalescope(record: Record, case: Case, *, global_batch: int) -> dict:
     # systematically under-predicts TPOT for long-OSL workloads (validated:
     # median ratio 0.81x -> 0.90x on the isl1024/osl8192 llama3_70b records).
     decode_mean_context = record.isl + record.osl // 2
+    decode_attention_context_reference = 1024 + record.osl // 2
     _patch_workload(
         template,
         workload_path,
@@ -905,8 +981,10 @@ def _run_scalescope(record: Record, case: Case, *, global_batch: int) -> dict:
         prefill_seq_len=decode_mean_context,
         num_colocated_experts=case.num_colocated_experts,
         is_dense=is_dense,
-        kernel_launch_latency_per_layer_sec=KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER[case.model_yaml],
+        kernel_launch_latency_per_layer_sec=floor_by_gpu[record.gpu_class],
         moe_token_pair_overhead_sec=MOE_TOKEN_PAIR_OVERHEAD_SEC[case.model_yaml],
+        decode_attention_context_correction_enabled=(DECODE_ATTENTION_CONTEXT_CORRECTION_ENABLED),
+        decode_attention_context_reference_tokens=decode_attention_context_reference,
     )
     cmd = [
         sys.executable,
@@ -1026,14 +1104,14 @@ def _run_scalescope(record: Record, case: Case, *, global_batch: int) -> dict:
 # precision, read from `hardware_library.yaml` (`nominal × efficiency`).
 
 
-def _load_per_chip_flops_budget() -> dict[tuple[str, str], float]:
+def _load_per_chip_flops_budget(hardware_lib: Path) -> dict[tuple[str, str], float]:
     """Build the (gpu_class, precision) -> effective FLOPS/sec/chip table from
-    `hardware_library.yaml`, so the α-correction's compute ceiling stays in
+    `hardware_lib`, so the α-correction's compute ceiling stays in
     sync with the single source of truth ScaleScope itself uses. For each
     `<GPU>_COMPUTE` component, every `<precision>_nominal` entry becomes
     `(GPU, precision) -> nominal × efficiency`.
     """
-    with HARDWARE_LIB.open() as f:
+    with hardware_lib.open() as f:
         compute = yaml.safe_load(f)["components"]["compute"]
     budget: dict[tuple[str, str], float] = {}
     suffix = "_COMPUTE"
@@ -1053,7 +1131,7 @@ def _load_per_chip_flops_budget() -> dict[tuple[str, str], float]:
 
 
 # (gpu_class, precision) -> effective FLOPS/sec per chip.
-PER_CHIP_FLOPS_BUDGET: dict[tuple[str, str], float] = _load_per_chip_flops_budget()
+PER_CHIP_FLOPS_BUDGET: dict[tuple[str, str], float] = _load_per_chip_flops_budget(HARDWARE_LIB)
 
 
 @dataclass(frozen=True)
@@ -1111,10 +1189,15 @@ def _queueing_factor(record: Record) -> float | None:
     Acts as a saturation probe: a value near 1× means each user spends
     its entire wall time decoding (steady-state batched behaviour, the
     regime ScaleScope models). Values significantly > 1× mean a chunk
-    of each user's e2e latency is spent in the framework's wait queue,
-    so reported `median_tpot` is per-step time on a smaller effective
-    decode batch than `conc` — the row's labelling lies, and
-    measured-vs-predicted ratios at the labelled batch are meaningless.
+    of each user's e2e latency occurs outside its measured decode
+    cadence. In both aggregated and PD-disaggregated serving this is
+    evidence that offered concurrency is not the resident decode batch:
+    requests can wait for admission before their first decode token,
+    while `median_tpot` subsequently measures steps on the smaller
+    admitted batch. A separate prefill pool removes prefill/decode
+    kernel interference; it does not remove router or decode-admission
+    queues. Ratios against ScaleScope at `global_batch=conc` are therefore
+    scheduler-contaminated when this factor crosses the threshold.
 
     Returns None if the record is missing `mean_e2el_s` (some
     InferenceX rows have it nulled out for very short runs).
@@ -1194,6 +1277,8 @@ def _alpha_for_inferencex_record(record: Record, case: Case) -> tuple[float | No
 # Main loop
 # ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
+    global HARDWARE_LIB, RUNS_DIR, PER_CHIP_FLOPS_BUDGET
+    global DECODE_ATTENTION_CONTEXT_CORRECTION_ENABLED
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
         "--source",
@@ -1272,7 +1357,66 @@ def main(argv: list[str] | None = None) -> int:
             "summaries. Pass empty string '' to force overwrite."
         ),
     )
+    parser.add_argument(
+        "--hardware-lib",
+        type=Path,
+        default=HARDWARE_LIB,
+        help=(
+            "Hardware library YAML passed to ScaleScope and used for the "
+            "α-correction FLOPS ceiling. Non-canonical libraries require "
+            "--output-suffix and --runs-dir so the default panel dumps "
+            "are left intact."
+        ),
+    )
+    parser.add_argument(
+        "--runs-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for per-record ScaleScope YAML dumps. Required when "
+            "--hardware-lib is not the canonical library."
+        ),
+    )
+    parser.add_argument(
+        "--disable-decode-attention-context-correction",
+        action="store_true",
+        help=(
+            "Leave the midpoint-context KV evaluation (ISL + OSL/2) in "
+            "place but skip the empirical attention-memory γ correction. "
+            "Use with --output-suffix and --runs-dir so the calibrated "
+            "panel dumps are not overwritten."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    DECODE_ATTENTION_CONTEXT_CORRECTION_ENABLED = (
+        not args.disable_decode_attention_context_correction
+    )
+    if args.disable_decode_attention_context_correction:
+        if args.output_suffix is None:
+            raise SystemExit(
+                "--output-suffix is required when "
+                "--disable-decode-attention-context-correction is set"
+            )
+        if args.runs_dir is None:
+            raise SystemExit(
+                "--runs-dir is required when "
+                "--disable-decode-attention-context-correction is set"
+            )
+
+    hardware_lib = args.hardware_lib.resolve()
+    canonical_lib = HARDWARE_LIB.resolve()
+    if hardware_lib != canonical_lib:
+        if args.output_suffix is None:
+            raise SystemExit(
+                "--output-suffix is required when --hardware-lib is not " f"{HARDWARE_LIB}"
+            )
+        if args.runs_dir is None:
+            raise SystemExit("--runs-dir is required when --hardware-lib is not " f"{HARDWARE_LIB}")
+        HARDWARE_LIB = hardware_lib
+        PER_CHIP_FLOPS_BUDGET = _load_per_chip_flops_budget(HARDWARE_LIB)
+    if args.runs_dir is not None:
+        RUNS_DIR = args.runs_dir.resolve()
 
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     _require_2d_workload_templates()
@@ -1469,14 +1613,18 @@ def main(argv: list[str] | None = None) -> int:
             "parallelism": case.parallelism_label,
             "measured_sys_tps": record.measured_sys_tps,
             "measured_tpot_ms": record.measured_tpot_ms,
+            "synthetic_sys_tps": record.synthetic_sys_tps,
+            "resident_batch_fraction": record.resident_batch_fraction,
+            "decode_num_workers": record.decode_num_workers,
         }
         if record.source == "inferencex":
-            # ScaleScope is invoked once at global_batch = `conc` (the
-            # row's reported concurrency = number of simultaneous users
-            # = exactly the steady-state decode-pool batch). Disagg rows
-            # need no further correction; non-disagg rows pay
-            # chunked-prefill overhead which we quantify with the
-            # α-correction below.
+            # ScaleScope is invoked once at global_batch = `conc`, which is
+            # the number of simultaneous users offered to the service. That
+            # is the intended steady-state decode batch only while every
+            # request remains resident. The Q-factor below checks this
+            # assumption for both aggregated and disaggregated rows.
+            # Non-disagg rows additionally pay chunked-prefill overhead,
+            # quantified by the α-correction below.
             if record.conc is None:
                 row.update(ok=False, error="inferencex: missing conc on Record")
                 rows.append(row)
@@ -1527,15 +1675,35 @@ def main(argv: list[str] | None = None) -> int:
                 row["hbm_capacity_gib"] = hbm_capacity / gib
                 row["peak_to_hbm_ratio"] = peak_bytes / hbm_capacity
                 row["infeasible_capacity"] = peak_bytes > hbm_capacity
-                # Queue-saturation probe (non-disagg only — disagg rows
-                # don't expose a coherent mean_e2el to compute against,
-                # and they're not subject to the same scheduling-queue
-                # contention because prefill lives on a separate pool).
-                if record.disagg is False:
-                    qf = _queueing_factor(record)
-                    row["queueing_factor"] = qf
-                    row["saturated"] = qf is not None and qf > QUEUEING_FACTOR_SATURATED_THRESHOLD
-                    row["contaminated"] = bool(row["infeasible_capacity"] or row["saturated"])
+                # Queue-saturation probe for every InferenceX deployment.
+                # The archived disagg records do contain end-to-end latency,
+                # and it remains meaningful here: their separate prefill pool
+                # prevents prefill kernels from stretching decode TPOT, but
+                # requests may still wait at the router or for decode-engine
+                # admission. That wait raises E2E/TTFT without raising the
+                # admitted batch's median TPOT. In that regime `conc /
+                # median_tpot` is only a synthetic number, not independently
+                # measured output throughput, and `global_batch=conc`
+                # overstates the resident batch modeled by ScaleScope.
+                qf = _queueing_factor(record)
+                row["queueing_factor"] = qf
+                row["queueing_factor_saturated"] = (
+                    qf is not None and qf > QUEUEING_FACTOR_SATURATED_THRESHOLD
+                )
+                resident_fraction = record.resident_batch_fraction
+                row["resident_batch_mismatch"] = (
+                    resident_fraction is not None
+                    and resident_fraction < MIN_RESIDENT_BATCH_FRACTION
+                )
+                # Either signal is sufficient. Q-factor catches wall time spent
+                # outside decode cadence; the independent-throughput signal
+                # catches the same mismatch directly even when mean E2E is
+                # absent or median aggregation leaves Q-factor just below its
+                # threshold.
+                row["saturated"] = bool(
+                    row["queueing_factor_saturated"] or row["resident_batch_mismatch"]
+                )
+                row["contaminated"] = bool(row["infeasible_capacity"] or row["saturated"])
                 # Non-disagg rows get the prefill-overhead α-correction:
                 # `T_real_pred = T_pure_decode / (1 − prefill_frac)`.
                 # Disagg rows skip it (prefill runs on a separate pool).
@@ -1629,9 +1797,20 @@ def main(argv: list[str] | None = None) -> int:
     timestamp_iso = now.strftime("%Y-%m-%d %H:%M:%S")
     timestamp_fn = now.strftime("%Y%m%d_%H%M%S")
 
-    yaml_dict = {"timestamp": timestamp_iso, "results": rows}
+    yaml_dict = {
+        "timestamp": timestamp_iso,
+        "decode_attention_context_correction_enabled": (
+            DECODE_ATTENTION_CONTEXT_CORRECTION_ENABLED
+        ),
+        "results": rows,
+    }
     yaml_text = yaml.safe_dump(yaml_dict, sort_keys=False)
-    md_text = _format_markdown(rows, deferred_count=len(deferred), timestamp=timestamp_iso)
+    md_text = _format_markdown(
+        rows,
+        deferred_count=len(deferred),
+        timestamp=timestamp_iso,
+        decode_attention_context_correction_enabled=(DECODE_ATTENTION_CONTEXT_CORRECTION_ENABLED),
+    )
 
     summary_yaml_ts = RESULTS_DIR / f"validation_panel_summary_{timestamp_fn}{suffix}.yaml"
     summary_md_ts = RESULTS_DIR / f"validation_panel_summary_{timestamp_fn}{suffix}.md"
@@ -1689,7 +1868,13 @@ def _stat_row(bucket: str, metric: str, ratios: list[float]) -> str | None:
     )
 
 
-def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | None = None) -> str:
+def _format_markdown(
+    rows: list[dict],
+    *,
+    deferred_count: int,
+    timestamp: str | None,
+    decode_attention_context_correction_enabled: bool,
+) -> str:
     out: list[str] = []
     out.append("# Validation-panel comparison — ScaleScope vs. published benchmarks\n")
     if timestamp:
@@ -1804,7 +1989,7 @@ def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | 
             "non-disagg rows, where chunked prefill interleaves with decode. "
             "The final row pools every clean record on its best available "
             "metric (α-corrected TPOT for non-disagg, naive TPOT for disagg, "
-            "else TPS) and excludes the contaminated non-disagg rows "
+            "else TPS) and excludes all queue- or capacity-contaminated rows "
             "(measurement artifacts, see Findings).\n"
         )
         out.append("| Bucket | Metric | N | Geomean | Median | Min | Max | ±10% | ±25% | ±50% |")
@@ -1825,13 +2010,22 @@ def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | 
         nondis_rows = [
             r for r in ok_rows if r["source"] == "inferencex" and r.get("disagg") is False
         ]
+        disagg_clean = [r for r in disagg_rows if not r.get("contaminated")]
+        disagg_contam = [r for r in disagg_rows if r.get("contaminated")]
         nd_clean = [r for r in nondis_rows if not r.get("contaminated")]
         nd_contam = [r for r in nondis_rows if r.get("contaminated")]
 
-        # For InferenceX, TPS ratio == 1 / (TPOT ratio), so only TPOT is
-        # scored; TPS is scored only for TRT-LLM (no published TPOT).
+        # InferenceX TPS is now the independently measured decode output rate,
+        # not `conc / median_tpot`; score TPOT here to keep the accuracy metric
+        # comparable with prior panels. TPS is scored for TRT-LLM because that
+        # source does not publish TPOT.
         _row("TRT-LLM perf-overview", "TPS", _vals(trt_rows, "tps_ratio"))
-        _row("InferenceX disagg", "TPOT", _vals(disagg_rows, "tpot_ratio"))
+        _row("InferenceX disagg — clean", "TPOT", _vals(disagg_clean, "tpot_ratio"))
+        _row(
+            "InferenceX disagg — contaminated",
+            "TPOT",
+            _vals(disagg_contam, "tpot_ratio"),
+        )
         _row("InferenceX non-disagg — clean", "TPOT naive", _vals(nd_clean, "tpot_ratio"))
         _row(
             "InferenceX non-disagg — clean", "TPOT α-corr", _vals(nd_clean, "corrected_tpot_ratio")
@@ -1913,17 +2107,20 @@ def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | 
                 )
             out.append("")
 
-        if nd_contam:
-            n_infeasible = sum(1 for r in nd_contam if r.get("infeasible_capacity"))
-            n_saturated = sum(1 for r in nd_contam if r.get("saturated"))
+        ix_contam = disagg_contam + nd_contam
+        if ix_contam:
+            n_infeasible = sum(1 for r in ix_contam if r.get("infeasible_capacity"))
+            n_qfactor = sum(1 for r in ix_contam if r.get("queueing_factor_saturated"))
+            n_resident = sum(1 for r in ix_contam if r.get("resident_batch_mismatch"))
             out.append(
                 f"Contamination breakdown: `infeasible_capacity=True` on "
                 f"{n_infeasible} row(s) (predicted peak > chip HBM); "
-                f"`saturated=True` (queueing_factor > "
-                f"{QUEUEING_FACTOR_SATURATED_THRESHOLD:g}×) on {n_saturated} "
-                f"row(s). Contaminated rows are excluded from the pooled "
+                f"Q-factor > {QUEUEING_FACTOR_SATURATED_THRESHOLD:g}× on "
+                f"{n_qfactor} row(s); independently inferred resident batch < "
+                f"{MIN_RESIDENT_BATCH_FRACTION * 100:.0f}% of offered concurrency "
+                f"on {n_resident} row(s). Contaminated rows are excluded from the pooled "
                 f'"All clean records" line — see the per-record table below '
-                f"for their `HBM%` and `Q-factor` flags."
+                f"for their `HBM%`, `Q-factor`, and `Resident%` flags."
             )
             out.append("")
 
@@ -1935,22 +2132,45 @@ def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | 
         out.append("## InferenceX disagg-decode records — GB200 NVL72")
         out.append("")
         out.append(
-            "Decode-only pool, `global_batch = conc`. The closest 1.00× ratio "
-            "is the IDEAL match — both TPOT (per-user latency) and TPS "
-            "(system throughput) ratios are reported so the residual is "
-            "decomposable into per-step time error vs. throughput error.\n"
+            "Decode-only pool, with offered concurrency initially mapped to "
+            "`global_batch = conc`. **`Q-factor`** = `mean_e2el / (OSL × "
+            "median_tpot)`. A separate prefill pool removes prefill/decode "
+            "kernel interference but does not remove router or decode-admission "
+            "queues. Therefore a Q-factor "
+            f"> {QUEUEING_FACTOR_SATURATED_THRESHOLD:g}× means TPOT describes "
+            "a smaller admitted decode batch than the offered `conc`; those "
+            "rows are marked `QUEUE` and excluded from clean accuracy "
+            "aggregates. **`Resident%`** = independently measured output TPS × "
+            "median TPOT ÷ `conc`; values below "
+            f"{MIN_RESIDENT_BATCH_FRACTION * 100:.0f}% also trigger `QUEUE`. "
+            "Measured TPS is InferenceX's independent decode output rate, not "
+            "the historical `conc / median_tpot` synthetic value.\n"
         )
         out.append(
-            "| System | Model | Framework | Parallelism | ISL | OSL | Conc | "
-            "TPOT meas (ms) | TPOT pred (ms) | TPOT ratio | TPS meas | TPS pred | TPS ratio |"
+            "| Flag | System | Model | Framework | Parallelism | ISL | OSL | Conc | "
+            "TPOT meas (ms) | TPOT pred (ms) | TPOT ratio | Q-factor | Resident% | "
+            "TPS meas | TPS pred | TPS ratio |"
         )
-        out.append("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        out.append("|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         for r in ix_disagg:
+            qf = r.get("queueing_factor")
+            qf_s = f"{qf:.2f}×" if qf is not None else "n/a"
+            resident_fraction = r.get("resident_batch_fraction")
+            resident_s = (
+                f"{resident_fraction * 100:.0f}%" if resident_fraction is not None else "n/a"
+            )
+            flags = []
+            if r.get("infeasible_capacity"):
+                flags.append("OOM")
+            if r.get("saturated"):
+                flags.append("QUEUE")
+            flag_s = "⚠ " + ",".join(flags) if flags else ""
             out.append(
-                f"| {r['system']} | {r['model_id']} | {r['submitter']} | {r['parallelism']} "
+                f"| {flag_s} | {r['system']} | {r['model_id']} | {r['submitter']} | "
+                f"{r['parallelism']} "
                 f"| {r['isl']} | {r['osl']} | {r['global_batch']} "
                 f"| {r['measured_tpot_ms']:.2f} | {r['predicted_tpot_ms']:.2f} "
-                f"| {r['tpot_ratio']:.2f}× "
+                f"| {r['tpot_ratio']:.2f}× | {qf_s} | {resident_s} "
                 f"| {r['measured_sys_tps']:.0f} | {r['predicted_sys_tps']:.0f} "
                 f"| {r['tps_ratio']:.2f}× |"
             )
@@ -1970,7 +2190,7 @@ def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | 
             "predicted TPOT toward the measured value.\n"
         )
         out.append(
-            "Two extra columns flag rows where the labelled `conc` is not "
+            "Three diagnostic columns flag rows where the labelled `conc` is not "
             "what the framework actually served per decode step. **`HBM%`** "
             "= ScaleScope-predicted peak resident memory ÷ chip HBM "
             "capacity; values > 100% mean the labelled batch cannot fit "
@@ -1980,18 +2200,21 @@ def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | 
             "entire wall-clock decoding (clean steady state), values "
             f"≥ {QUEUEING_FACTOR_SATURATED_THRESHOLD:g}× mean a chunk of "
             "each user's wall time is spent in the scheduler's wait "
-            "queue, so reported `median_tpot` is per-step time on a "
+            "queue. The independent-throughput cross-check also marks rows "
+            f"whose inferred resident batch is below "
+            f"{MIN_RESIDENT_BATCH_FRACTION * 100:.0f}% of offered `conc`. "
+            "In either case reported `median_tpot` is per-step time on a "
             "smaller effective decode batch than labelled. Rows where "
-            "either flag fires are marked `⚠` and excluded from the "
+            "any flag fires are marked `⚠` and excluded from the "
             "headline median in the aggregate stats above.\n"
         )
         out.append(
             "| Flag | System | Model | Framework | Parallelism | ISL | OSL | Conc | "
             "Precision | TPOT meas (ms) | TPOT pred (ms) | TPOT ratio | α | "
-            "Corrected TPOT (ms) | HBM% | Q-factor | Corrected ratio |"
+            "Corrected TPOT (ms) | HBM% | Q-factor | Resident% | Corrected ratio |"
         )
         out.append(
-            "|---|---|---|---|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+            "|---|---|---|---|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
         )
         for r in ix_nondis:
             alpha = r.get("alpha")
@@ -2010,6 +2233,10 @@ def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | 
             qf = r.get("queueing_factor")
             hbm_s = f"{hbm_ratio*100:.0f}%" if hbm_ratio is not None else "n/a"
             qf_s = f"{qf:.2f}×" if qf is not None else "n/a"
+            resident_fraction = r.get("resident_batch_fraction")
+            resident_s = (
+                f"{resident_fraction * 100:.0f}%" if resident_fraction is not None else "n/a"
+            )
             flags = []
             if r.get("infeasible_capacity"):
                 flags.append("OOM")
@@ -2021,7 +2248,7 @@ def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | 
                 f"| {r['isl']} | {r['osl']} | {r['global_batch']} | {prec} "
                 f"| {r['measured_tpot_ms']:.2f} | {r['predicted_tpot_ms']:.2f} "
                 f"| {r['tpot_ratio']:.2f}× | {alpha_s} | {corr_tpot_s} "
-                f"| {hbm_s} | {qf_s} | {corr_ratio_s} |"
+                f"| {hbm_s} | {qf_s} | {resident_s} | {corr_ratio_s} |"
             )
         out.append("")
 
@@ -2087,8 +2314,10 @@ def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | 
             r for r in ok_rows if r["source"] == "inferencex" and r.get("disagg") is False
         ]
         if ix_disagg_ok:
+            ix_disagg_clean = [r for r in ix_disagg_ok if not r.get("contaminated")]
+            ix_disagg_contam = [r for r in ix_disagg_ok if r.get("contaminated")]
             tpot_ratios = sorted(
-                r["tpot_ratio"] for r in ix_disagg_ok if r.get("tpot_ratio") is not None
+                r["tpot_ratio"] for r in ix_disagg_clean if r.get("tpot_ratio") is not None
             )
             median_tpot_ratio = tpot_ratios[len(tpot_ratios) // 2] if tpot_ratios else float("nan")
             # Phase 3A = clean-TP-only cases (TP=N spanning N chips, no
@@ -2100,8 +2329,8 @@ def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | 
                 "gpt_oss_120b__gb200_4x_tp4",
                 "gpt_oss_120b__gb200_8x_tp8",
             }
-            ix_clean = [r for r in ix_disagg_ok if r["case"] in phase3a_cases]
-            ix_hybrid = [r for r in ix_disagg_ok if r["case"] not in phase3a_cases]
+            ix_clean = [r for r in ix_disagg_clean if r["case"] in phase3a_cases]
+            ix_hybrid = [r for r in ix_disagg_clean if r["case"] not in phase3a_cases]
             clean_tpot = sorted(
                 r["tpot_ratio"] for r in ix_clean if r.get("tpot_ratio") is not None
             )
@@ -2110,12 +2339,13 @@ def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | 
             )
             clean_median = clean_tpot[len(clean_tpot) // 2] if clean_tpot else float("nan")
             hybrid_median = hybrid_tpot[len(hybrid_tpot) // 2] if hybrid_tpot else float("nan")
-            ix_ok = ix_disagg_ok
             out.append(
                 "2. **InferenceX disagg decode (gpt-oss-120b on GB200 NVL72): "
                 f"median TPOT ratio {median_tpot_ratio:.2f}× across "
-                f"{len(ix_ok)} rows.** This is the cleanest comparison in the "
-                f"panel — `global_batch = conc` is reported directly, the "
+                f"{len(ix_disagg_clean)} clean rows; "
+                f"{len(ix_disagg_contam)} queue/capacity-contaminated rows are "
+                f"excluded.** For clean rows this is the panel's most direct "
+                f"comparison — `global_batch = conc`, the "
                 f"prefill engine sits on a separate GPU pool (no "
                 f"chunked-prefill interleaving), and no overlap-efficiency "
                 f"factor is applied. Coverage: TP=2/4/8, ISL=1024/8192, "
@@ -2127,8 +2357,9 @@ def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | 
                 f"(moe_token_pair_overhead_sec, see "
                 f"MOE_TOKEN_PAIR_OVERHEAD_SEC and modeling_"
                 f"improvements_todo.md §14); the residual misses there are "
-                f"the DP-replicated cells with saturation-flat measured TPOT "
-                f"(over-predicted) and the EP4 shapes (modestly under). "
+                f"the EP4 shapes (modestly under). High-concurrency "
+                f"DP-replicated rows whose TPOT reflects a smaller admitted "
+                f"batch are reported separately as QUEUE-contaminated. "
                 f"See Notes & caveats below."
             )
             out.append("")
@@ -2259,12 +2490,36 @@ def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | 
         "batch and per-user TPOT for a tighter comparison.\n"
     )
     out.append(
-        "- **Linearly-growing KV-cache traffic is not modelled.** Decode KV "
-        "is read at a fixed per-step size rather than growing with the "
-        "generated length, so ScaleScope over-predicts throughput at long "
-        "OSL (TRT-LLM) and under-predicts the per-step TPOT slope at high "
-        "concurrency (non-disagg).\n"
+        "- **Decode KV growth is represented by a midpoint step.** For each "
+        "record the driver evaluates one decode step at "
+        "`ISL + OSL // 2`, so linearly growing KV reads and attention-core "
+        "work are included at their generation-average context. This is exact "
+        "while the active roofline branch remains affine over the OSL walk. "
+        "It does not represent branch changes in the C/M/K maximum or dynamic "
+        "batch occupancy as requests finish; those require an explicit "
+        "multi-step probe.\n"
     )
+    if decode_attention_context_correction_enabled:
+        out.append(
+            "- **Validation enables the empirical long-context attention-memory "
+            "correction; production defaults it off.** It applies only to "
+            "incremental attention-core memory time above the matching "
+            "`ISL=1024` midpoint anchor (`1024 + OSL//2`). Its architecture term "
+            "uses local KV heads after TP-X sharding. TP-YZ already sequence-shards "
+            "the memory-traffic span, and the multiplier additionally extrapolates "
+            "inverse local work as `TP_YZ / local_KV_heads`. The fit was measured "
+            "at TP-YZ=1, so TP-YZ>1 results are explicitly extrapolative rather "
+            "than independently calibrated. Reported memory bytes remain "
+            "unchanged because this models achieved efficiency, not extra "
+            "traffic.\n"
+        )
+    else:
+        out.append(
+            "- **This run disables the empirical long-context attention-memory "
+            "correction.** Midpoint-context KV evaluation (`ISL + OSL//2`) is "
+            "still applied. Production workloads also leave the correction off. "
+            "Use the calibrated `__emem` panel for the γ-on comparison.\n"
+        )
     out.append(
         "- **Sliding-window / hybrid attention is modelled via the "
         "`attention_layers` blend** (gpt-oss caps KV history at 128 tokens "
@@ -2272,18 +2527,10 @@ def _format_markdown(rows: list[dict], *, deferred_count: int, timestamp: str | 
         "mix, so KV traffic at long ISL reflects it).\n"
     )
     out.append(
-        "- **The kernel-launch floor is keyed on model only, not "
-        "(model, GPU).** `KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER` carries one "
-        "value per model, applied across every GPU class it runs on. "
-        "Kernel-launch/dispatch latency is physically a host + GPU-runtime "
-        "cost, so it has a per-GPU component the single value cannot "
-        "capture. On Llama-3.3-70B (the only model spanning two GPU "
-        "classes in the panel), matched (TP, conc, ISL, OSL) cells show "
-        "ScaleScope predicts ~6% higher TPOT on B200 than H100 at small "
-        "batch (~9% pooled): the shared 42 µs floor is centered on H100 "
-        "(small-batch geomean 1.00×) and slightly over-predicts B200 "
-        "(1.05×). The bias is within the ±10% band and small next to the "
-        "OSL-driven KV-cache error above, which is common to both GPUs.\n"
+        "- **The kernel-launch floor is keyed on (model, gpu_class).** "
+        "Llama-3.3-70B uses 40 µs/layer on B200 and 23 µs/layer on H100 "
+        "(clean conc≤8 residual). Other panel models list the one GPU "
+        "they run on. Lookup fails if either key is missing.\n"
     )
     if contam_caveat is not None:
         out.append(contam_caveat)

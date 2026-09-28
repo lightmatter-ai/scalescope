@@ -89,6 +89,7 @@ from scalescope.model_spec import (
 )
 from scalescope.pp_strategy import get_pp_strategy
 from scalescope.runtime_overhead_model import (
+    _resolve_decode_attention_context_correction,
     hot_rank_routed_tokens_for_overlap,
     moe_token_pair_overhead_per_pass,
 )
@@ -2580,6 +2581,22 @@ def get_model_stats(
     attn_core_mem_time_fwd = fwd_attn_core_traffic.get_stats(layers_per_stage)[
         f"{fwd_attn_core_traffic.name}_time_s"
     ]
+    attn_context_correction = _resolve_decode_attention_context_correction(
+        pass_mode=pass_mode,
+        workload_spec=workload_spec,
+        model_spec=model_spec,
+        attn_tp_spec=attn_tp_spec,
+        proj_tp_spec=proj_tp_spec,
+        attn_tp_topology_view=attn_tp_topology_view,
+        proj_tp_topology_view=proj_tp_topology_view,
+        current_memory_time_sec=attn_core_mem_time_fwd,
+        layers_per_stage=layers_per_stage,
+    )
+    attn_core_mem_time_fwd += attn_context_correction.correction_time_sec
+    # Keep the aggregate memory pot consistent with the corrected detailed
+    # attention-core pot. Otherwise residual accounting would absorb or reject
+    # the correction before official overlap is calculated.
+    batch_mem_time_forward_pass += attn_context_correction.correction_time_sec
     ffn_mem_time_fwd = fwd_moe_traffic.get_stats(layers_per_stage)[f"{fwd_moe_traffic.name}_time_s"]
     attn_proj_comm_time_fwd = tp_attn_fwd_proj.total_comm_time
     attn_core_comm_time_fwd = tp_attn_fwd_core.total_comm_time
@@ -3033,6 +3050,12 @@ def get_model_stats(
         "Attn_Core_Fwd_Mem_Time_Sec": attn_core_mem_time_fwd,
         "Attn_Core_Fwd_Comm_Time_Sec": attn_core_comm_time_fwd,
         "Attn_Core_Fwd_Total_Time_Overlapped_Sec": attn_core_overlapped_fwd["total_time"],
+        "Attn_Core_Context_Mem_Correction_Sec": (attn_context_correction.correction_time_sec),
+        "Attn_Core_Context_Mem_Delta_Sec": (attn_context_correction.delta_memory_time_sec),
+        "Attn_Core_Context_Mem_Gamma": attn_context_correction.gamma,
+        "Attn_Core_Context_Local_KV_Heads": (attn_context_correction.local_kv_heads),
+        "Attn_Core_Context_TP_YZ": attn_context_correction.attention_tp_yz,
+        "Attn_Core_Context_Reference_Tokens": (attn_context_correction.reference_tokens),
         # FFN/MoE block
         "FFN_Fwd_Compute_Time_Sec": ffn_comp_time_fwd,
         "FFN_Fwd_Mem_Time_Sec": ffn_mem_time_fwd,
@@ -3780,6 +3803,14 @@ def structure_run_results(row, human_readable=False):
                     "compute_s": get_val("Attn_Core_Fwd_Compute_Time_Sec"),
                     "memory_s": get_val("Attn_Core_Fwd_Mem_Time_Sec"),
                     "communication_s": get_val("Attn_Core_Fwd_Comm_Time_Sec"),
+                    "context_memory_correction": {
+                        "time_seconds": get_val("Attn_Core_Context_Mem_Correction_Sec"),
+                        "memory_delta_seconds": get_val("Attn_Core_Context_Mem_Delta_Sec"),
+                        "gamma": get_val("Attn_Core_Context_Mem_Gamma"),
+                        "local_kv_heads": get_val("Attn_Core_Context_Local_KV_Heads"),
+                        "attention_tp_yz": get_val("Attn_Core_Context_TP_YZ"),
+                        "reference_context_tokens": get_val("Attn_Core_Context_Reference_Tokens"),
+                    },
                 },
                 "ffn": {
                     "total_time": fmt_t(get_val("FFN_Fwd_Total_Time_Overlapped_Sec")),
@@ -3950,6 +3981,12 @@ def structure_run_results(row, human_readable=False):
                         "time_per_pp_stage_seconds": get_val("attn_fwd_mem_time_core_s"),
                         "time_per_pp_stage": fmt_t(get_val("attn_fwd_mem_time_core_s")),
                         "volume_bytes_per_pp_stage": fmt_b(get_val("attn_fwd_mem_bytes_core")),
+                        "context_efficiency_correction_seconds": get_val(
+                            "Attn_Core_Context_Mem_Correction_Sec"
+                        ),
+                        "corrected_time_per_pp_stage_seconds": get_val(
+                            "Attn_Core_Fwd_Mem_Time_Sec"
+                        ),
                     },
                     "by_component": {
                         "weights": {
