@@ -93,26 +93,27 @@ generated output against it rather than blindly overwriting.
 injects. They consume `validation_results/validation_panel_summary.yaml` (run the
 panel first) and never modify configs.
 
+Floor first, then pair. Procedure, commands, and holdouts:
+[`calibration/README.md`](calibration/README.md).
+
 ```bash
-# Fit + audit the per-model kernel-launch floor. Prints, for every model in
-# the panel: the suggested floor (us/layer), small-batch centering per GPU
-# class, and a matched-cell head-to-head between GPU classes for multi-GPU
-# models.
+# Floor: suggested us/layer + per-GPU centering audit
 python validation/calibration/calibrate_kernel_floor.py
 python validation/calibration/calibrate_kernel_floor.py --model llama3_70b
+
+# Pair: LS on a zero-pair dump (EP2 ISL=1024 fit; EP4/DP/ISL=8192 holdout)
+python validation/fit_ep_dispatch_overhead.py \
+    validation/validation_results/validation_panel_summary__p1_zeropair.yaml
+
+# Current driver table vs recovered fits
+python validation/calibration/compare_floor_pair.py \
+    --panel validation/validation_results/validation_panel_summary__tokensat.yaml \
+    --zeropair-panel validation/validation_results/validation_panel_summary__p1_zeropair.yaml
 ```
 
-`KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER` is hand-set in the driver and keyed on
-model only. This script computes what each value *should* be — the floor is
-additive to decode TPOT at the fixed `batch = conc` operating point, so the
-fit is recovered exactly from the panel as
-`floor_current + (measured_tpot − predicted_tpot) / n_layers`, taken as the
-median over clean small-batch rows. It also audits how well the current value
-is centered (e.g. on Llama-3.3-70B the shared floor sits on H100 at
-small-batch geomean ~1.00× but slightly over-predicts B200 ~1.05×) and flags
-models where promoting the key to `(model, gpu_class)` would help. Applying a
-fitted value is a manual edit to the driver dict followed by re-running the
-panel; the script never modifies configs.
+`KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER` and `MOE_TOKEN_PAIR_OVERHEAD_SEC` are
+hand-set in the driver. The scripts only print suggestions. Applying a
+value is a manual edit followed by a panel rerun.
 
 ## Inputs and outputs
 
@@ -130,16 +131,20 @@ validation/
     inferencex_fetch.py           #   InferenceX REST API -> benchmark_data/inferencex_raw/*.json
     trtllm_perf_overview_fetch.py #   NVIDIA perf-overview HTML -> trtllm_perf_overview.yaml
   calibration/                    # read-only fit + audit of empirical model knobs
-    calibrate_kernel_floor.py     #   fits per-model kernel floor (us/layer) + per-GPU centering audit
+    README.md                     #   floor-then-pair procedure
+    calibrate_kernel_floor.py     #   fits (model, gpu) kernel floor (us/layer)
+    compare_floor_pair.py         #   driver table vs recovered floor + pair
+    fit_emem.py                   #   per-GPU HBM efficiency from an ideal-e panel
+  fit_ep_dispatch_overhead.py     # pair LS on a zero-pair gpt-oss EP dump
   inference_decode_specs/         # fp8 / fp4 decode workload templates
   model_zoo/                      # transformer configs for the selected models
   topology_zoo/{physical,logical}/# per-(hardware × parallelism) topology configs
 ```
 
-Each generated workload spec injects a per-model host kernel-launch/dispatch
-floor (`KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER` in the driver), an empirical
-runtime overhead the roofline does not model, calibrated to the clean
-small-batch residual of each model. `calibration/calibrate_kernel_floor.py`
-fits those values from the panel and audits their centering (see above).
+Each generated workload spec injects a host kernel-launch/dispatch
+floor keyed on `(model, gpu_class)` (`KERNEL_LAUNCH_FLOOR_SEC_PER_LAYER`
+in the driver), an empirical runtime overhead the roofline does not
+model. `calibration/calibrate_kernel_floor.py` fits those values from
+the panel and audits their centering (see `calibration/README.md`).
 
 Everything under `validation_results/` is regenerated on each run and is not checked in.
