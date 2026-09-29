@@ -8,6 +8,8 @@ import yaml
 
 from scalescope.run_scalescope import main as scalescope_main
 
+HOT_INTERCONNECTS_HARDWARE_LIB = "hardware_specs/hot_interconnects_2025/hardware_library.yaml"
+
 
 @pytest.fixture(scope="module")
 def tmp_output_dir(tmp_path_factory):
@@ -129,7 +131,7 @@ def run_scalescope_cli(
 def test_alternative_32_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/alternative_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/alternative_logical_config_1__32_experts.yaml",
         workload_spec="train_specs/hot_interconnects_2025/train_spec.yaml",
@@ -145,7 +147,7 @@ def test_alternative_32_experts(tmp_output_dir):
 def test_passage_32_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/passage_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/passage_logical_config_1__32_experts.yaml",
         workload_spec="train_specs/hot_interconnects_2025/train_spec.yaml",
@@ -154,7 +156,7 @@ def test_passage_32_experts(tmp_output_dir):
         pass_mode="training",
         output_file_name="scalescope_res_passage_32_experts.yaml",
     )
-    expected_time_sec = 307443.3820138336
+    expected_time_sec = 307425.0759463336
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -162,7 +164,7 @@ def test_passage_32_experts(tmp_output_dir):
 def test_alternative_64_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/alternative_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/alternative_logical_config_2__64_experts.yaml",
         workload_spec="train_specs/hot_interconnects_2025/train_spec.yaml",
@@ -178,7 +180,7 @@ def test_alternative_64_experts(tmp_output_dir):
 def test_passage_64_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/passage_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/passage_logical_config_2__64_experts.yaml",
         workload_spec="train_specs/hot_interconnects_2025/train_spec.yaml",
@@ -187,7 +189,7 @@ def test_passage_64_experts(tmp_output_dir):
         pass_mode="training",
         output_file_name="scalescope_res_passage_64_experts.yaml",
     )
-    expected_time_sec = 307423.53277417406
+    expected_time_sec = 307405.22670667415
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -195,7 +197,7 @@ def test_passage_64_experts(tmp_output_dir):
 def test_alternative_128_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/alternative_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/alternative_logical_config_3__128_experts.yaml",
         workload_spec="train_specs/hot_interconnects_2025/train_spec.yaml",
@@ -211,7 +213,7 @@ def test_alternative_128_experts(tmp_output_dir):
 def test_passage_128_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/passage_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/passage_logical_config_3__128_experts.yaml",
         workload_spec="train_specs/hot_interconnects_2025/train_spec.yaml",
@@ -220,7 +222,7 @@ def test_passage_128_experts(tmp_output_dir):
         pass_mode="training",
         output_file_name="scalescope_res_passage_128_experts.yaml",
     )
-    expected_time_sec = 307383.8650196298
+    expected_time_sec = 307365.55895212985
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -228,7 +230,7 @@ def test_passage_128_experts(tmp_output_dir):
 def test_alternative_256_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/alternative_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/alternative_logical_config_4__256_experts.yaml",
         workload_spec="train_specs/hot_interconnects_2025/train_spec.yaml",
@@ -244,7 +246,7 @@ def test_alternative_256_experts(tmp_output_dir):
 def test_passage_256_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/passage_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/passage_logical_config_4__256_experts.yaml",
         workload_spec="train_specs/hot_interconnects_2025/train_spec.yaml",
@@ -253,7 +255,7 @@ def test_passage_256_experts(tmp_output_dir):
         pass_mode="training",
         output_file_name="scalescope_res_passage_256_experts.yaml",
     )
-    expected_time_sec = 307304.56023531605
+    expected_time_sec = 307286.254167816
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -263,7 +265,7 @@ def test_passage_256_experts(tmp_output_dir):
 def test_passage_prefill_32_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/passage_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/passage_logical_config_1__32_experts.yaml",
         workload_spec="inference_prefill_specs/hot_interconnects_2025/inference_prefill_spec.yaml",
@@ -279,7 +281,7 @@ def test_passage_prefill_32_experts(tmp_output_dir):
 def test_passage_prefill_64_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/passage_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/passage_logical_config_2__64_experts.yaml",
         workload_spec="inference_prefill_specs/hot_interconnects_2025/inference_prefill_spec.yaml",
@@ -295,7 +297,7 @@ def test_passage_prefill_64_experts(tmp_output_dir):
 def test_passage_prefill_128_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/passage_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/passage_logical_config_3__128_experts.yaml",
         workload_spec="inference_prefill_specs/hot_interconnects_2025/inference_prefill_spec.yaml",
@@ -311,7 +313,7 @@ def test_passage_prefill_128_experts(tmp_output_dir):
 def test_passage_prefill_256_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/passage_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/passage_logical_config_4__256_experts.yaml",
         workload_spec="inference_prefill_specs/hot_interconnects_2025/inference_prefill_spec.yaml",
@@ -330,7 +332,7 @@ def test_passage_prefill_256_experts(tmp_output_dir):
 def test_alternative_prefill_32_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/alternative_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/alternative_logical_config_1__32_experts.yaml",
         workload_spec="inference_prefill_specs/hot_interconnects_2025/inference_prefill_spec.yaml",
@@ -346,7 +348,7 @@ def test_alternative_prefill_32_experts(tmp_output_dir):
 def test_alternative_prefill_64_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/alternative_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/alternative_logical_config_2__64_experts.yaml",
         workload_spec="inference_prefill_specs/hot_interconnects_2025/inference_prefill_spec.yaml",
@@ -362,7 +364,7 @@ def test_alternative_prefill_64_experts(tmp_output_dir):
 def test_alternative_prefill_128_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/alternative_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/alternative_logical_config_3__128_experts.yaml",
         workload_spec="inference_prefill_specs/hot_interconnects_2025/inference_prefill_spec.yaml",
@@ -378,7 +380,7 @@ def test_alternative_prefill_128_experts(tmp_output_dir):
 def test_alternative_prefill_256_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/alternative_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/alternative_logical_config_4__256_experts.yaml",
         workload_spec="inference_prefill_specs/hot_interconnects_2025/inference_prefill_spec.yaml",
@@ -410,7 +412,7 @@ def test_alternative_prefill_256_experts(tmp_output_dir):
 def test_passage_decode_32_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/passage_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/passage_logical_config_1__32_experts.yaml",
         workload_spec="inference_decode_specs/hot_interconnects_2025/inference_decode_spec.yaml",
@@ -419,14 +421,14 @@ def test_passage_decode_32_experts(tmp_output_dir):
         pass_mode="inference_decode",
         output_file_name="decode_32_experts_scalescope_res.yaml",
     )
-    expected_time_sec = 0.4933071407161978
+    expected_time_sec = 0.45029914071619803
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
 def test_passage_decode_64_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/passage_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/passage_logical_config_2__64_experts.yaml",
         workload_spec="inference_decode_specs/hot_interconnects_2025/inference_decode_spec.yaml",
@@ -435,14 +437,14 @@ def test_passage_decode_64_experts(tmp_output_dir):
         pass_mode="inference_decode",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.4937027847425036
+    expected_time_sec = 0.45069478474316405
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
 def test_passage_decode_128_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/passage_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/passage_logical_config_3__128_experts.yaml",
         workload_spec="inference_decode_specs/hot_interconnects_2025/inference_decode_spec.yaml",
@@ -451,14 +453,14 @@ def test_passage_decode_128_experts(tmp_output_dir):
         pass_mode="inference_decode",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.49449407358907177
+    expected_time_sec = 0.45148607359013704
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
 def test_passage_decode_256_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/passage_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/passage_logical_config_4__256_experts.yaml",
         workload_spec="inference_decode_specs/hot_interconnects_2025/inference_decode_spec.yaml",
@@ -467,7 +469,7 @@ def test_passage_decode_256_experts(tmp_output_dir):
         pass_mode="inference_decode",
         output_file_name="scalescope_res.yaml",
     )
-    expected_time_sec = 0.4960766520758352
+    expected_time_sec = 0.45306865207712305
     assert time_sec == pytest.approx(expected_time_sec, abs=0.001)
 
 
@@ -495,7 +497,7 @@ def test_passage_decode_256_experts(tmp_output_dir):
 def test_alternative_decode_32_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/alternative_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/alternative_logical_config_1__32_experts.yaml",
         workload_spec="inference_decode_specs/hot_interconnects_2025/inference_decode_spec.yaml",
@@ -518,7 +520,7 @@ def test_alternative_decode_32_experts(tmp_output_dir):
 def test_alternative_decode_64_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/alternative_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/alternative_logical_config_2__64_experts.yaml",
         workload_spec="inference_decode_specs/hot_interconnects_2025/inference_decode_spec.yaml",
@@ -541,7 +543,7 @@ def test_alternative_decode_64_experts(tmp_output_dir):
 def test_alternative_decode_128_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/alternative_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/alternative_logical_config_3__128_experts.yaml",
         workload_spec="inference_decode_specs/hot_interconnects_2025/inference_decode_spec.yaml",
@@ -564,7 +566,7 @@ def test_alternative_decode_128_experts(tmp_output_dir):
 def test_alternative_decode_256_experts(tmp_output_dir):
     time_sec = run_scalescope_cli(
         tmp_output_dir,
-        hardware_lib="hardware_specs/hardware_library.yaml",
+        hardware_lib=HOT_INTERCONNECTS_HARDWARE_LIB,
         physical_topology="topology_zoo/physical/hot_interconnects_2025/alternative_physical_32768.yaml",
         logical_topology="topology_zoo/logical/hot_interconnects_2025/alternative_logical_config_4__256_experts.yaml",
         workload_spec="inference_decode_specs/hot_interconnects_2025/inference_decode_spec.yaml",
