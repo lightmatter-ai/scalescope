@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 import scalescope.plotting as plotting
 from scalescope.comm_model import get_transformer_comm_stats
+from scalescope.communication_volume import calculate_network_wide_communication_volume
 from scalescope.compute_model import (
     backward_pass_flops_per_chip,
     calculate_embedding_compute,
@@ -2851,6 +2852,30 @@ def get_model_stats(
     tokens_per_second = total_train_tokens / time_to_train_sec
     total_xpus_val = attn_tp_topology_view.num_chips * attn_dp_topology_view.num_chips * pp_stages
     tokens_per_second_per_xpu = tokens_per_second / total_xpus_val
+    network_wide_comm = calculate_network_wide_communication_volume(
+        collective_forward_bytes_per_xpu=(
+            tp_attn_fwd.comm_vol
+            + tp_moe_fwd.comm_vol
+            + dp_attn_fwd.comm_vol
+            + dp_moe_fwd.comm_vol
+            + moe_a2a_fwd_1.comm_vol
+            + moe_a2a_fwd_2.comm_vol
+        ),
+        collective_backward_bytes_per_xpu=(
+            tp_attn_bwd.comm_vol
+            + tp_moe_bwd.comm_vol
+            + dp_attn_bwd.comm_vol
+            + dp_moe_bwd.comm_vol
+            + moe_a2a_bwd.comm_vol
+        ),
+        pipeline_forward_bytes_per_lane=pp_fwd.comm_vol,
+        pipeline_backward_bytes_per_lane=pp_bwd.comm_vol,
+        total_xpu_count=total_xpus_val,
+        pp_stages=pp_stages,
+    )
+    network_wide_collective_comm_total_run = network_wide_comm.collective_bytes * train_steps
+    network_wide_pipeline_comm_total_run = network_wide_comm.pipeline_bytes * train_steps
+    network_wide_comm_total_run = network_wide_comm.total_bytes * train_steps
 
     # Decode-only TPOT:
     # - System TPOT: wall-time per *system-level* output token (across the whole batch).
@@ -2877,6 +2902,25 @@ def get_model_stats(
 
     tp_node = tp_topology_view.physical_topology.node_definition
     stats = {
+        "Global_Batch_Size": workload_spec.global_batch_size,
+        "Tokens_Per_Batch": workload_spec.global_batch_size * seq_length,
+        "Requested_Total_Tokens": total_train_tokens,
+        "Modeled_Steps": train_steps,
+        "Modeled_Total_Tokens": workload_spec.global_batch_size * seq_length * train_steps,
+        "Model_Num_Layers": model_spec.n_layers,
+        "Model_Num_Heads": model_spec.num_heads,
+        "Model_Num_KV_Heads": model_spec.num_kv_heads,
+        "Model_Head_Dim": model_spec.head_dim,
+        "Model_Vocab_Size": model_spec.vocab_size,
+        "Model_Max_Sequence_Length": model_spec.max_sequence_length,
+        "Projection_TP_XPU_Count": proj_tp_topology_view.num_chips,
+        "MoE_TP_XPU_Count": moe_tp_topology_view.num_chips,
+        "MoE_DP_Ranks": moe_dp_topology_view.num_chips,
+        "Attention_TP_Variant": attn_tp_variant.name,
+        "Projection_TP_Variant": proj_tp_variant.name,
+        "MoE_TP_Variant": moe_tp_variant.name,
+        "Data_Parallel_Variant": workload_spec.dp_spec.variant.name,
+        "Pipeline_Parallel_Variant": workload_spec.pp_spec.variant.name,
         plotting.tp_node_label: tp_node.node_name,
         plotting.tp_xpu_count_label: attn_tp_topology_view.num_chips,
         plotting.dp_ranks_label: attn_dp_topology_view.num_chips,
@@ -2941,6 +2985,31 @@ def get_model_stats(
         plotting.unembedding_mem_vol_bwd_label: unembedding_mem_vol_bwd,
         plotting.comm_vol_forward_pass_label: batch_comm_vol_forward_pass,
         plotting.comm_vol_backward_pass_label: batch_comm_vol_backward_pass,
+        plotting.network_wide_comm_vol_collective_forward_label: (
+            network_wide_comm.collective_forward_bytes
+        ),
+        plotting.network_wide_comm_vol_collective_backward_label: (
+            network_wide_comm.collective_backward_bytes
+        ),
+        plotting.network_wide_comm_vol_collective_per_batch_label: (
+            network_wide_comm.collective_bytes
+        ),
+        plotting.network_wide_comm_vol_collective_total_run_label: (
+            network_wide_collective_comm_total_run
+        ),
+        plotting.network_wide_comm_vol_pipeline_forward_label: (
+            network_wide_comm.pipeline_forward_bytes
+        ),
+        plotting.network_wide_comm_vol_pipeline_backward_label: (
+            network_wide_comm.pipeline_backward_bytes
+        ),
+        plotting.network_wide_comm_vol_pipeline_total_run_label: (
+            network_wide_pipeline_comm_total_run
+        ),
+        plotting.network_wide_comm_vol_forward_label: network_wide_comm.forward_bytes,
+        plotting.network_wide_comm_vol_backward_label: network_wide_comm.backward_bytes,
+        plotting.network_wide_comm_vol_per_batch_label: network_wide_comm.total_bytes,
+        plotting.network_wide_comm_vol_total_run_label: network_wide_comm_total_run,
         plotting.comm_time_forward_pass_label: batch_comm_time_forward_pass,
         plotting.comm_time_backward_pass_label: batch_comm_time_backward_pass,
         # Unembedding comm omitted (typical vocab-parallel path)
@@ -3751,12 +3820,41 @@ def structure_run_results(row, human_readable=False):
             "tensor_parallel_variant": get_val(plotting.tensor_parallel_variant_label),
             "optimizer": get_val(plotting.optimizer_label),
         },
+        "workload": {
+            "global_batch_size": get_val("Global_Batch_Size"),
+            "sequence_length": get_val(plotting.seq_len_label),
+            "tokens_per_batch": get_val("Tokens_Per_Batch"),
+            "requested_total_tokens": get_val("Requested_Total_Tokens"),
+            "modeled_steps": get_val("Modeled_Steps"),
+            "modeled_total_tokens": get_val("Modeled_Total_Tokens"),
+        },
         "model_configuration": {
+            "num_layers": get_val("Model_Num_Layers"),
+            "hidden_dim": get_val(plotting.model_hidden_dim_label),
+            "num_heads": get_val("Model_Num_Heads"),
+            "num_kv_heads": get_val("Model_Num_KV_Heads"),
+            "head_dim": get_val("Model_Head_Dim"),
+            "vocab_size": get_val("Model_Vocab_Size"),
+            "max_sequence_length": get_val("Model_Max_Sequence_Length"),
             "shared_expert_count": get_val(plotting.shared_expert_count_label),
             "regular_expert_count": get_val(plotting.regular_expert_count_label),
             "selected_experts": get_val(plotting.num_selected_experts_label),
             "mlp_ratio": get_val(plotting.mlp_ratio_label),
             "mlp_kind": get_val(plotting.mlp_kind_label),
+        },
+        "parallelization": {
+            "total_xpu_count": get_val(plotting.total_xpu_count_label),
+            "attention_tp_size": get_val(plotting.tp_xpu_count_label),
+            "projection_tp_size": get_val("Projection_TP_XPU_Count"),
+            "moe_tp_size": get_val("MoE_TP_XPU_Count"),
+            "attention_dp_size": get_val(plotting.dp_ranks_label),
+            "moe_dp_size": get_val("MoE_DP_Ranks"),
+            "pipeline_stages": get_val(plotting.pp_stages_label),
+            "attention_tp_variant": get_val("Attention_TP_Variant"),
+            "projection_tp_variant": get_val("Projection_TP_Variant"),
+            "moe_tp_variant": get_val("MoE_TP_Variant"),
+            "data_parallel_variant": get_val("Data_Parallel_Variant"),
+            "pipeline_parallel_variant": get_val("Pipeline_Parallel_Variant"),
         },
         "expert_placement": {
             "shared_experts_per_dp_rank": get_val(plotting.shared_experts_per_dp_rank_label),
@@ -4770,6 +4868,40 @@ def structure_run_results(row, human_readable=False):
                     "time_per_pp_stage": fmt_t(get_val(plotting.moe_alltoall_bwd_time_label)),
                 },
             },
+        },
+        "communication_network_wide": {
+            "accounting": "sender_side_endpoint_bytes",
+            "per_batch": {
+                "total_bytes": fmt_b(get_val(plotting.network_wide_comm_vol_per_batch_label)),
+                "forward_bytes": fmt_b(get_val(plotting.network_wide_comm_vol_forward_label)),
+                "backward_bytes": fmt_b(get_val(plotting.network_wide_comm_vol_backward_label)),
+                "collective_bytes": fmt_b(
+                    get_val(plotting.network_wide_comm_vol_collective_per_batch_label)
+                ),
+                "collective_forward_bytes": fmt_b(
+                    get_val(plotting.network_wide_comm_vol_collective_forward_label)
+                ),
+                "collective_backward_bytes": fmt_b(
+                    get_val(plotting.network_wide_comm_vol_collective_backward_label)
+                ),
+                "pipeline_bytes": fmt_b(
+                    (get_val(plotting.network_wide_comm_vol_pipeline_forward_label) or 0)
+                    + (get_val(plotting.network_wide_comm_vol_pipeline_backward_label) or 0)
+                ),
+                "pipeline_forward_bytes": fmt_b(
+                    get_val(plotting.network_wide_comm_vol_pipeline_forward_label)
+                ),
+                "pipeline_backward_bytes": fmt_b(
+                    get_val(plotting.network_wide_comm_vol_pipeline_backward_label)
+                ),
+            },
+            "total_run_bytes": fmt_b(get_val(plotting.network_wide_comm_vol_total_run_label)),
+            "collective_total_run_bytes": fmt_b(
+                get_val(plotting.network_wide_comm_vol_collective_total_run_label)
+            ),
+            "pipeline_total_run_bytes": fmt_b(
+                get_val(plotting.network_wide_comm_vol_pipeline_total_run_label)
+            ),
         },
         "ratios": {
             "comm_to_compute": get_val(plotting.comm_compute_ratio_label),
